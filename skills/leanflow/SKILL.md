@@ -1,58 +1,43 @@
 ---
 name: leanflow
-description: Low-handoff AI coding workflow for OMP — plan and build in the same main session, with on-demand Scout investigators and one independent read-only Gate reviewer.
+description: Low-handoff AI coding workflow for OMP — plan in native plan mode, build in the same session, review with an independent read-only Gate. On-demand Scout investigators. Used by /flow.
 ---
 
 # LeanFlow
 
-Use when running a LeanFlow workflow (started by `/flow <task>`). LeanFlow minimizes inter-agent context duplication by keeping the planner and the builder as the **same main session**, and by passing the independent gate's inputs by reference rather than pasting them.
+LeanFlow is the workflow started by `/flow <task>`. This skill holds the **rationale and configuration**; the step-by-step lifecycle lives in the `/flow` command body, which is the authoritative instruction set during a run.
 
-## Lifecycle
+## Why LeanFlow exists
+
+Traditional multi-agent pipelines (`Architect → Dispatcher → Implementer → Reviewer`) pay a large handoff token cost: each spawn re-reads code and re-receives summaries. LeanFlow keeps the **Planner and Builder as the same main session**, so the implementation inherits the investigation context for free. The only mandatory spawn is an independent **Gate** reviewer; optional cheap **Scouts** handle location-only investigation when the task is complex.
+
+## Why the Planner is the main session, not a pipeline node
+
+A separate Planner agent forces a handoff: the planner's investigation must be summarized and re-sent to the builder. For the common case — a bounded bug fix or feature — the planner and the builder are the same mind. Keeping them in one session means the implementation inherits the full investigation for free. The planner can still delegate *location* (not design) to cheap scouts when the task is complex.
+
+## Why there is no fixed preflight
+
+A fixed preflight (always-spawn investigator) taxes simple tasks with the cost of complex ones. The planner, having read the task, is the best judge of investigation depth: a one-file change needs zero scouts; a cross-module refactor needs focused parallel scouts. Dynamic depth keeps the average handoff low without capping the ceiling.
+
+## Why the Main Builder is not an independent agent
+
+An independent Implementer agent must re-read the code the planner already read, and re-receive the plan the planner already wrote. That is the single largest handoff in a traditional pipeline. LeanFlow's main session implements directly after approval — it already holds the plan and the investigation. The single-writer principle is preserved (only the main session edits); independence is provided by the Gate, not by splitting the builder.
+
+## Why the Gate must be independent
+
+The one handoff worth paying for is a fresh pair of eyes that did not write the code. The gate reads the approved plan, the diff artifact, and the validation results — by reference — and returns PASS or structured FAIL. It never writes (its tool set is `read`/`grep`/`glob` only, enforced by frontmatter), so it cannot regress the tree, and its fresh context means it is not anchored to the planner's assumptions. This is the irreducible minimum for real review independence.
+
+## Handoff accounting
 
 ```text
-/flow <task>
-  ↓
-PLAN  (main session = Planner; model @plan when configured)
-  - bounded read-only investigation (read/grep/glob/lsp, same session)
-  - simple task → 0 scouts; complex task → 1–3 parallel scout(@smol)
-  - write plan to local://leanflow/<run-id>/plan.md
-  - OMP native plan-mode approval
-  ↓
-APPROVE
-  ↓
-BUILD  (same main session = sole writer; model @default)
-  - implement directly (inherits investigation+plan context, zero re-read)
-  - run the plan's validation commands
-  - write local://leanflow/<run-id>/build.md (changed files, git diff --stat, results)
-  ↓
-GATE  (independent one-shot gate agent; model @slow, read-only)
-  - task({agent:"gate", handle, schema, schemaMode:"strict"})
-  - reads local://leanflow/<run-id>/plan.md + git diff + local://leanflow/<run-id>/build.md
-  - returns {verdict: PASS|FAIL, findings?}
-  ↓
-PASS → done      FAIL → main session fixes, re-validates, re-gates (max 2 rounds)
+Traditional (Architect→Dispatcher→Implementer→Reviewer):
+  3+ spawns, each reads code fresh, each handoff = summary artifact + prompt re-send.
+
+LeanFlow:
+  Main[Planner, @plan] → (0–3 scout @smol, one batch, short output) → Main[Builder, @default] → gate(@slow) → Main
+  Mandatory spawns: 1 (gate). Optional cheap scouts: 0–3. Max 3 scouts per run. Max 2 gate calls per run.
+  Main never re-reads its own investigation. Gate reads references, returns one small JSON.
 ```
-
-## Why this reduces handoff token
-
-- **No Planner→Builder handoff**: the main session is both. The investigation context is never re-sent.
-- **No fixed preflight**: simple tasks spawn zero scouts. The planner decides depth from complexity.
-- **Cheap scouts**: when used, they return only a short Files/Symbols/Tests/Unknowns list — no design, no re-narration.
-- **No Implementer agent**: the main session writes; it already has the plan context.
-- **Reference, don't paste**: the gate reads `local://` artifacts and runs `git diff` itself. Nothing is pasted into a prompt.
-- **One mandatory spawn**: the gate. Optional cheap scouts (0–3). That is the entire handoff budget.
-
-## Single-writer rule
-
-Only the main session edits files. Scouts and Gate are read-only. No agent spawns a builder.
-
-## Gate contract
-
-- Reads plan + diff + build results by reference.
-- Returns `{verdict:"PASS"|"FAIL", findings:[{severity,file,location,issue,required_fix}]}`.
-- Blocking categories: `correctness`, `validation_failure`, `plan_deviation`, `missing_change`, `regression_risk`.
-- Non-blocking: `style`, `naming` (never drive a FAIL).
-- Max 2 gate rounds; on the second FAIL, stop and report — do not commit.
 
 ## Model roles (configured in one place, no vendor lock-in)
 
@@ -65,4 +50,16 @@ modelRoles:
   slow:    <independent reviewer model>        # gate
 ```
 
-`@plan` / `@smol` / `@slow` / `@default` are OMP native model-role aliases. Agents reference them in frontmatter (`model: "@smol"`). Swap concrete models in `config.yml` only.
+`@plan` / `@smol` / `@slow` / `@default` are OMP native model-role aliases (from the `ModelRole` enum). Agents reference them in frontmatter (`model: "@smol"`). Swap concrete models in `config.yml` only — no agent or command edits needed.
+
+- `@plan` is optional. If `modelRoles.plan` is unset, OMP native plan mode stays on the current model.
+- `@smol` / `@slow` unset → OMP falls back to the `default` model; `/flow` warns once when a role collapses to `default` (scouts stop being cheap, gate loses model diversity).
+- OMP native plan-mode approval lets the user pick the execution model (defaults to `@default`) at approval time — no manual `/model` switch needed.
+
+## Gate loop
+
+Max **2 gate calls** per run (count calls, not repairs). On the 2nd FAIL, the main session reports the last blocking findings and stops — it does not commit and does not spawn a new builder. Blocking categories: `correctness`, `validation_failure`, `plan_deviation`, `missing_change`, `regression_risk`. Non-blocking: `style`, `naming` (never drive a FAIL).
+
+## Large changes
+
+If the plan touches more than ~8 files or the diff exceeds a few thousand lines, split into phases and gate each phase independently rather than one monolithic gate.
