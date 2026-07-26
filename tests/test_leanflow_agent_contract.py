@@ -98,6 +98,10 @@ class AgentContractTest(unittest.TestCase):
         self.assertIn("2 gate calls", text)
         # role check
         self.assertIn("Role check", text)
+        # FAIL loop re-writes diff artifact (gate has no bash, reads diff by reference)
+        self.assertIn("re-write `local://<slug>-diff.md`", text)
+        # gate does not run git (mechanical read-only)
+        self.assertIn("gate does not run `git`", text.lower())
 
     def test_flow_scout_batch_form(self) -> None:
         path = ROOT / "commands" / "flow.md"

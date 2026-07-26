@@ -54,6 +54,7 @@ class InstallTest(unittest.TestCase):
             "agents/gate.md",
             "agents/scout.md",
             "commands/flow.md",
+            "extensions/leanflow-bootstrap.ts",
             "skills/leanflow/SKILL.md",
         ])
         for entry in data["entries"]:
@@ -67,7 +68,7 @@ class InstallTest(unittest.TestCase):
         data = json.loads(out)
         self.assertTrue(data["ok"])
         # files installed
-        for rel in ("commands/flow.md", "agents/scout.md", "agents/gate.md", "skills/leanflow/SKILL.md"):
+        for rel in ("commands/flow.md", "agents/scout.md", "agents/gate.md", "skills/leanflow/SKILL.md", "extensions/leanflow-bootstrap.ts"):
             target = self.fake_agent_dir / rel
             self.assertTrue(target.is_symlink(), f"{rel} should be a symlink")
             self.assertTrue(target.resolve(strict=True).exists(), f"{rel} link target missing")
@@ -86,7 +87,7 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         data = json.loads(out)
         self.assertTrue(data["ok"])
-        for rel in ("commands/flow.md", "agents/scout.md", "agents/gate.md", "skills/leanflow/SKILL.md"):
+        for rel in ("commands/flow.md", "agents/scout.md", "agents/gate.md", "skills/leanflow/SKILL.md", "extensions/leanflow-bootstrap.ts"):
             self.assertFalse((self.fake_agent_dir / rel).exists(), f"{rel} should be removed")
         self.assertFalse((self.fake_agent_dir / "leanflow-install.json").exists())
 
@@ -96,7 +97,7 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         data = json.loads(out)
         self.assertTrue(data["ok"])
-        for rel in ("commands/flow.md", "agents/scout.md", "agents/gate.md", "skills/leanflow/SKILL.md"):
+        for rel in ("commands/flow.md", "agents/scout.md", "agents/gate.md", "skills/leanflow/SKILL.md", "extensions/leanflow-bootstrap.ts"):
             target = self.fake_agent_dir / rel
             self.assertTrue(target.is_file(), f"{rel} should be a real file (copy)")
             self.assertFalse(target.is_symlink(), f"{rel} should not be a symlink in copy mode")
@@ -114,21 +115,27 @@ class InstallTest(unittest.TestCase):
         self.assertTrue(data["ok"])
         self.assertEqual(data["base"], str((project / ".omp").resolve()))
 
-    def test_force_replaces_existing(self) -> None:
+    def test_force_replaces_existing_symlink(self) -> None:
         env = self._env()
-        # first install in copy mode (symlink mode would self-overlap on re-run)
-        rc, out, _ = run_installer("--apply", "--scope", "user", "--mode", "copy", env=env)
+        # first install in default symlink mode
+        rc, out, _ = run_installer("--apply", "--scope", "user", env=env)
         self.assertEqual(rc, 0, out)
-        # second install without force fails (existing copy targets)
-        rc, out, _ = run_installer("--dry-run", "--scope", "user", "--mode", "copy", env=env)
+        # second install without force fails (existing symlink targets)
+        rc, out, _ = run_installer("--dry-run", "--scope", "user", env=env)
         data = json.loads(out)
         self.assertFalse(data["ok"])
         self.assertIn("force", data.get("error", ""))
-        # with force
-        rc, out, _ = run_installer("--apply", "--scope", "user", "--mode", "copy", "--force", env=env)
+        # with force, symlink mode re-installs in place (no source_overlap false positive)
+        rc, out, _ = run_installer("--apply", "--scope", "user", "--force", env=env)
         self.assertEqual(rc, 0, out)
         data = json.loads(out)
-        self.assertTrue(data["ok"])
+        self.assertTrue(data["ok"], f"force re-install failed: {data}")
+        self.assertNotIn("overlaps", data)
+        # files still valid symlinks pointing at source
+        for rel in ("commands/flow.md", "agents/scout.md", "agents/gate.md", "skills/leanflow/SKILL.md", "extensions/leanflow-bootstrap.ts"):
+            target = self.fake_agent_dir / rel
+            self.assertTrue(target.is_symlink(), f"{rel} should still be a symlink after force")
+            self.assertTrue(target.resolve(strict=True).exists(), f"{rel} link target missing after force")
 
 
 if __name__ == "__main__":

@@ -106,7 +106,7 @@ A `FAIL` verdict MUST have at least one finding with `severity: "blocking"` and 
 Count gate **calls**, not repairs:
 
 - `verdict: PASS` → report done. Do not commit unless the user asks.
-- `verdict: FAIL` → read the blocking findings, fix them **in this same session**, re-run the plan's validation commands, update `local://<slug>-build.md`, and call the gate again.
+- `verdict: FAIL` → read the blocking findings, fix them **in this same session**, re-run the plan's validation commands, **re-write `local://<slug>-diff.md`** with the fresh `git diff` output, update `local://<slug>-build.md`, and call the gate again. The gate has no `bash` and reads the diff artifact by reference — if you do not re-write it, the second gate call reviews the pre-fix diff and cannot see your repairs.
 - **Maximum 2 gate calls per run.** On the 2nd FAIL, report the last blocking findings to the user and stop — do NOT commit and do NOT spawn a new builder.
 
 ## Rules
@@ -114,7 +114,7 @@ Count gate **calls**, not repairs:
 - **Single writer**: only this session edits repo files. Scouts and Gate are read-only (enforced by their tool set — they have no `edit`/`write`).
 - **No fixed preflight**: you decide scout count from complexity. Zero is fine. Max 3 total per run, spawned in one batch.
 - **No separate Planner/Implementer agent**: you plan and you build.
-- **Reference, don't paste**: the gate reads `local://` artifacts and runs `git diff` itself; never paste the diff or the plan into a prompt.
+- **Reference, don't paste**: the gate reads `local://` artifacts (plan, diff, build) by reference; never paste the diff or the plan into a prompt. The gate does not run `git` — you write `local://<slug>-diff.md` and it reads that.
 - **Compaction-safe**: the approved plan lives in `local://<slug>-plan.md`, the canonical OMP plan artifact, so it survives any session compaction during BUILD. After compaction, re-read the plan file rather than trusting inline context.
 - **Large changes**: if the plan touches more than ~8 files or the diff exceeds a few thousand lines, split into phases and gate each phase independently rather than one monolithic gate.
 

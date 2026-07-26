@@ -7,8 +7,8 @@ LeanFlow keeps the **Planner** and the **Builder** as the **same main session**,
 ## Lifecycle
 
 ```text
-/flow <task>
-  ↓
+/flow <task>   (extension command: pre-fills `/plan <workflow prompt>`)
+  ↓ Enter  (operator hits Enter; OMP enters native plan mode)
 PLAN  (main session = Planner; OMP native plan mode; model @plan when configured)
   - bounded read-only investigation (read/grep/glob, same session)
   - simple task → 0 scouts; complex task → 1–3 scouts in one native task batch (@smol)
@@ -108,14 +108,15 @@ python3 scripts/install_leanflow.py --scope user --uninstall --apply
 
 Installed files (user scope → `~/.omp/agent/`; project scope → `<repo>/.omp/`):
 
-- `commands/flow.md` — the `/flow` slash command
+- `commands/flow.md` — the `/flow` workflow prompt (used as the plan-mode first turn)
+- `extensions/leanflow-bootstrap.ts` — the `/flow` extension command that pre-fills `/plan <prompt>` to enter native plan mode
 - `agents/scout.md` — the read-only investigator (`@smol`, blocking, tools: read/grep/glob)
 - `agents/gate.md` — the independent reviewer (`@slow`, blocking, tools: read/grep/glob)
 - `skills/leanflow/SKILL.md` — the workflow rationale + config
 
 ## Usage
 
-In a target repo, start `omp` and run:
+In a target repo, start `omp` (interactive TUI) and run:
 
 ```text
 /flow <task>
@@ -127,8 +128,10 @@ For example:
 /flow Fix the off-by-one in the pagination cursor decoder
 ```
 
-The main session enters plan mode, investigates, writes the plan, requests approval via `xd://propose`. After you approve (and pick the execution model), the same session implements, validates, writes the diff/build artifacts, spawns the gate, and reports PASS or the final FAIL findings.
+The `/flow` **extension command** reads `commands/flow.md`, renders `{{ARGUMENTS}}` with your task, and pre-fills the editor with `/plan <workflow prompt>`. Hit **Enter** to enter OMP native plan mode — the session switches to `@plan`, tool set becomes read-only, and the workflow prompt is the first plan-mode turn. The main session investigates, writes `local://<slug>-plan.md`, and requests approval via `xd://propose`. After you approve (and pick the execution model), the same session implements, validates, writes the diff/build artifacts, spawns the gate, and reports PASS or the final FAIL findings.
+
+> **Why an extension, not just a markdown command?** OMP only enters plan mode from the `/plan` builtin or the plan key — a plain markdown slash command expands into a normal prompt and cannot toggle plan mode. The extension command closes that gap by pre-filling `/plan <prompt>`. In print mode (`omp -p`), where the extension runner is not loaded and plan mode is unavailable anyway, `/flow` falls back to the markdown file command.
 
 ## Compatibility
 
-OMP major 17 (verified on 17.1.3). Uses: `.omp/commands/*.md` markdown slash commands, custom agents (`agents/*.md` frontmatter `name`/`tools`/`model`/`blocking`), native `task({agent,outputSchema,schemaMode})` tool, `local://` artifacts, `xd://propose` plan approval, native `ModelRole` enum + `@` aliases, native plan mode (auto model switch + approval overlay).
+OMP major 17 (verified on 17.1.3). Uses: `.omp/commands/*.md` markdown slash commands, `.omp/extensions/*.ts` extension modules (registerCommand + setEditorText), custom agents (`agents/*.md` frontmatter `name`/`tools`/`model`/`blocking`), native `task({agent,outputSchema,schemaMode})` tool, `local://` artifacts, `xd://propose` plan approval, native `ModelRole` enum + `@` aliases, native plan mode (auto model switch + approval overlay). Extension commands take precedence over file commands in the TUI (builtin > skill > extension > custom > file).
