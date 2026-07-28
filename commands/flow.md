@@ -63,7 +63,12 @@ After approval, native plan mode exits and the same Main Session becomes Builder
 3. Implement the approved plan; do not create an implementer, developer, coder, or builder subagent.
 4. Run every planned validation command. Record command, exit code, complete output reference, and result in `build.md`.
 5. Write the complete final diff to `local://<slug>-diff.md`; record final status, changed paths, and final HEAD in `build.md`.
-6. Collect runtime evidence for Gate. Run every command the plan's Verification section requires (git diff, docker inspect, compose ps, psql queries, image version checks, etc.) and write the complete output of each into `local://<slug>-evidence.md` with a heading per command. Gate has no shell access; this file is its only runtime evidence source.
+6. Collect runtime evidence for Gate. Write `local://<slug>-evidence.md` with one `## <command>` heading per command. At minimum include:
+   - Every command from the plan's Verification section, with full output
+   - `git diff <base> -- <changed-paths>` for each changed file
+   - `git status --short` final state
+   - Test suite summary line (runs/assertions/failures/errors)
+   Gate has no shell access; this file is its only runtime evidence source.
 
 ## GATE
 
