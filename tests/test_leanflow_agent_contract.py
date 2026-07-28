@@ -1,130 +1,74 @@
-#!/usr/bin/env python3
-"""Contract tests for LeanFlow agent and command frontmatter."""
-
 from __future__ import annotations
 
 import re
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[1]
 
 
-FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n(.*)$", re.DOTALL)
-
-
-def parse_frontmatter(path: Path) -> tuple[dict[str, str], str]:
+def frontmatter(path: Path) -> tuple[dict[str, str], str]:
     text = path.read_text(encoding="utf-8")
-    match = FRONTMATTER_RE.match(text)
-    if not match:
-        raise AssertionError(f"{path} has no frontmatter")
-    fm_text, body = match.group(1), match.group(2)
-    fm: dict[str, str] = {}
-    for line in fm_text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if ":" not in line:
-            continue
-        key, _, value = line.partition(":")
-        fm[key.strip()] = value.strip().strip('"').strip("'")
-    return fm, body
+    raw, body = text.split("---\n", 2)[1:]
+    values = {}
+    for line in raw.splitlines():
+        if ":" in line and not line.startswith((" ", "\t")):
+            key, value = line.split(":", 1)
+            values[key] = value.strip().strip('"')
+    return values, body
 
 
-def tools_set(fm: dict[str, str]) -> set[str]:
-    return {t.strip() for t in fm.get("tools", "").split(",") if t.strip()}
+class MinimalRoleContractTest(unittest.TestCase):
+    def test_only_scout_and_gate_agent_files_exist(self) -> None:
+        self.assertEqual(sorted(path.name for path in (ROOT / "agents").glob("*.md")), ["gate.md", "scout.md"])
 
+    def test_scout_is_a_leaf_fact_finder(self) -> None:
+        metadata, body = frontmatter(ROOT / "agents" / "scout.md")
+        self.assertEqual(metadata["name"], "scout")
+        self.assertEqual(metadata["model"], "@smol")
+        self.assertEqual(metadata["tools"], "read, grep, glob, web_search")
+        self.assertNotIn("spawns", metadata)
+        for required in ("Facts:", "Files:", "Sources:", "Unknowns:", "do not write plans", "return PASS/FAIL", "spawn agents"):
+            self.assertIn(required, body)
+        self.assertEqual(body.count("yield(result:"), 1)
 
-class AgentContractTest(unittest.TestCase):
-    def test_scout_frontmatter_readonly(self) -> None:
-        fm, body = parse_frontmatter(ROOT / "agents" / "scout.md")
-        self.assertEqual(fm.get("name"), "scout")
-        self.assertEqual(fm.get("model"), "@smol")
-        self.assertEqual(fm.get("blocking"), "true")
-        tools = tools_set(fm)
-        self.assertEqual(tools, {"read", "grep", "glob"})
-        # no write/exec/lsp tools — mechanically read-only per OMP READ_ONLY_TOOL_NAMES
-        self.assertNotIn("edit", tools)
-        self.assertNotIn("write", tools)
-        self.assertNotIn("bash", tools)
-        self.assertNotIn("lsp", tools)
-        self.assertNotIn("spawns", fm)
-        self.assertNotIn("task", fm)
-        # body mentions the structured output
-        self.assertIn("Files:", body)
-        self.assertIn("Symbols:", body)
-        self.assertIn("Unknowns:", body)
+    def test_gate_is_the_only_independent_reviewer(self) -> None:
+        metadata, body = frontmatter(ROOT / "agents" / "gate.md")
+        self.assertEqual(metadata["name"], "gate")
+        self.assertEqual(metadata["model"], "@slow")
+        self.assertEqual(metadata["tools"], "read, grep, glob, task")
+        self.assertEqual(metadata["spawns"], "scout")
+        self.assertIn("Do not call any reviewer, auditor, validator, planner, or implementer.", body)
+        self.assertIn("only independent reviewer", body)
+        self.assertIn("at most once per Gate call", body)
+        self.assertIn("no shell access", body)
+        self.assertIn("evidence.md", body)
+        self.assertIn("never runs shell commands", body)
 
-    def test_gate_frontmatter_readonly(self) -> None:
-        fm, body = parse_frontmatter(ROOT / "agents" / "gate.md")
-        self.assertEqual(fm.get("name"), "gate")
-        self.assertEqual(fm.get("model"), "@slow")
-        self.assertEqual(fm.get("blocking"), "true")
-        tools = tools_set(fm)
-        self.assertEqual(tools, {"read", "grep", "glob"})
-        # no write/exec tools — mechanically read-only, cannot run git or tests
-        self.assertNotIn("edit", tools)
-        self.assertNotIn("write", tools)
-        self.assertNotIn("bash", tools)
-        self.assertNotIn("lsp", tools)
-        self.assertNotIn("spawns", fm)
-        self.assertNotIn("task", fm)
-        self.assertIn("PASS", body)
-        self.assertIn("FAIL", body)
+    def test_flow_has_only_three_agent_roles(self) -> None:
+        text = (ROOT / "commands" / "flow.md").read_text(encoding="utf-8")
+        self.assertIn("## LEANFLOW ROLE POLICY", text)
+        self.assertIn("Only three roles exist:", text)
+        self.assertIn("Planner and Builder are the same Main Session", text)
+        self.assertIn('agent: "scout"', text)
+        self.assertIn('agent: "gate"', text)
+        self.assertNotIn("repo-reviewer", text)
+        self.assertNotRegex(text, r'agent:\s*"[^"]*(?:review|audit|implementer|builder)[^"]*"')
+        self.assertIn("at most **3 Scout + 1 Gate**", text)
+        self.assertIn("at most **3 Scout + 2 Gate**", text)
+        self.assertIn("evidence.md", text)
+        self.assertIn("Gate has no shell access", text)
 
-    def test_flow_command_native_plan_mode(self) -> None:
-        path = ROOT / "commands" / "flow.md"
-        text = path.read_text(encoding="utf-8")
-        # correct arg token ({{args}} would comma-join words)
-        self.assertIn("{{ARGUMENTS}}", text)
-        self.assertNotIn("{{args}}", text)
-        for section in ("PLAN", "BUILD", "GATE", "LOOP"):
-            self.assertIn(section, text)
-        # native plan mode integration
-        self.assertIn("plan mode", text.lower())
-        self.assertIn("local://<slug>-plan.md", text)  # canonical plan artifact
-        self.assertIn("xd://propose", text)  # native approval path
-        # native task tool, not eval agent()
-        self.assertIn("task({", text)
-        self.assertIn("outputSchema", text)
-        self.assertNotIn('"schema":', text)  # legacy field rejected by OMP
-        # gate reads diff artifact, does not run git
-        self.assertIn("local://<slug>-diff.md", text)
-        # scout batch form
-        self.assertIn("agent: \"scout\"", text)
-        # single-writer rule present
-        self.assertIn("Single writer", text)
-        # max 2 gate calls
-        self.assertIn("2 gate calls", text)
-        # role check
-        self.assertIn("Role check", text)
-        # FAIL loop re-writes diff artifact (gate has no bash, reads diff by reference)
-        self.assertIn("re-write `local://<slug>-diff.md`", text)
-        # gate does not run git (mechanical read-only)
-        self.assertIn("gate does not run `git`", text.lower())
-
-    def test_flow_scout_batch_form(self) -> None:
-        path = ROOT / "commands" / "flow.md"
-        text = path.read_text(encoding="utf-8")
-        # scout spawn uses native task batch with context + tasks
-        self.assertIn("context:", text)
-        self.assertIn("tasks:", text)
-        self.assertIn("agent: \"scout\"", text)
-        # max 3 scouts total per run
-        self.assertIn("3", text)
-
-    def test_skill_rationale_not_lifecycle_dup(self) -> None:
-        path = ROOT / "skills" / "leanflow" / "SKILL.md"
-        text = path.read_text(encoding="utf-8")
-        self.assertIn("name: leanflow", text)
-        self.assertIn("@plan", text)
-        self.assertIn("@smol", text)
-        self.assertIn("@slow", text)
-        # rationale present
-        self.assertIn("Why the Planner is the main session", text)
-        self.assertIn("Why the Gate must be independent", text)
-        # skill defers lifecycle to /flow, does not duplicate step-by-step
-        self.assertIn("authoritative instruction set", text)
+    def test_docs_and_skill_describe_minimal_architecture(self) -> None:
+        for path in (ROOT / "skills" / "leanflow" / "SKILL.md", ROOT / "docs" / "leanflow.md"):
+            text = path.read_text(encoding="utf-8")
+            self.assertIn("Planner", text)
+            self.assertIn("Scout", text)
+            self.assertIn("Builder", text)
+            self.assertIn("Gate", text)
+            self.assertNotIn("Repo Reviewer", text)
+            self.assertNotIn("repo-reviewer", text)
+            self.assertIn("evidence.md", text)
 
 
 if __name__ == "__main__":
