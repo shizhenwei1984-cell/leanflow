@@ -14,6 +14,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 INSTALLER = ROOT / "scripts" / "install_leanflow.py"
+DEFAULT_MODE = "copy" if os.name == "nt" else "symlink"
+INSTALL_PATHS = (
+    "commands/flow.md",
+    "agents/scout.md",
+    "agents/gate.md",
+    "skills/leanflow/SKILL.md",
+    "extensions/leanflow-bootstrap.ts",
+)
 
 
 def run_installer(*args: str, env: dict | None = None) -> tuple[int, str, str]:
@@ -41,12 +49,22 @@ class InstallTest(unittest.TestCase):
         env["PI_CODING_AGENT_DIR"] = str(self.fake_agent_dir)
         return env
 
-    def test_dry_run_user_symlink(self) -> None:
+    def assert_default_install_target(self, relative: str) -> None:
+        target = self.fake_agent_dir / relative
+        if DEFAULT_MODE == "symlink":
+            self.assertTrue(target.is_symlink(), f"{relative} should be a symlink")
+            self.assertTrue(target.resolve(strict=True).exists(), f"{relative} link target missing")
+        else:
+            self.assertTrue(target.is_file(), f"{relative} should be a copied file")
+            self.assertFalse(target.is_symlink(), f"{relative} should not be a symlink")
+            self.assertEqual(target.read_bytes(), (ROOT / relative).read_bytes())
+
+    def test_dry_run_uses_platform_default_mode(self) -> None:
         rc, out, _ = run_installer("--dry-run", "--scope", "user", env=self._env())
         self.assertEqual(rc, 0, out)
         data = json.loads(out)
         self.assertTrue(data["ok"])
-        self.assertEqual(data["mode"], "symlink")
+        self.assertEqual(data["mode"], DEFAULT_MODE)
         self.assertEqual(data["scope"], "user")
         self.assertEqual(data["base"], str(self.fake_agent_dir.resolve()))
         paths = sorted(e["path"] for e in data["entries"])
@@ -61,34 +79,29 @@ class InstallTest(unittest.TestCase):
             self.assertEqual(entry["state"], "absent")
             self.assertEqual(entry["kind"], "file")
 
-    def test_apply_and_uninstall_symlink(self) -> None:
+    def test_apply_and_uninstall_platform_default_mode(self) -> None:
         env = self._env()
         rc, out, _ = run_installer("--apply", "--scope", "user", env=env)
         self.assertEqual(rc, 0, out)
         data = json.loads(out)
         self.assertTrue(data["ok"])
-        # files installed
-        for rel in ("commands/flow.md", "agents/scout.md", "agents/gate.md", "skills/leanflow/SKILL.md", "extensions/leanflow-bootstrap.ts"):
-            target = self.fake_agent_dir / rel
-            self.assertTrue(target.is_symlink(), f"{rel} should be a symlink")
-            self.assertTrue(target.resolve(strict=True).exists(), f"{rel} link target missing")
-        # metadata present
+        self.assertEqual(data["mode"], DEFAULT_MODE)
+        for relative in INSTALL_PATHS:
+            self.assert_default_install_target(relative)
         self.assertTrue((self.fake_agent_dir / "leanflow-install.json").exists())
 
-        # uninstall dry-run
         rc, out, _ = run_installer("--uninstall", "--dry-run", "--scope", "user", env=env)
         self.assertEqual(rc, 0, out)
         data = json.loads(out)
         self.assertTrue(data["ok"])
         self.assertEqual(data["action"], "uninstall-dry-run")
 
-        # uninstall apply
         rc, out, _ = run_installer("--uninstall", "--apply", "--scope", "user", env=env)
         self.assertEqual(rc, 0, out)
         data = json.loads(out)
         self.assertTrue(data["ok"])
-        for rel in ("commands/flow.md", "agents/scout.md", "agents/gate.md", "skills/leanflow/SKILL.md", "extensions/leanflow-bootstrap.ts"):
-            self.assertFalse((self.fake_agent_dir / rel).exists(), f"{rel} should be removed")
+        for relative in INSTALL_PATHS:
+            self.assertFalse((self.fake_agent_dir / relative).exists(), f"{relative} should be removed")
         self.assertFalse((self.fake_agent_dir / "leanflow-install.json").exists())
 
     def test_apply_copy_mode(self) -> None:
@@ -97,12 +110,11 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         data = json.loads(out)
         self.assertTrue(data["ok"])
-        for rel in ("commands/flow.md", "agents/scout.md", "agents/gate.md", "skills/leanflow/SKILL.md", "extensions/leanflow-bootstrap.ts"):
-            target = self.fake_agent_dir / rel
-            self.assertTrue(target.is_file(), f"{rel} should be a real file (copy)")
-            self.assertFalse(target.is_symlink(), f"{rel} should not be a symlink in copy mode")
+        for relative in INSTALL_PATHS:
+            target = self.fake_agent_dir / relative
+            self.assertTrue(target.is_file(), f"{relative} should be a real file (copy)")
+            self.assertFalse(target.is_symlink(), f"{relative} should not be a symlink in copy mode")
 
-        # uninstall
         rc, out, _ = run_installer("--uninstall", "--apply", "--scope", "user", env=env)
         self.assertEqual(rc, 0, out)
 
@@ -115,27 +127,21 @@ class InstallTest(unittest.TestCase):
         self.assertTrue(data["ok"])
         self.assertEqual(data["base"], str((project / ".omp").resolve()))
 
-    def test_force_replaces_existing_symlink(self) -> None:
+    def test_force_replaces_existing_platform_default_install(self) -> None:
         env = self._env()
-        # first install in default symlink mode
         rc, out, _ = run_installer("--apply", "--scope", "user", env=env)
         self.assertEqual(rc, 0, out)
-        # second install without force fails (existing symlink targets)
         rc, out, _ = run_installer("--dry-run", "--scope", "user", env=env)
         data = json.loads(out)
         self.assertFalse(data["ok"])
         self.assertIn("force", data.get("error", ""))
-        # with force, symlink mode re-installs in place (no source_overlap false positive)
         rc, out, _ = run_installer("--apply", "--scope", "user", "--force", env=env)
         self.assertEqual(rc, 0, out)
         data = json.loads(out)
         self.assertTrue(data["ok"], f"force re-install failed: {data}")
         self.assertNotIn("overlaps", data)
-        # files still valid symlinks pointing at source
-        for rel in ("commands/flow.md", "agents/scout.md", "agents/gate.md", "skills/leanflow/SKILL.md", "extensions/leanflow-bootstrap.ts"):
-            target = self.fake_agent_dir / rel
-            self.assertTrue(target.is_symlink(), f"{rel} should still be a symlink after force")
-            self.assertTrue(target.resolve(strict=True).exists(), f"{rel} link target missing after force")
+        for relative in INSTALL_PATHS:
+            self.assert_default_install_target(relative)
 
 
 if __name__ == "__main__":

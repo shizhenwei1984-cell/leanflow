@@ -69,4 +69,4 @@ skills/leanflow/SKILL.md
 extensions/leanflow-bootstrap.ts
 ```
 
-Use `python3 scripts/install_leanflow.py --scope user --mode symlink --apply` to install them under the user OMP agent directory.
+Use `python3 scripts/install_leanflow.py --scope user --apply` to install them under the user OMP agent directory. The default is symlink mode on POSIX and copy mode on Windows, where ordinary user accounts usually lack the privilege to create symlinks. Pass `--mode symlink` explicitly on Windows only when that privilege is enabled.

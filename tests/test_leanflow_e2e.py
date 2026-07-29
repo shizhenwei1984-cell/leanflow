@@ -29,6 +29,14 @@ class WorkflowPromptTest(unittest.TestCase):
         self.assertIn("evidence.md", text)
         self.assertIn("Gate has no shell access", text)
 
+    def test_flow_requires_chinese_user_communication(self) -> None:
+        text = (ROOT / "commands" / "flow.md").read_text(encoding="utf-8")
+        self.assertIn("## USER LANGUAGE", text)
+        self.assertIn("All communication addressed to the user MUST be in Simplified Chinese.", text)
+        self.assertIn("`ask` questions, option labels and descriptions", text)
+        self.assertIn("canonical plan shown for approval", text)
+        self.assertIn("Write the decision-complete canonical plan in Simplified Chinese", text)
+
     def test_extension_remains_thin_plan_bootstrap(self) -> None:
         text = (ROOT / "extensions" / "leanflow-bootstrap.ts").read_text(encoding="utf-8")
         self.assertIn('registerCommand("flow"', text)

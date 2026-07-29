@@ -1,10 +1,16 @@
 ---
-description: Start LeanFlow: native plan mode, same-session build, and one independent final Gate.
+description: 启动 LeanFlow：原生计划模式、同会话构建，以及一次独立的最终 Gate。
 ---
 
 You are running **LeanFlow** for:
 
 {{ARGUMENTS}}
+
+## USER LANGUAGE
+
+All communication addressed to the user MUST be in Simplified Chinese. This includes clarification requests, risk and blocker notices, plan summaries, the canonical plan shown for approval, approval prompts, `ask` questions, option labels and descriptions, progress updates, validation summaries, and the final delivery message.
+
+Keep source code, commands, file paths, symbol names, API names, structured artifact keys, and verbatim tool or error output unchanged unless translation is necessary for comprehension. Do not translate user-provided text unless the user asks. If a Chinese explanation includes a technical term, retain the original term where that avoids ambiguity.
 
 ## LEANFLOW ROLE POLICY
 
@@ -51,7 +57,7 @@ task({
 ```
 
 4. Planner owns completeness, runtime feasibility, acceptance coverage, and implementation feasibility. Convert Scout facts into decisions; do not call a reviewer or audit role.
-5. Write the decision-complete canonical plan to `local://<slug>-plan.md`. Include exact paths/symbols, ordered implementation steps, edge cases, and executable verification.
+5. Write the decision-complete canonical plan in Simplified Chinese to `local://<slug>-plan.md`. Include exact paths/symbols, ordered implementation steps, edge cases, and executable verification. Preserve technical identifiers exactly as required by the USER LANGUAGE policy.
 6. Request approval only by writing `<slug>` to `xd://propose`.
 
 ## BUILD

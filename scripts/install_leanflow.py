@@ -385,6 +385,142 @@ def materialize(source: Path, kind: str, target: Path, mode: str) -> None:
     else:
         shutil.copy2(str(source), str(target))
 
+def path_parent(root: Path, relative: str, create: bool = False, created: Optional[List[str]] = None) -> Path:
+    parts = validate_relative(relative).parts[:-1]
+    current = root
+    traversed: List[str] = []
+    for component in parts:
+        traversed.append(component)
+        current = current / component
+        if current.exists():
+            if current.is_symlink() or not current.is_dir():
+                raise InstallError("unsafe installation parent: %s" % "/".join(traversed))
+        elif create:
+            current.mkdir()
+            if created is not None:
+                created.append("/".join(traversed))
+        else:
+            raise FileNotFoundError(current)
+    return current
+
+
+def path_replace(source_root: Path, source_relative: str, destination_root: Path, destination_relative: str, create_destination: bool = False, created: Optional[List[str]] = None) -> None:
+    source = target_for(source_root, source_relative)
+    destination = target_for(destination_root, destination_relative)
+    path_parent(destination_root, destination_relative, create_destination, created)
+    os.replace(str(source), str(destination))
+
+
+def install_windows(root: Path, base: Path, scope: str, mode: str, force: bool, apply: bool) -> Mapping[str, Any]:
+    sources = package_sources(root)
+    entries = planned_entries(sources, base, mode)
+    conflicts = [entry["path"] for entry in entries if entry["state"] != "absent"]
+    metadata_snapshot = target_snapshot(metadata_path(base))
+    if metadata_snapshot is not None:
+        conflicts.append(METADATA_NAME)
+    blocked_ancestors = ancestor_conflicts(base, entries)
+    result: Dict[str, Any] = {
+        "action": "apply" if apply else "dry-run",
+        "ancestor_conflicts": blocked_ancestors,
+        "base": str(base),
+        "conflicts": sorted(conflicts),
+        "entries": entries,
+        "force": force,
+        "mode": mode,
+        "scope": scope,
+    }
+    overlaps = [entry["path"] for entry in entries if entry["source_overlap"]]
+    if overlaps:
+        result["ok"] = False
+        result["error"] = "installation target overlaps package source"
+        result["overlaps"] = overlaps
+        return result
+    if blocked_ancestors:
+        result["ok"] = False
+        result["error"] = "blocking ancestor collisions cannot be replaced"
+        return result
+    if conflicts and not force:
+        result["ok"] = False
+        result["error"] = "existing targets require --force"
+        return result
+    result["ok"] = True
+    if not apply:
+        return result
+
+    base_existed = base.exists()
+    base.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=".leanflow-stage-", dir=str(base)))
+    backup = Path(tempfile.mkdtemp(prefix=".leanflow-backup-", dir=str(base)))
+    backed_up: List[str] = []
+    metadata_backed_up = False
+    created_parents: List[str] = []
+    promoted: List[str] = []
+    metadata_promoted = False
+    preserve_backup = False
+    try:
+        for entry, (_, source, kind) in zip(entries, sources):
+            materialize(source, kind, target_for(stage, entry["path"]), mode)
+        write_metadata_atomic(stage, install_metadata(scope, mode, entries))
+        for entry in entries:
+            path_parent(base, entry["path"], create=True, created=created_parents)
+            if target_snapshot(target_for(base, entry["path"])) != entry["snapshot"]:
+                raise InstallError("installation target changed after preflight: %s" % entry["path"])
+        if target_snapshot(metadata_path(base)) != metadata_snapshot:
+            raise InstallError("installation metadata target changed after preflight")
+        for entry in entries:
+            if entry["state"] != "absent":
+                path_replace(base, entry["path"], backup, entry["path"], create_destination=True)
+                backed_up.append(entry["path"])
+        if metadata_snapshot is not None:
+            path_replace(base, METADATA_NAME, backup, METADATA_NAME, create_destination=True)
+            metadata_backed_up = True
+        for entry in entries:
+            path_replace(stage, entry["path"], base, entry["path"])
+            promoted.append(entry["path"])
+        path_replace(stage, METADATA_NAME, base, METADATA_NAME)
+        metadata_promoted = True
+    except Exception as exc:
+        rollback_errors: List[str] = []
+        for relative in reversed(promoted):
+            try:
+                path_replace(base, relative, stage, "rollback/" + relative, create_destination=True)
+            except OSError as rollback_exc:
+                rollback_errors.append(str(rollback_exc))
+        if metadata_promoted:
+            try:
+                path_replace(base, METADATA_NAME, stage, "rollback-" + METADATA_NAME, create_destination=True)
+            except OSError as rollback_exc:
+                rollback_errors.append(str(rollback_exc))
+        for relative in reversed(backed_up):
+            try:
+                path_replace(backup, relative, base, relative, create_destination=True)
+            except OSError as rollback_exc:
+                rollback_errors.append(str(rollback_exc))
+        if metadata_backed_up:
+            try:
+                path_replace(backup, METADATA_NAME, base, METADATA_NAME, create_destination=True)
+            except OSError as rollback_exc:
+                rollback_errors.append(str(rollback_exc))
+        for relative in sorted(set(created_parents), key=lambda value: len(PurePosixPath(value).parts), reverse=True):
+            try:
+                path_parent(base, relative + "/placeholder").rmdir()
+            except OSError:
+                pass
+        if rollback_errors:
+            preserve_backup = True
+            raise InstallError("installation failed and rollback was incomplete: %s; recoverable originals are preserved at %s; %s" % (exc, backup, "; ".join(rollback_errors))) from exc
+        raise InstallError("installation failed before completion: %s" % exc) from exc
+    finally:
+        shutil.rmtree(str(stage), ignore_errors=True)
+        if not preserve_backup:
+            shutil.rmtree(str(backup), ignore_errors=True)
+        if not base_existed:
+            try:
+                base.rmdir()
+            except OSError:
+                pass
+    return result
+
 
 def create_target_parents(
     base_fd: int,
@@ -399,6 +535,8 @@ def create_target_parents(
 
 
 def install(root: Path, base: Path, scope: str, mode: str, force: bool, apply: bool) -> Mapping[str, Any]:
+    if os.name == "nt":
+        return install_windows(root, base, scope, mode, force, apply)
     sources = package_sources(root)
     entries = planned_entries(sources, base, mode)
     conflicts = [entry["path"] for entry in entries if entry["state"] != "absent"]
@@ -623,7 +761,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     actions.add_argument("--dry-run", action="store_true", help="show changes without writing (default)")
     actions.add_argument("--apply", action="store_true", help="perform installation")
     parser.add_argument("--uninstall", action="store_true", help="select metadata-verified uninstall; combine with --apply to remove")
-    parser.add_argument("--mode", choices=("symlink", "copy"), default="symlink")
+    parser.add_argument("--mode", choices=("symlink", "copy"), default="copy" if os.name == "nt" else "symlink")
     parser.add_argument("--scope", choices=("user", "project"), default="user")
     parser.add_argument("--project-root", help="target project root; defaults to cwd for project scope")
     parser.add_argument("--force", action="store_true", help="replace existing install targets during installation")
