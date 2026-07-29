@@ -20,7 +20,7 @@ INSTALL_PATHS = (
     "agents/scout.md",
     "agents/gate.md",
     "skills/leanflow/SKILL.md",
-    "extensions/leanflow-bootstrap.ts",
+    "extensions/leanflow",
 )
 
 
@@ -51,13 +51,17 @@ class InstallTest(unittest.TestCase):
 
     def assert_default_install_target(self, relative: str) -> None:
         target = self.fake_agent_dir / relative
+        source = ROOT / relative
         if DEFAULT_MODE == "symlink":
             self.assertTrue(target.is_symlink(), f"{relative} should be a symlink")
             self.assertTrue(target.resolve(strict=True).exists(), f"{relative} link target missing")
+        elif source.is_dir():
+            self.assertTrue(target.is_dir(), f"{relative} should be a copied directory")
+            self.assertFalse(target.is_symlink(), f"{relative} should not be a symlink")
         else:
             self.assertTrue(target.is_file(), f"{relative} should be a copied file")
             self.assertFalse(target.is_symlink(), f"{relative} should not be a symlink")
-            self.assertEqual(target.read_bytes(), (ROOT / relative).read_bytes())
+            self.assertEqual(target.read_bytes(), source.read_bytes())
 
     def test_dry_run_uses_platform_default_mode(self) -> None:
         rc, out, _ = run_installer("--dry-run", "--scope", "user", env=self._env())
@@ -72,12 +76,16 @@ class InstallTest(unittest.TestCase):
             "agents/gate.md",
             "agents/scout.md",
             "commands/flow.md",
-            "extensions/leanflow-bootstrap.ts",
+            "extensions/leanflow",
             "skills/leanflow/SKILL.md",
         ])
         for entry in data["entries"]:
             self.assertEqual(entry["state"], "absent")
-            self.assertEqual(entry["kind"], "file")
+        kinds = {e["path"]: e["kind"] for e in data["entries"]}
+        self.assertEqual(kinds["extensions/leanflow"], "directory")
+        for path, kind in kinds.items():
+            if path != "extensions/leanflow":
+                self.assertEqual(kind, "file")
 
     def test_apply_and_uninstall_platform_default_mode(self) -> None:
         env = self._env()
@@ -112,7 +120,11 @@ class InstallTest(unittest.TestCase):
         self.assertTrue(data["ok"])
         for relative in INSTALL_PATHS:
             target = self.fake_agent_dir / relative
-            self.assertTrue(target.is_file(), f"{relative} should be a real file (copy)")
+            source = ROOT / relative
+            if source.is_dir():
+                self.assertTrue(target.is_dir(), f"{relative} should be a real directory (copy)")
+            else:
+                self.assertTrue(target.is_file(), f"{relative} should be a real file (copy)")
             self.assertFalse(target.is_symlink(), f"{relative} should not be a symlink in copy mode")
 
         rc, out, _ = run_installer("--uninstall", "--apply", "--scope", "user", env=env)

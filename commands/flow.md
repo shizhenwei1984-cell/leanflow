@@ -1,5 +1,5 @@
 ---
-description: 启动 LeanFlow：原生计划模式、同会话构建，以及一次独立的最终 Gate。
+description: 启动 LeanFlow：Extension 驱动的 plan → build → gate 工作流。
 ---
 
 You are running **LeanFlow** for:
@@ -112,13 +112,13 @@ task({
 })
 ```
 
-- `PASS`: finish. Do not create another reviewer or audit.
-- First `FAIL`: Main repairs, re-runs required validation, refreshes diff/build/evidence artifacts, then calls Gate once more.
-- Second `FAIL`: report Gate's blocking findings. Do not create any further agents.
+:- `PASS`: finish. Do not create another reviewer or audit.
+:- First `FAIL`: Main repairs, re-runs required validation, refreshes diff/build/evidence artifacts, then calls Gate once more.
+:- Second `FAIL`: report Gate's blocking findings. Do not create any further agents.
 
 ## Limits
 
-- Normal complex run: at most **3 Scout + 1 Gate**.
-- Worst case after repair: at most **3 Scout + 2 Gate**.
-- Gate may request one Scout fact only when an approved-plan correctness or compatibility fact cannot be established from repository, diff, or validation evidence. That Scout never reviews or returns a verdict.
-- No task name or agent role may contain `Audit`, `Review`, `Reviewer`, `FinalAudit`, `Reaudit`, `Coverage`, `RuntimeAudit`, or `ApprovalAudit`.
+:- Normal complex run: at most **3 Scout + 1 Gate**.
+:- Worst case after repair: at most **3 Scout + 2 Gate**.
+:- Gate may request one Scout fact only when an approved-plan correctness or compatibility fact cannot be established from repository, diff, or validation evidence. That Scout never reviews or returns a verdict.
+:- No task name or agent role may contain `Audit`, `Review`, `Reviewer`, `FinalAudit`, `Reaudit`, `Coverage`, `RuntimeAudit`, or `ApprovalAudit`.

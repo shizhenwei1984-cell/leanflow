@@ -37,13 +37,28 @@ class WorkflowPromptTest(unittest.TestCase):
         self.assertIn("canonical plan shown for approval", text)
         self.assertIn("Write the decision-complete canonical plan in Simplified Chinese", text)
 
-    def test_extension_remains_thin_plan_bootstrap(self) -> None:
-        text = (ROOT / "extensions" / "leanflow-bootstrap.ts").read_text(encoding="utf-8")
-        self.assertIn('registerCommand("flow"', text)
-        self.assertIn('setEditorText(`/plan ${rendered}`)', text)
-        self.assertIn("Main + optional Scout only", text)
-        self.assertNotIn("repo-reviewer", text)
-        self.assertNotIn("audit", text.lower())
+    def test_extension_has_state_machine_and_guard(self) -> None:
+        ext_dir = ROOT / "extensions" / "leanflow"
+        self.assertTrue(ext_dir.is_dir())
+        index = (ext_dir / "index.ts").read_text(encoding="utf-8")
+        self.assertIn('registerCommand("flow"', index)
+        self.assertIn("setEditorText(`/plan ${prompt}`)", index)
+        self.assertIn("tool_call", index)
+        self.assertIn("tool_result", index)
+        self.assertIn("context", index)
+        self.assertIn("appendEntry", index)
+        self.assertNotIn("repo-reviewer", index)
+        guard = (ext_dir / "guard.ts").read_text(encoding="utf-8")
+        self.assertIn("FORBIDDEN_PATTERN", guard)
+        self.assertIn("checkTaskGuard", guard)
+        state = (ext_dir / "state.ts").read_text(encoding="utf-8")
+        self.assertIn("LeanFlowPhase", state)
+        self.assertIn("restoreState", state)
+        handoff = (ext_dir / "handoff.ts").read_text(encoding="utf-8")
+        self.assertIn("READY_WITH_WARNINGS", handoff)
+        self.assertIn("NEEDS_UPDATE", handoff)
+        context = (ext_dir / "context.ts").read_text(encoding="utf-8")
+        self.assertIn("filterForBuilder", context)
 
 
 class InstalledDiscoveryTest(unittest.TestCase):

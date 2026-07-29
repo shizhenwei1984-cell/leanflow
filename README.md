@@ -1,21 +1,46 @@
 # LeanFlow
 
-Low-handoff AI coding workflow for OMP (oh-my-pi).
+Low-handoff AI coding workflow for OMP. Extension-driven plan → build → gate with tool guards, context optimization, and minimal agent architecture.
 
-LeanFlow keeps PLAN and BUILD in the same main session, adds on-demand Scout
-investigators, and uses an independent read-only Gate reviewer. The normal path
-uses one Gate call; after one repair, a second is the limit. Same-session BUILD
-avoids cross-agent investigation re-send, while Gate inputs travel by bounded
-`local://` evidence artifacts rather than pasted prompts. After compact, the
-Builder re-reads the decision-complete canonical plan; raw investigation context
-is not guaranteed.
-
-## Install
+## Quick start
 
 ```bash
-python3 scripts/install_leanflow.py --scope user --dry-run
 python3 scripts/install_leanflow.py --scope user --apply
 ```
 
-See docs/leanflow.md for the workflow lifecycle and configuration.
+Then in OMP: `/flow <task description>`
 
+## Architecture
+
+```text
+LeanFlow Extension (state machine + guard + handoff + context filter)
+        │
+   Main Session
+     @plan Planner ──→ optional @smol Scout (0–3)
+        │
+   canonical plan → xd://propose approval
+        │
+     @default Builder (same session, filtered context)
+        │
+     @slow Gate (1 call; 2 after repair)
+```
+
+No reviewer, audit, validator, or implementer agents. Ever.
+
+## Package contents
+
+```text
+commands/flow.md              Workflow reference (kept for compatibility)
+agents/scout.md               Scout agent definition
+agents/gate.md                Gate agent definition
+skills/leanflow/SKILL.md      Skill documentation
+extensions/leanflow/          Extension control layer
+  index.ts                    Entry point: /flow command, event wiring
+  state.ts                    State machine types + persistence
+  guard.ts                    Tool guard (forbidden agent blocking)
+  handoff.ts                  Handoff advisor (plan assessment)
+  context.ts                  Builder context filter (token optimization)
+scripts/install_leanflow.py   Installer (symlink/copy, user/project scope)
+docs/leanflow.md              Detailed documentation
+tests/                        Test suite
+```

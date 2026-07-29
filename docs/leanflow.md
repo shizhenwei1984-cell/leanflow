@@ -1,6 +1,6 @@
 # LeanFlow
 
-LeanFlow minimizes handoffs by keeping planning and implementation in the same Main Session.
+LeanFlow minimizes handoffs by keeping planning and implementation in the same Main Session, with an extension-driven control layer providing state management, tool guards, and context optimization.
 
 ## Roles
 
@@ -22,19 +22,30 @@ Main Session
 
 There are no reviewer, audit, validator, planner, implementer, developer, coder, or builder subagents.
 
+## Extension Control Layer
+
+The LeanFlow extension (`extensions/leanflow/`) provides:
+
+- **State machine** — tracks `idle → planning → handoff → building → gating` phases, persisted via session entries (survives compaction)
+- **Tool guard** — blocks forbidden agent spawns (reviewer, audit, implementer, etc.) per phase
+- **Handoff advisor** — assesses plan completeness after write; READY/READY_WITH_WARNINGS proceed, NEEDS_UPDATE advises revision (never hard-blocks except critical gaps)
+- **Context filter** — during building phase, removes planning history from LLM context and injects a compact builder preamble referencing the approved plan artifact
+- **Budget enforcement** — max 3 Scout calls, max 2 Gate calls, enforced at the tool_call level
+
 ## Lifecycle
 
 ### PLAN
 
-1. Enter OMP native plan mode.
+1. `/flow` initializes the state machine and enters native plan mode with a minimal planning prompt.
 2. Planner understands the task and reads repository evidence.
 3. Use zero Scouts for simple work; use at most three focused Scouts for complex factual gaps.
 4. Planner owns completeness, runtime feasibility, acceptance coverage, and implementation feasibility.
 5. Write `local://<slug>-plan.md` and request approval with `xd://propose`.
+6. The extension assesses the plan (handoff advisor) and transitions to building.
 
 ### BUILD
 
-After approval, the same Main Session becomes Builder. It records baseline state, implements the approved plan, runs the planned checks, collects runtime evidence (git diff, docker/compose state, database queries, image versions, test output), and writes `local://<slug>-build.md`, `local://<slug>-diff.md`, plus `local://<slug>-evidence.md`. No code-writing subagent exists.
+After approval, the same Main Session becomes Builder. The extension filters planning history from context and injects a compact builder preamble. Builder records baseline state, implements the approved plan, runs the planned checks, collects runtime evidence, and writes `local://<slug>-build.md`, `local://<slug>-diff.md`, plus `local://<slug>-evidence.md`. No code-writing subagent exists.
 
 ### GATE
 
@@ -42,10 +53,6 @@ One independent Gate reads the canonical plan, final diff, build record, and run
 - PASS finishes the run.
 - First FAIL is repaired by Main, with refreshed validation and evidence, then one Gate retry is allowed.
 - Second FAIL is reported; no reviewer or audit chain is created.
-
-## Extension boundary
-
-`/flow` is intentionally a native-plan bootstrap. The available extension API can prefill `/plan` and display the planning status, but it does not expose plan-approval, build, Gate, or task-dispatch lifecycle hooks. LeanFlow therefore enforces the phase allow-list through the rendered workflow policy and agent declarations rather than inventing unenforceable extension state.
 
 ## Budgets
 
@@ -66,7 +73,16 @@ commands/flow.md
 agents/scout.md
 agents/gate.md
 skills/leanflow/SKILL.md
-extensions/leanflow-bootstrap.ts
+extensions/leanflow/          (directory: index.ts, state.ts, guard.ts, handoff.ts, context.ts)
 ```
 
-Use `python3 scripts/install_leanflow.py --scope user --apply` to install them under the user OMP agent directory. The default is symlink mode on POSIX and copy mode on Windows, where ordinary user accounts usually lack the privilege to create symlinks. Pass `--mode symlink` explicitly on Windows only when that privilege is enabled.
+Use `python3 scripts/install_leanflow.py --scope user --apply` to install them under the user OMP agent directory. The default is symlink mode on POSIX and copy mode on Windows.
+
+### Upgrading from v1
+
+If you previously installed LeanFlow v1 (single `leanflow-bootstrap.ts`), uninstall first:
+
+```bash
+python3 scripts/install_leanflow.py --scope user --uninstall --apply
+python3 scripts/install_leanflow.py --scope user --apply
+```

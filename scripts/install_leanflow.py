@@ -17,19 +17,27 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 PACKAGE = "leanflow"
 METADATA_NAME = "leanflow-install.json"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Source-relative path -> install-relative path -> kind.
 # Source files live at the leanflow package root; install targets live under
 # <base>/commands, <base>/agents, <base>/skills/leanflow.
-EXPECTED_KINDS = {
+EXPECTED_KINDS_V1 = {
     "commands/flow.md": "file",
     "agents/scout.md": "file",
     "agents/gate.md": "file",
     "skills/leanflow/SKILL.md": "file",
     "extensions/leanflow-bootstrap.ts": "file",
 }
-EXPECTED_KINDS_BY_VERSION = {1: EXPECTED_KINDS, SCHEMA_VERSION: EXPECTED_KINDS}
+
+EXPECTED_KINDS = {
+    "commands/flow.md": "file",
+    "agents/scout.md": "file",
+    "agents/gate.md": "file",
+    "skills/leanflow/SKILL.md": "file",
+    "extensions/leanflow": "directory",
+}
+EXPECTED_KINDS_BY_VERSION = {1: EXPECTED_KINDS_V1, SCHEMA_VERSION: EXPECTED_KINDS}
 
 
 class InstallError(Exception):

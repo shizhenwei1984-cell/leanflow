@@ -5,7 +5,7 @@ description: Low-handoff AI coding workflow for OMP — Planner/Main, optional S
 
 # LeanFlow
 
-LeanFlow uses a minimum-agent architecture:
+LeanFlow uses a minimum-agent architecture with an extension-driven control layer:
 
 - **Planner (`@plan`)** — Main Session plan mode. Understands the request, investigates, decides feasibility and acceptance coverage, writes the canonical plan, and requests approval.
 - **Scout (`@smol`)** — Optional cheap factual investigation. Finds repository facts, call paths, tests, official documentation, and external facts. It never plans, writes, reviews, returns PASS/FAIL, or spawns agents.
@@ -22,6 +22,16 @@ Main Session
 ```
 
 There are no repo reviewers, plan reviewers, auditors, validators, implementers, or reviewer chains. Planner owns plan completeness, runtime feasibility, acceptance coverage, and implementation feasibility. When confidence is insufficient, improve the plan or ask Scout one focused factual question.
+
+## Extension control layer
+
+The `/flow` command initializes an extension state machine (`idle → planning → handoff → building → gating`) that:
+
+- Blocks forbidden agent spawns (reviewer, audit, implementer, etc.) via tool_call interception
+- Assesses plan completeness after write (handoff advisor: READY / READY_WITH_WARNINGS / NEEDS_UPDATE)
+- Filters planning history from builder context (token optimization)
+- Enforces Scout (≤3) and Gate (≤2) budgets
+- Persists state via session entries (survives compaction)
 
 ## Limits
 
