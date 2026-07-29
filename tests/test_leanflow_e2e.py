@@ -106,6 +106,34 @@ class WorkflowPromptTest(unittest.TestCase):
         context = (ROOT / "extensions" / "leanflow" / "context.ts").read_text(encoding="utf-8")
         self.assertIn("state.approvalBoundary", context)
 
+    def test_gate_requires_build_evidence(self) -> None:
+        """P1: Gate is blocked until build/diff/evidence artifacts are written."""
+        state = (ROOT / "extensions" / "leanflow" / "state.ts").read_text(encoding="utf-8")
+        self.assertIn("writtenArtifacts", state)
+        index = (ROOT / "extensions" / "leanflow" / "index.ts").read_text(encoding="utf-8")
+        self.assertIn("missingArtifacts", index)
+        self.assertIn("Gate unavailable", index)
+        self.assertIn("REQUIRED_ARTIFACTS", index)
+        # Repair round resets evidence so it must be refreshed before re-gating.
+        self.assertIn("state.writtenArtifacts = []", index)
+
+    def test_lsp_is_not_a_build_action(self) -> None:
+        """P2: lsp (definition/hover/preview) must not trigger the building phase."""
+        index = (ROOT / "extensions" / "leanflow" / "index.ts").read_text(encoding="utf-8")
+        self.assertIn('new Set(["edit", "bash", "ast_edit"])', index)
+        self.assertNotIn('"lsp"', index)
+
+    def test_planner_prompt_has_no_gate_reference(self) -> None:
+        """P2: the Planner prompt must not mention Gate calls or build artifacts."""
+        index = (ROOT / "extensions" / "leanflow" / "index.ts").read_text(encoding="utf-8")
+        start = index.index("function buildPlanningPrompt")
+        # Bound to the planner function body only (exclude later helpers/comments).
+        end = index.index('].join("\\n");', start)
+        planner = index[start:end]
+        self.assertNotIn("Gate", planner)
+        self.assertNotIn("build.md", planner)
+        self.assertNotIn("evidence.md", planner)
+
 
 class InstalledDiscoveryTest(unittest.TestCase):
     def test_user_install_discovers_only_scout_and_gate(self) -> None:

@@ -28,15 +28,16 @@ import { checkTaskGuard, extractAgentNames, resolveRole } from "./guard";
 import { assessHandoff, formatHandoffNotification } from "./handoff";
 import { filterForBuilder } from "./context";
 
-/** Tools that mutate the repository — signal that building has started. */
-const BUILD_ACTION_TOOLS = new Set(["edit", "bash", "ast_edit", "lsp"]);
+/** Tools that mutate the repository — signal that building has started.
+ *  `lsp` is intentionally excluded: definition/hover/rename-preview are reads. */
+const BUILD_ACTION_TOOLS = new Set(["edit", "bash", "ast_edit"]);
 
 export default function leanflow(pi: ExtensionAPI): void {
 	let state: LeanFlowState = defaultState();
-
 	// Correlate tool_call → tool_result for plan writes and gate calls.
 	const pendingPlanWrites = new Map<string, string>(); // toolCallId → plan content
 	const pendingGateCalls = new Set<string>(); // toolCallIds
+	const pendingArtifactWrites = new Map<string, string>(); // toolCallId → artifact kind
 
 	function persist(): void {
 		pi.appendEntry(CUSTOM_TYPE, state);
@@ -148,6 +149,14 @@ export default function leanflow(pi: ExtensionAPI): void {
 
 			// Track gate calls and transition to gating phase.
 			if (roles.has("gate")) {
+				// Gate readiness: build evidence must exist before gating.
+				const missing = missingArtifacts(state);
+				if (missing.length > 0) {
+					return {
+						block: true,
+						reason: `LeanFlow: Gate unavailable — complete build evidence first (missing: ${missing.join(", ")}).`,
+					};
+				}
 				state.gateCalls++;
 				state.gateAttempt++;
 				if (state.gateCalls > 2) {
@@ -162,7 +171,6 @@ export default function leanflow(pi: ExtensionAPI): void {
 				updateStatus(ctx);
 			}
 		}
-
 		// Detect plan write for handoff assessment (planning → awaiting_approval).
 		if (event.toolName === "write" && state.phase === "planning") {
 			const path = String((event.input as Record<string, unknown>).path ?? "");
@@ -172,6 +180,13 @@ export default function leanflow(pi: ExtensionAPI): void {
 			}
 		}
 
+		// Track build-evidence artifact writes (build/diff/evidence) for gate readiness.
+		if (event.toolName === "write" && state.phase === "building") {
+			const path = String((event.input as Record<string, unknown>).path ?? "");
+			const kind = artifactKind(path);
+			if (kind) pendingArtifactWrites.set(event.toolCallId, kind);
+		}
+
 		// Approval detection: the first repository-mutating action means the
 		// plan was approved and building has begun. Native plan mode only
 		// releases the model to execute after the approval overlay, so a
@@ -179,6 +194,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 		if (state.phase === "awaiting_approval" && isBuildAction(event)) {
 			state.phase = "building";
 			state.approvalBoundary = ctx.sessionManager.getBranch().length;
+			state.writtenArtifacts = [];
 			persist();
 			updateStatus(ctx);
 			ctx.ui.notify("LeanFlow: plan approved — entering BUILD.", "info");
@@ -219,6 +235,17 @@ export default function leanflow(pi: ExtensionAPI): void {
 			}
 		}
 
+		// Record successfully-written build-evidence artifacts for gate readiness.
+		if (event.toolName === "write" && pendingArtifactWrites.has(event.toolCallId)) {
+			const kind = pendingArtifactWrites.get(event.toolCallId)!;
+			pendingArtifactWrites.delete(event.toolCallId);
+			const written = state.writtenArtifacts ?? [];
+			if (!written.includes(kind)) {
+				state.writtenArtifacts = [...written, kind];
+				persist();
+			}
+		}
+
 		// Gate verdict processing.
 		if (event.toolName === "task" && pendingGateCalls.has(event.toolCallId)) {
 			pendingGateCalls.delete(event.toolCallId);
@@ -236,8 +263,9 @@ export default function leanflow(pi: ExtensionAPI): void {
 					verdict === "PASS" ? "info" : "warn",
 				);
 			} else {
-				// First FAIL → back to building for repair.
+				// First FAIL → back to building for repair; evidence must be refreshed.
 				state.phase = "building";
+				state.writtenArtifacts = [];
 				persist();
 				updateStatus(ctx);
 				ctx.ui.notify("LeanFlow: Gate FAIL. Repair, refresh evidence, and re-gate (1 retry left).", "warn");
@@ -272,6 +300,27 @@ function isBuildAction(event: { toolName: string; input: Record<string, unknown>
 		return !path.includes("-plan.md");
 	}
 	return false;
+}
+
+// ---------------------------------------------------------------------------
+// Build-evidence artifact tracking (gate readiness)
+// ---------------------------------------------------------------------------
+
+/** The three evidence artifacts Gate requires, keyed by path suffix. */
+const REQUIRED_ARTIFACTS = ["build", "diff", "evidence"] as const;
+
+/** Classify a written path as a build-evidence artifact kind, or undefined. */
+function artifactKind(path: string): string | undefined {
+	for (const kind of REQUIRED_ARTIFACTS) {
+		if (path.includes(`-${kind}.md`)) return kind;
+	}
+	return undefined;
+}
+
+/** Evidence artifacts not yet written this round. */
+function missingArtifacts(state: LeanFlowState): string[] {
+	const written = new Set(state.writtenArtifacts ?? []);
+	return REQUIRED_ARTIFACTS.filter((kind) => !written.has(kind)).map((k) => `${k}.md`);
 }
 
 // ---------------------------------------------------------------------------

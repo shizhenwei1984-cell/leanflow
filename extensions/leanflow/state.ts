@@ -38,6 +38,8 @@ export interface LeanFlowState {
 	handoffWarnings?: string[];
 	/** Message index of the approval boundary (xd://propose write), for context filter. */
 	approvalBoundary?: number;
+	/** Build evidence artifacts written this round: build / diff / evidence. */
+	writtenArtifacts?: string[];
 }
 
 export const CUSTOM_TYPE = "leanflow-state";
