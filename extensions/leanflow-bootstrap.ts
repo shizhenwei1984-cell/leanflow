@@ -40,7 +40,7 @@ function findFlowPrompt(thisPath: string, cwd: string, agentDir: string): string
 export default function leanflowBootstrap(pi: ExtensionAPI): void {
 	pi.registerCommand("flow", {
 		description:
-			"Start a LeanFlow run — plan in OMP native plan mode, build in the same session, review with an independent Gate. Pre-fills `/plan <workflow prompt>` so Enter enters plan mode.",
+			"Start LeanFlow: Main plans and builds in one session, optional Scout facts, then one independent Gate. Pre-fills `/plan <workflow prompt>` so Enter enters plan mode.",
 		handler: async (rawArgs, ctx) => {
 			if (!ctx.hasUI) {
 				ctx.ui.notify("LeanFlow /flow requires the interactive TUI.", "error");
@@ -72,7 +72,7 @@ export default function leanflowBootstrap(pi: ExtensionAPI): void {
 			// an extension command: the extension context does not expose
 			// handlePlanModeCommand, and sendUserMessage bypasses slash dispatch.
 			ctx.ui.setEditorText(`/plan ${rendered}`);
-			ctx.ui.setStatus("leanflow", "Enter to start LeanFlow in plan mode");
+			ctx.ui.setStatus("leanflow", "LeanFlow planning: Main + optional Scout only");
 		},
 	});
 }

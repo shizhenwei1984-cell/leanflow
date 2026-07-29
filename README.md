@@ -2,10 +2,13 @@
 
 Low-handoff AI coding workflow for OMP (oh-my-pi).
 
-LeanFlow keeps PLAN and BUILD in the same main session, adds cheap on-demand
-Scout investigators, and one independent read-only Gate reviewer. It minimizes
-inter-agent context duplication by never re-reading the investigation context
-and by passing gate inputs by reference (`local://`, `git diff`), never pasted.
+LeanFlow keeps PLAN and BUILD in the same main session, adds on-demand Scout
+investigators, and uses an independent read-only Gate reviewer. The normal path
+uses one Gate call; after one repair, a second is the limit. Same-session BUILD
+avoids cross-agent investigation re-send, while Gate inputs travel by bounded
+`local://` evidence artifacts rather than pasted prompts. After compact, the
+Builder re-reads the decision-complete canonical plan; raw investigation context
+is not guaranteed.
 
 ## Install
 

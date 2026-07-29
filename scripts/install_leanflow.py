@@ -266,29 +266,14 @@ def relative_rmdir(root_fd: int, relative: str) -> None:
         os.close(parent_fd)
 
 
-def _is_source_overlap(target: Path, source: Path, base: Path) -> bool:
-    """True only when the install *base* itself lives inside the source package.
-
-    A symlink target that resolves to its source file is the correct, intended
-    state for symlink-mode installs — not an overlap. The real conflict is when
-    the whole install directory (base) is nested inside the source package tree
-    (e.g. installing leanflow into leanflow/.omp/), because every operation
-    then mutates the package being read. ``--force`` must be allowed to replace
-    a correctly-pointing symlink in place.
-    """
+def _is_source_overlap(target: Path, source: Path) -> bool:
+    """True only when the target directory entry is the source entry."""
     try:
-        base_resolved = base.resolve(strict=False)
-        source_root = source.resolve(strict=True).parent
-        # Walk up: if base is inside the source package, the package root is an
-        # ancestor of base. Compare via os.path.commonpath to avoid prefix-only
-        # false positives (e.g. /foo/lean vs /foo/leanflow).
-        import os.path as _osp
-        common = _osp.commonpath([str(base_resolved), str(source_root)])
-        return common == str(source_root)
+        target_entry = target.parent.resolve(strict=False) / target.name
+        source_entry = source.resolve(strict=True)
+        return target_entry == source_entry
     except (OSError, ValueError):
-        # cross-device or non-resolvable path — fall back to the legacy check
-        return target.exists() and target.resolve(strict=False) == source.resolve(strict=True)
-
+        return False
 
 def planned_entries(
     sources: Sequence[Tuple[str, Path, str]], base: Path, mode: str
@@ -303,7 +288,7 @@ def planned_entries(
             "snapshot": target_snapshot(target),
             "state": target_state(target),
         }
-        entry["source_overlap"] = _is_source_overlap(target, source, base)
+        entry["source_overlap"] = _is_source_overlap(target, source)
         if mode == "symlink":
             entry["link_target"] = str(source.resolve(strict=True))
         planned.append(entry)

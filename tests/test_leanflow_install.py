@@ -143,6 +143,31 @@ class InstallTest(unittest.TestCase):
         for relative in INSTALL_PATHS:
             self.assert_default_install_target(relative)
 
+    def test_user_symlink_install_and_uninstall_has_only_minimal_roles(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            apply = subprocess.run(
+                [sys.executable, str(INSTALLER), "--scope", "user", "--mode", "symlink", "--apply"],
+                env={"HOME": str(home)},
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(apply.returncode, 0, apply.stderr)
+            metadata = json.loads((home / ".omp" / "agent" / "leanflow-install.json").read_text())
+            self.assertEqual({entry["path"] for entry in metadata["entries"]}, set(INSTALL_PATHS))
+            agents = home / ".omp" / "agent" / "agents"
+            self.assertTrue((agents / "scout.md").is_symlink())
+            self.assertTrue((agents / "gate.md").is_symlink())
+            self.assertFalse((agents / "repo-reviewer.md").exists())
+            remove = subprocess.run(
+                [sys.executable, str(INSTALLER), "--scope", "user", "--uninstall", "--apply"],
+                env={"HOME": str(home)},
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(remove.returncode, 0, remove.stderr)
+            self.assertFalse((home / ".omp" / "agent" / "leanflow-install.json").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
