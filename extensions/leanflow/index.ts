@@ -27,6 +27,7 @@ import type { LeanFlowState } from "./state";
 import { checkTaskGuard, extractAgentNames, resolveRole } from "./guard";
 import { assessHandoff, formatHandoffNotification } from "./handoff";
 import { filterForBuilder } from "./context";
+import { addUsage, formatStats, recordContextFilter } from "./stats";
 
 /** Tools that mutate the repository — signal that building has started.
  *  `lsp` is intentionally excluded: definition/hover/rename-preview are reads. */
@@ -278,13 +279,36 @@ export default function leanflow(pi: ExtensionAPI): void {
 	// -----------------------------------------------------------------------
 
 	pi.on("context", async (event) => {
-		const filtered = filterForBuilder(
-			event.messages as Array<Record<string, unknown>>,
-			state,
-		);
+		const messages = event.messages as Array<Record<string, unknown>>;
+		const filtered = filterForBuilder(messages, state);
 		if (filtered) {
+			// Quantify the handoff reduction: messages removed from the builder context.
+			recordContextFilter(state, messages.length, filtered.length);
+			persist();
 			return { messages: filtered as typeof event.messages };
 		}
+	});
+
+	// -----------------------------------------------------------------------
+	// Token statistics: accrue main-session usage per phase
+	// -----------------------------------------------------------------------
+
+	pi.on("message_end", async (event) => {
+		if (state.phase === "idle") return;
+		const message = event.message;
+		if (message.role !== "assistant") return;
+		const usage = message.usage;
+		if (!usage) return;
+		addUsage(state, { input: usage.input, output: usage.output, cacheRead: usage.cacheRead });
+		persist();
+	});
+	// -----------------------------------------------------------------------
+
+	pi.registerCommand("flowstats", {
+		description: "Show LeanFlow run statistics (per-phase tokens, context reduction).",
+		handler: async (_args, ctx) => {
+			ctx.ui.notify(formatStats(state), "info");
+		},
 	});
 }
 

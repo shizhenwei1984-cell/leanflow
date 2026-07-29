@@ -134,6 +134,24 @@ class WorkflowPromptTest(unittest.TestCase):
         self.assertNotIn("build.md", planner)
         self.assertNotIn("evidence.md", planner)
 
+    def test_runtime_stats_are_tracked(self) -> None:
+        """Suggestion 3: per-phase tokens and context reduction are quantified."""
+        ext_dir = ROOT / "extensions" / "leanflow"
+        stats = (ext_dir / "stats.ts").read_text(encoding="utf-8")
+        self.assertIn("addUsage", stats)
+        self.assertIn("recordContextFilter", stats)
+        self.assertIn("formatStats", stats)
+        # Honest accounting: subagent tokens are explicitly NOT fabricated.
+        self.assertIn("separate subagent sessions", stats)
+        state = (ext_dir / "state.ts").read_text(encoding="utf-8")
+        self.assertIn("LeanFlowStats", state)
+        self.assertIn("stats?: LeanFlowStats", state)
+        index = (ext_dir / "index.ts").read_text(encoding="utf-8")
+        self.assertIn("message_end", index)
+        self.assertIn("addUsage(state", index)
+        self.assertIn("recordContextFilter(state", index)
+        self.assertIn('registerCommand("flowstats"', index)
+
 
 class InstalledDiscoveryTest(unittest.TestCase):
     def test_user_install_discovers_only_scout_and_gate(self) -> None:

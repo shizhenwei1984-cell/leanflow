@@ -40,6 +40,7 @@ extensions/leanflow/          Extension control layer
   guard.ts                    Tool guard (forbidden agent blocking)
   handoff.ts                  Handoff advisor (plan assessment)
   context.ts                  Builder context filter (token optimization)
+  stats.ts                    Runtime token/context statistics (/flowstats)
 scripts/install_leanflow.py   Installer (symlink/copy, user/project scope)
 docs/leanflow.md              Detailed documentation
 tests/                        Test suite

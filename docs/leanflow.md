@@ -26,11 +26,13 @@ There are no reviewer, audit, validator, planner, implementer, developer, coder,
 
 The LeanFlow extension (`extensions/leanflow/`) provides:
 
-- **State machine** — tracks `idle → planning → handoff → building → gating` phases, persisted via session entries (survives compaction)
+- **State machine** — tracks `idle → planning → awaiting_approval → building → gating` phases, persisted via session entries (survives compaction)
 - **Tool guard** — blocks forbidden agent spawns (reviewer, audit, implementer, etc.) per phase
 - **Handoff advisor** — assesses plan completeness after write; READY/READY_WITH_WARNINGS proceed, NEEDS_UPDATE advises revision (never hard-blocks except critical gaps)
+- **Gate readiness** — Gate is blocked until build/diff/evidence artifacts are written, preventing premature (token-wasting) gate calls
 - **Context filter** — during building phase, removes planning history from LLM context and injects a compact builder preamble referencing the approved plan artifact
 - **Budget enforcement** — max 3 Scout calls, max 2 Gate calls, enforced at the tool_call level
+- **Runtime stats** — `/flowstats` reports per-phase main-session tokens and the builder context reduction (Scout/Gate tokens excluded: they run in separate subagent sessions)
 
 ## Lifecycle
 
