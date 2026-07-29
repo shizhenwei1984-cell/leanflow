@@ -48,6 +48,10 @@ export interface LeanFlowStats {
 	contextAfter: number;
 	/** Number of provider responses observed (sanity denominator). */
 	turns: number;
+	/** Number of Gate FAIL verdicts observed. */
+	gateFailures: number;
+	/** Number of repair rounds entered (Gate FAIL → building). */
+	repairs: number;
 }
 
 export interface LeanFlowState {
@@ -78,6 +82,8 @@ export function defaultStats(): LeanFlowStats {
 		contextBefore: 0,
 		contextAfter: 0,
 		turns: 0,
+		gateFailures: 0,
+		repairs: 0,
 	};
 }
 

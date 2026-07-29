@@ -45,6 +45,13 @@ export function recordContextFilter(state: LeanFlowState, before: number, after:
 	}
 }
 
+/** Record a Gate FAIL verdict and whether it triggered a repair round. */
+export function recordGateFailure(state: LeanFlowState, repaired: boolean): void {
+	const stats = (state.stats ??= defaultStats());
+	stats.gateFailures++;
+	if (repaired) stats.repairs++;
+}
+
 /** Human-readable multi-line summary for display. */
 export function formatStats(state: LeanFlowState): string {
 	const s = state.stats;
@@ -63,17 +70,29 @@ export function formatStats(state: LeanFlowState): string {
 			`  gating:   ${fmt(s.gating)}`,
 			`  total:    ${total}`,
 			"",
+			"Workflow outcomes:",
+			`  gate attempts: ${state.gateCalls}   failures: ${s.gateFailures}   repairs: ${s.repairs}`,
+			`  handoff: ${state.handoffStatus ?? "n/a"}   warnings: ${state.handoffWarnings?.length ?? 0}`,
+			"",
 		);
 		if (s.contextBefore > 0) {
 			const pct = Math.round((1 - s.contextAfter / s.contextBefore) * 100);
-			lines.push(`Builder context filter: ${s.contextBefore} → ${s.contextAfter} messages (${pct}% reduction)`);
+			lines.push(
+				`Builder context filter: ${s.contextBefore} → ${s.contextAfter} messages (-${pct}%)`,
+				"  (message count only; token impact not measured)",
+			);
 		} else {
 			lines.push("Builder context filter: not yet exercised this run.");
 		}
 	} else {
 		lines.push("  (no token data recorded yet)");
 	}
-	lines.push("", "Note: Scout/Gate run in separate subagent sessions; their tokens are not counted here.");
+	lines.push(
+		"",
+		"Notes:",
+		"- Scout/Gate run in separate subagent sessions; their tokens are not counted here.",
+		"- awaiting_approval/idle are non-generation phases and accrue no tokens.",
+	);
 	return lines.join("\n");
 }
 

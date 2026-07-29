@@ -27,7 +27,7 @@ import type { LeanFlowState } from "./state";
 import { checkTaskGuard, extractAgentNames, resolveRole } from "./guard";
 import { assessHandoff, formatHandoffNotification } from "./handoff";
 import { filterForBuilder } from "./context";
-import { addUsage, formatStats, recordContextFilter } from "./stats";
+import { addUsage, formatStats, recordContextFilter, recordGateFailure } from "./stats";
 
 /** Tools that mutate the repository — signal that building has started.
  *  `lsp` is intentionally excluded: definition/hover/rename-preview are reads. */
@@ -254,6 +254,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 
 			if (verdict === "PASS" || state.gateCalls >= 2) {
 				// Done: PASS or second FAIL (no more retries).
+				if (verdict !== "PASS") recordGateFailure(state, false);
 				state.phase = "idle";
 				persist();
 				updateStatus(ctx);
@@ -265,6 +266,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 				);
 			} else {
 				// First FAIL → back to building for repair; evidence must be refreshed.
+				recordGateFailure(state, true);
 				state.phase = "building";
 				state.writtenArtifacts = [];
 				persist();

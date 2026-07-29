@@ -152,6 +152,23 @@ class WorkflowPromptTest(unittest.TestCase):
         self.assertIn("recordContextFilter(state", index)
         self.assertIn('registerCommand("flowstats"', index)
 
+    def test_stats_track_gate_failures_and_repairs(self) -> None:
+        """Suggestion 7: workflow-quality counters (gate failures, repairs)."""
+        ext_dir = ROOT / "extensions" / "leanflow"
+        state = (ext_dir / "state.ts").read_text(encoding="utf-8")
+        self.assertIn("gateFailures", state)
+        self.assertIn("repairs", state)
+        stats = (ext_dir / "stats.ts").read_text(encoding="utf-8")
+        self.assertIn("recordGateFailure", stats)
+        index = (ext_dir / "index.ts").read_text(encoding="utf-8")
+        self.assertIn("recordGateFailure(state", index)
+
+    def test_stats_disclaim_token_impact(self) -> None:
+        """Suggestion 5/6: context filter is message-count only; non-gen phases noted."""
+        stats = (ROOT / "extensions" / "leanflow" / "stats.ts").read_text(encoding="utf-8")
+        self.assertIn("token impact not measured", stats)
+        self.assertIn("non-generation phases", stats)
+
 
 class InstalledDiscoveryTest(unittest.TestCase):
     def test_user_install_discovers_only_scout_and_gate(self) -> None:
