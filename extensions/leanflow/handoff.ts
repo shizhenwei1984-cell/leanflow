@@ -5,9 +5,12 @@
  * validator — it provides risk signals but does NOT block the workflow unless
  * the plan is critically incomplete (no target, no files, no behavior).
  *
+ * Checks semantic signals, not section headings. A plan that says
+ * "## Implementation Strategy" instead of "## Approach" is fine.
+ *
  * Statuses:
- *   READY               — plan looks executable, proceed to BUILD
- *   READY_WITH_WARNINGS — minor gaps logged, proceed to BUILD
+ *   READY               — plan looks executable, proceed
+ *   READY_WITH_WARNINGS — minor gaps logged, proceed
  *   NEEDS_UPDATE        — critically incomplete, advise Planner to revise
  */
 
@@ -18,16 +21,14 @@ export interface HandoffResult {
 	warnings: string[];
 }
 
-const REQUIRED_SECTIONS = ["context", "approach", "verification"];
-const RECOMMENDED_SECTIONS = ["critical files", "assumptions"];
-
 export function assessHandoff(planContent: string): HandoffResult {
-	const lower = planContent.toLowerCase();
 	const warnings: string[] = [];
 
-	// Critical checks → NEEDS_UPDATE (extremely rare)
+	// Critical: no modification target AND no file references → cannot execute.
 	const hasTarget =
-		/修改|change|modify|implement|add|remove|update|fix|create|delete|refactor/i.test(planContent);
+		/修改|change|modify|implement|add|remove|update|fix|create|delete|refactor|replace|rewrite/i.test(
+			planContent,
+		);
 	const hasFileEntry = /[\w./-]+\.\w{1,6}/.test(planContent);
 
 	if (!hasTarget && !hasFileEntry) {
@@ -37,26 +38,17 @@ export function assessHandoff(planContent: string): HandoffResult {
 		};
 	}
 
-	// Required sections
-	for (const section of REQUIRED_SECTIONS) {
-		if (!lower.includes(section)) {
-			warnings.push(`Missing section: ${section}`);
-		}
+	// Semantic: does the plan describe what to verify?
+	if (!/test|验证|check|assert|expect|run|command|命令|smoke|spec|unittest|pytest|cargo|npm|bun/i.test(planContent)) {
+		warnings.push("No verification signals found — plan may lack test/validation detail.");
 	}
 
-	// Recommended sections
-	for (const section of RECOMMENDED_SECTIONS) {
-		if (!lower.includes(section)) {
-			warnings.push(`Missing recommended section: ${section}`);
-		}
+	// Semantic: does the plan reference concrete files or symbols?
+	if (!hasFileEntry) {
+		warnings.push("No file paths found — Builder may lack concrete entry points.");
 	}
 
-	// Verification detail
-	if (!/test|验证|check|assert|expect|run|command|命令/i.test(planContent)) {
-		warnings.push("Verification lacks concrete test commands or expected outcomes.");
-	}
-
-	// Size sanity
+	// Size sanity (very short plans are suspicious).
 	if (planContent.length < 100) {
 		warnings.push("Plan is very short — may lack implementation detail.");
 	}
@@ -76,7 +68,7 @@ export function formatHandoffNotification(result: HandoffResult): string {
 		}
 	}
 	if (result.status !== "NEEDS_UPDATE") {
-		lines.push("Continue BUILD: yes");
+		lines.push("Proceeding to approval.");
 	}
 	return lines.join("\n");
 }

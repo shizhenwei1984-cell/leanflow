@@ -4,11 +4,18 @@
  * Replaces the prompt-driven flow.md approach with an extension-driven
  * state machine, tool guard, handoff advisor, and builder context filter.
  *
- * Architecture:
- *   /flow command → initialize state → native plan mode (minimal prompt)
- *   tool_call     → guard (block forbidden agents) + phase transitions
- *   tool_result   → handoff assessment + gate verdict processing
- *   context       → filter planning history from builder context
+ * Phase lifecycle:
+ *   /flow            → planning
+ *   write *-plan.md  → awaiting_approval  (plan exists; NOT yet approved)
+ *   first build action after approval → building
+ *   task(gate)       → gating
+ *   Gate PASS / 2nd FAIL → idle
+ *   Gate 1st FAIL    → building (repair)
+ *
+ * The critical correctness property: writing the plan artifact does NOT
+ * advance to building. The builder phase begins only when the model takes
+ * its first implementation action (edit/bash/non-plan write), which can only
+ * happen after the native plan-mode approval overlay is accepted.
  *
  * State persists via appendEntry and restores from the session branch,
  * surviving compaction and session switches.
@@ -17,9 +24,12 @@
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { CUSTOM_TYPE, defaultState, restoreState } from "./state";
 import type { LeanFlowState } from "./state";
-import { checkTaskGuard, extractAgentNames } from "./guard";
+import { checkTaskGuard, extractAgentNames, resolveRole } from "./guard";
 import { assessHandoff, formatHandoffNotification } from "./handoff";
 import { filterForBuilder } from "./context";
+
+/** Tools that mutate the repository — signal that building has started. */
+const BUILD_ACTION_TOOLS = new Set(["edit", "bash", "ast_edit", "lsp"]);
 
 export default function leanflow(pi: ExtensionAPI): void {
 	let state: LeanFlowState = defaultState();
@@ -93,13 +103,14 @@ export default function leanflow(pi: ExtensionAPI): void {
 				phase: "planning",
 				scoutCalls: 0,
 				gateCalls: 0,
+				gateAttempt: 0,
 				planSlug: slug,
 				startedAt: Date.now(),
 			};
 			persist();
 			updateStatus(ctx);
 
-			// Enter native plan mode with minimal planning context.
+			// Enter native plan mode with a Planner-only prompt.
 			const prompt = buildPlanningPrompt(task, slug);
 			ctx.ui.setEditorText(`/plan ${prompt}`);
 		},
@@ -120,9 +131,10 @@ export default function leanflow(pi: ExtensionAPI): void {
 			}
 
 			const names = extractAgentNames(event.input as Record<string, unknown>);
+			const roles = new Set(names.map((n) => resolveRole(n)).filter((r): r is string => !!r));
 
 			// Track scout budget.
-			if (names.includes("scout")) {
+			if (roles.has("scout")) {
 				state.scoutCalls++;
 				if (state.scoutCalls > 3) {
 					return {
@@ -135,8 +147,9 @@ export default function leanflow(pi: ExtensionAPI): void {
 			}
 
 			// Track gate calls and transition to gating phase.
-			if (names.includes("gate")) {
+			if (roles.has("gate")) {
 				state.gateCalls++;
+				state.gateAttempt++;
 				if (state.gateCalls > 2) {
 					return {
 						block: true,
@@ -150,13 +163,25 @@ export default function leanflow(pi: ExtensionAPI): void {
 			}
 		}
 
-		// Detect plan write for handoff assessment.
+		// Detect plan write for handoff assessment (planning → awaiting_approval).
 		if (event.toolName === "write" && state.phase === "planning") {
 			const path = String((event.input as Record<string, unknown>).path ?? "");
 			if (path.includes("-plan.md")) {
 				const content = String((event.input as Record<string, unknown>).content ?? "");
 				pendingPlanWrites.set(event.toolCallId, content);
 			}
+		}
+
+		// Approval detection: the first repository-mutating action means the
+		// plan was approved and building has begun. Native plan mode only
+		// releases the model to execute after the approval overlay, so a
+		// build action is a reliable post-approval signal.
+		if (state.phase === "awaiting_approval" && isBuildAction(event)) {
+			state.phase = "building";
+			state.approvalBoundary = ctx.sessionManager.getBranch().length;
+			persist();
+			updateStatus(ctx);
+			ctx.ui.notify("LeanFlow: plan approved — entering BUILD.", "info");
 		}
 	});
 
@@ -167,7 +192,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 	pi.on("tool_result", async (event, ctx) => {
 		if (event.isError) return;
 
-		// Handoff: plan was written successfully → assess and transition.
+		// Handoff: plan was written successfully → assess, then await approval.
 		if (event.toolName === "write" && pendingPlanWrites.has(event.toolCallId)) {
 			const content = pendingPlanWrites.get(event.toolCallId)!;
 			pendingPlanWrites.delete(event.toolCallId);
@@ -183,11 +208,14 @@ export default function leanflow(pi: ExtensionAPI): void {
 				updateStatus(ctx);
 				ctx.ui.notify(formatHandoffNotification(result), "warn");
 			} else {
-				// READY or READY_WITH_WARNINGS — proceed to building.
-				state.phase = "building";
+				// Plan artifact ready — wait for native approval, do NOT build yet.
+				state.phase = "awaiting_approval";
 				persist();
 				updateStatus(ctx);
-				ctx.ui.notify(formatHandoffNotification(result), "info");
+				ctx.ui.notify(
+					`${formatHandoffNotification(result)}\nRequest approval via xd://propose.`,
+					"info",
+				);
 			}
 		}
 
@@ -233,7 +261,21 @@ export default function leanflow(pi: ExtensionAPI): void {
 }
 
 // ---------------------------------------------------------------------------
-// Minimal planning prompt — replaces the 125-line flow.md injection
+// Build-action detection (approval signal)
+// ---------------------------------------------------------------------------
+
+function isBuildAction(event: { toolName: string; input: Record<string, unknown> }): boolean {
+	if (BUILD_ACTION_TOOLS.has(event.toolName)) return true;
+	// A `write` to a non-plan path (build/diff/evidence/source) is a build action.
+	if (event.toolName === "write") {
+		const path = String(event.input.path ?? "");
+		return !path.includes("-plan.md");
+	}
+	return false;
+}
+
+// ---------------------------------------------------------------------------
+// Planner-only prompt — no Gate schema, no build artifact detail
 // ---------------------------------------------------------------------------
 
 function buildPlanningPrompt(task: string, slug: string): string {
@@ -246,9 +288,9 @@ function buildPlanningPrompt(task: string, slug: string): string {
 		"- Request approval via xd://propose",
 		"",
 		"## Plan artifact",
-		`Write to local://${slug}-plan.md with these sections:`,
-		"Context, Approach, Critical files & anchors, Verification, Assumptions & contingencies",
-		"The plan is a decision document — Builder needs no planning reasoning.",
+		`Write to local://${slug}-plan.md. It is a decision document covering:`,
+		"what changes, which files/symbols, how it will be verified, and key assumptions.",
+		"The Builder needs no planning reasoning — only the decisions.",
 		"",
 		"## Scout (optional, max 3)",
 		"```text",
@@ -256,23 +298,9 @@ function buildPlanningPrompt(task: string, slug: string): string {
 		'  task: "<one focused factual question>", schemaMode: "strict" }] })',
 		"```",
 		"",
-		"## After approval",
-		"You become Builder (@default) in the same session. The extension injects a compact",
-		"builder context. Read the approved plan, implement it, run verification, write",
-		`local://${slug}-build.md, local://${slug}-diff.md, local://${slug}-evidence.md, then call Gate:`,
-		"```text",
-		'task({ agent: "gate", task: "Review plan local://' + slug + '-plan.md, diff local://' + slug + '-diff.md,',
-		"  build local://" + slug + '-build.md, evidence local://' + slug + '-evidence.md.",',
-		'  outputSchema: { type: "object", properties: { verdict: { type: "string", enum: ["PASS","FAIL"] },',
-		'    findings: { type: "array", items: { type: "object", properties: {',
-		'      category: { type: "string" }, severity: { type: "string", enum: ["blocking","nonblocking"] },',
-		'      file: { type: "string" }, location: { type: "string" },',
-		'      issue: { type: "string" }, required_fix: { type: "string" } },',
-		'      required: ["category","severity","file","location","issue","required_fix"],',
-		'      additionalProperties: false } } }, required: ["verdict","findings"], additionalProperties: false },',
-		'  schemaMode: "strict" })',
-		"```",
-		"Gate PASS → done. First FAIL → repair + re-gate (max 2 Gate calls).",
+		"## Approval",
+		`After writing the plan, request approval by writing \`${slug}\` to xd://propose.`,
+		"The extension advances the workflow to BUILD only after approval.",
 		"",
 		"## Forbidden",
 		"No reviewer, audit, validator, implementer, architect, or builder subagents.",

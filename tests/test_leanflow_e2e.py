@@ -60,6 +60,52 @@ class WorkflowPromptTest(unittest.TestCase):
         context = (ext_dir / "context.ts").read_text(encoding="utf-8")
         self.assertIn("filterForBuilder", context)
 
+    def test_plan_write_does_not_skip_approval(self) -> None:
+        """Issue 1: writing the plan must move to awaiting_approval, not building."""
+        state = (ROOT / "extensions" / "leanflow" / "state.ts").read_text(encoding="utf-8")
+        self.assertIn('"awaiting_approval"', state)
+        index = (ROOT / "extensions" / "leanflow" / "index.ts").read_text(encoding="utf-8")
+        # Plan write transitions to awaiting_approval, not building.
+        self.assertIn('state.phase = "awaiting_approval"', index)
+        # Building begins only on a post-approval build action.
+        self.assertIn("isBuildAction", index)
+        self.assertIn("BUILD_ACTION_TOOLS", index)
+
+    def test_planner_prompt_has_no_gate_schema(self) -> None:
+        """Issue 6: the Planner-only prompt must not leak the Gate JSON schema."""
+        index = (ROOT / "extensions" / "leanflow" / "index.ts").read_text(encoding="utf-8")
+        # Split out the planner prompt builder body.
+        start = index.index("function buildPlanningPrompt")
+        end = index.index("function extractVerdict")
+        planner = index[start:end]
+        self.assertNotIn("outputSchema", planner)
+        self.assertNotIn('"verdict"', planner)
+        self.assertNotIn('agent: "gate"', planner)
+        # The Gate schema lives in the builder preamble instead.
+        context = (ROOT / "extensions" / "leanflow" / "context.ts").read_text(encoding="utf-8")
+        self.assertIn("outputSchema", context)
+
+    def test_guard_uses_agent_alias_table(self) -> None:
+        """Issue 2: agent names resolve through an alias table, not hardcoding."""
+        guard = (ROOT / "extensions" / "leanflow" / "guard.ts").read_text(encoding="utf-8")
+        self.assertIn("LEANFLOW_AGENTS", guard)
+        self.assertIn("resolveRole", guard)
+        self.assertIn('"lean-scout"', guard)
+
+    def test_gate_attempt_is_tracked(self) -> None:
+        """Issue 3: first vs repair gate are distinguished via gateAttempt."""
+        state = (ROOT / "extensions" / "leanflow" / "state.ts").read_text(encoding="utf-8")
+        self.assertIn("gateAttempt", state)
+        index = (ROOT / "extensions" / "leanflow" / "index.ts").read_text(encoding="utf-8")
+        self.assertIn("state.gateAttempt++", index)
+
+    def test_context_filter_uses_stored_boundary(self) -> None:
+        """Issue 5: context filter uses state.approvalBoundary, not message scan."""
+        state = (ROOT / "extensions" / "leanflow" / "state.ts").read_text(encoding="utf-8")
+        self.assertIn("approvalBoundary", state)
+        context = (ROOT / "extensions" / "leanflow" / "context.ts").read_text(encoding="utf-8")
+        self.assertIn("state.approvalBoundary", context)
+
 
 class InstalledDiscoveryTest(unittest.TestCase):
     def test_user_install_discovers_only_scout_and_gate(self) -> None:
