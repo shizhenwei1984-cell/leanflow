@@ -100,6 +100,8 @@ function buildBuilderPreamble(state: LeanFlowState): string {
 		"",
 		"Read the approved plan, implement it, run verification, and write:",
 		`  local://${slug}-build.md, local://${slug}-diff.md, local://${slug}-evidence.md`,
+		"Use LSP references and diagnostics best-effort before source search. If unavailable or timed out, continue with read/grep, compiler checks, executable tests, and runtime smoke tests.",
+		"LSP diagnostics are auxiliary evidence, never a substitute for executable verification. Record LSP availability/result in build.md and evidence.md; do not inject runtime statistics.",
 		"Then call Gate:",
 		"```text",
 		`task({ agent: "gate", task: "Review plan local://${slug}-plan.md, diff local://${slug}-diff.md,`,

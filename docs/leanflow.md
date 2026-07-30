@@ -26,13 +26,13 @@ There are no reviewer, audit, validator, planner, implementer, developer, coder,
 
 The LeanFlow extension (`extensions/leanflow/`) provides:
 
-- **State machine** — tracks `idle → planning → awaiting_approval → building → gating` phases, persisted via session entries (survives compaction)
+- **State machine** — tracks `idle → planning → awaiting_approval → building → gating` phases, persists them via session entries, and measures Main Session provider usage, response count, and elapsed time for each observable phase
 - **Tool guard** — blocks forbidden agent spawns (reviewer, audit, implementer, etc.) per phase
 - **Handoff advisor** — assesses plan completeness after write; READY/READY_WITH_WARNINGS proceed, NEEDS_UPDATE advises revision (never hard-blocks except critical gaps)
-- **Gate readiness** — Gate is blocked until build/diff/evidence artifacts are written, preventing premature (token-wasting) gate calls
-- **Context filter** — during building phase, removes planning history from LLM context and injects a compact builder preamble referencing the approved plan artifact
-- **Budget enforcement** — max 3 Scout calls, max 2 Gate calls, enforced at the tool_call level
-- **Runtime stats** — `/flowstats` reports per-phase main-session tokens and the builder context reduction (Scout/Gate tokens excluded: they run in separate subagent sessions)
+- **Gate readiness** — Gate is blocked until build/diff/evidence artifacts are written, preventing premature gate calls without consuming an attempt
+- **Context filter** — during building phase, removes planning history from LLM context, injects a compact builder preamble referencing the approved plan artifact, and records latest message-count and deterministic serialized UTF-8 byte observations separately
+- **Budget enforcement** — max 3 Scout calls and max 2 Gate calls, checked before incrementing at the tool_call level
+- **Runtime stats** — `/flowstats` reports Main Session phase metrics, Gate outcome counters, and context-filter reductions. Provider reduction plus Scout/Gate subagent tokens are `not measured`, never estimated
 
 ## Lifecycle
 
@@ -42,8 +42,8 @@ The LeanFlow extension (`extensions/leanflow/`) provides:
 2. Planner understands the task and reads repository evidence.
 3. Use zero Scouts for simple work; use at most three focused Scouts for complex factual gaps.
 4. Planner owns completeness, runtime feasibility, acceptance coverage, and implementation feasibility.
-5. Write `local://<slug>-plan.md` and request approval with `xd://propose`.
-6. The extension assesses the plan (handoff advisor) and transitions to building.
+5. Write `local://<slug>-plan.md`; after handoff assessment the state becomes `awaiting_approval`, then request approval with `xd://propose`.
+6. Only the first repository-mutating post-approval action transitions the extension to `building`.
 
 ### BUILD
 
@@ -55,6 +55,16 @@ One independent Gate reads the canonical plan, final diff, build record, and run
 - PASS finishes the run.
 - First FAIL is repaired by Main, with refreshed validation and evidence, then one Gate retry is allowed.
 - Second FAIL is reported; no reviewer or audit chain is created.
+
+## Statistics semantics
+
+`/flowstats` keeps three distinct context-filter measures: latest message counts, latest deterministic serialized UTF-8 bytes (a payload-size proxy), and provider token reduction. Message and byte reductions are never labeled as token reductions. Serialization failures retain the message observation and mark bytes unavailable. The token reduction is always `not measured`.
+
+Each `planning`, `awaiting_approval`, `building`, and `gating` bucket contains Main Session provider input/output/cache-read usage, response count, and observed elapsed time. Missing historical phase-start timestamps are not estimated. Workflow outcomes separately count Gate passes, parsed FAIL verdicts, execution/unparseable errors, readiness blocks, repair rounds, repair successes, and terminal failures.
+
+## LSP verification fallback
+
+Builder first uses LSP symbol references and diagnostics best-effort. An unavailable server or timeout does not block LeanFlow: continue with `read`/`grep`, compiler checks, executable tests, and runtime smoke tests. LSP diagnostics are supplementary rather than executable validation. If used, record LSP availability and results in `build.md` and `evidence.md`; do not add them to `/flowstats` or Builder context statistics. The repository `.lsp.json` declares Python and TypeScript/JavaScript capabilities but does not install language-server binaries.
 
 ## Budgets
 

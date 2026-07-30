@@ -22,16 +22,27 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { CUSTOM_TYPE, defaultState, restoreState } from "./state";
+import { CUSTOM_TYPE, defaultState, defaultStats, restoreState } from "./state";
 import type { LeanFlowState } from "./state";
-import { checkTaskGuard, extractAgentNames, resolveRole } from "./guard";
+import { checkAgentBudget, checkTaskGuard, extractAgentRoles } from "./guard";
 import { assessHandoff, formatHandoffNotification } from "./handoff";
 import { filterForBuilder } from "./context";
-import { addUsage, formatStats, recordContextFilter, recordGateFailure } from "./stats";
+import {
+	addUsage,
+	formatStats,
+	recordContextFilter,
+	recordGateError,
+	recordGateFailure,
+	recordGatePass,
+	recordGateReadinessBlock,
+	recordTerminalFailure,
+	resumePhaseTiming,
+	transitionPhase,
+} from "./stats";
 
 /** Tools that mutate the repository — signal that building has started.
- *  `lsp` is intentionally excluded: definition/hover/rename-preview are reads. */
-const BUILD_ACTION_TOOLS = new Set(["edit", "bash", "ast_edit"]);
+ * `lsp` is intentionally excluded: definition/hover/rename-preview are reads. */
+const BUILD_ACTION_TOOLS: Readonly<Record<string, true>> = { edit: true, bash: true, ast_edit: true };
 
 export default function leanflow(pi: ExtensionAPI): void {
 	let state: LeanFlowState = defaultState();
@@ -42,6 +53,62 @@ export default function leanflow(pi: ExtensionAPI): void {
 
 	function persist(): void {
 		pi.appendEntry(CUSTOM_TYPE, state);
+	}
+
+	/** Statistics observation and its standalone persistence are non-blocking. */
+	function recordStats(mutator: () => void, persistObservation = true): void {
+		try {
+			mutator();
+			if (persistObservation) {
+				try {
+					persist();
+				} catch {
+					// Losing an observation cannot affect workflow control.
+				}
+			}
+		} catch {
+			// Statistics must never break an otherwise valid workflow action.
+		}
+	}
+
+	function finishGateResult(verdict: "PASS" | "FAIL" | undefined, isError: boolean, ctx: ExtensionContext): void {
+		const repaired = state.gateCalls < 2;
+		if (verdict === "PASS") {
+			recordStats(() => recordGatePass(state, state.gateAttempt > 1), false);
+			transitionPhase(state, "idle");
+			persist();
+			updateStatus(ctx);
+			ctx.ui.notify("LeanFlow: Gate PASS. Run complete.", "info");
+			return;
+		}
+
+		recordStats(
+			() => {
+				if (isError || verdict === undefined) {
+					recordGateError(state, repaired);
+				} else {
+					recordGateFailure(state, repaired);
+				}
+				if (!repaired) recordTerminalFailure(state);
+			},
+			false,
+		);
+		if (repaired) {
+			transitionPhase(state, "building");
+			state.writtenArtifacts = [];
+			persist();
+			updateStatus(ctx);
+			ctx.ui.notify(
+				"LeanFlow: Gate result unavailable or FAIL. Repair, refresh evidence, and re-gate (1 retry left).",
+				"warn",
+			);
+			return;
+		}
+
+		transitionPhase(state, "idle");
+		persist();
+		updateStatus(ctx);
+		ctx.ui.notify("LeanFlow: Gate FAIL (2/2). Report findings and finish.", "warn");
 	}
 
 	function updateStatus(ctx: ExtensionContext): void {
@@ -64,6 +131,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 	for (const eventName of restoreEvents) {
 		pi.on(eventName, async (_event, ctx) => {
 			state = restoreState(ctx.sessionManager.getBranch());
+			resumePhaseTiming(state);
 			updateStatus(ctx);
 		});
 	}
@@ -100,14 +168,17 @@ export default function leanflow(pi: ExtensionAPI): void {
 					.replace(/^-+|-+$/g, "")
 					.slice(0, 40) || "task";
 
-			// Initialize state machine.
+			// Initialize state machine and the first observable phase.
+			const now = Date.now();
 			state = {
 				phase: "planning",
+				phaseStartedAt: now,
 				scoutCalls: 0,
 				gateCalls: 0,
 				gateAttempt: 0,
 				planSlug: slug,
-				startedAt: Date.now(),
+				startedAt: now,
+				stats: defaultStats(),
 			};
 			persist();
 			updateStatus(ctx);
@@ -132,42 +203,33 @@ export default function leanflow(pi: ExtensionAPI): void {
 				return { block: true, reason: guard.reason };
 			}
 
-			const names = extractAgentNames(event.input as Record<string, unknown>);
-			const roles = new Set(names.map((n) => resolveRole(n)).filter((r): r is string => !!r));
+			const roles = extractAgentRoles(event.input as Record<string, unknown>);
+			const budget = checkAgentBudget(state, roles);
+			if (budget.block) return { block: true, reason: budget.reason };
 
-			// Track scout budget.
-			if (roles.has("scout")) {
-				state.scoutCalls++;
-				if (state.scoutCalls > 3) {
-					return {
-						block: true,
-						reason: "LeanFlow guard: Scout budget exhausted (3/3). Improve the plan directly.",
-					};
-				}
-				persist();
-				updateStatus(ctx);
-			}
-
-			// Track gate calls and transition to gating phase.
-			if (roles.has("gate")) {
-				// Gate readiness: build evidence must exist before gating.
+			const scoutCount = roles.filter((role) => role === "scout").length;
+			const gateCount = roles.filter((role) => role === "gate").length;
+			if (gateCount > 0) {
+				// Readiness is still checked before any Gate attempt is counted.
 				const missing = missingArtifacts(state);
 				if (missing.length > 0) {
+					recordStats(() => recordGateReadinessBlock(state));
 					return {
 						block: true,
 						reason: `LeanFlow: Gate unavailable — complete build evidence first (missing: ${missing.join(", ")}).`,
 					};
 				}
+			}
+
+			// Every preflight passed; mutate exact request counts atomically.
+			state.scoutCalls += scoutCount;
+			if (gateCount === 1) {
 				state.gateCalls++;
 				state.gateAttempt++;
-				if (state.gateCalls > 2) {
-					return {
-						block: true,
-						reason: "LeanFlow guard: Gate budget exhausted (2/2). Report findings and finish.",
-					};
-				}
-				state.phase = "gating";
+				transitionPhase(state, "gating");
 				pendingGateCalls.add(event.toolCallId);
+			}
+			if (roles.length > 0) {
 				persist();
 				updateStatus(ctx);
 			}
@@ -193,7 +255,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 		// releases the model to execute after the approval overlay, so a
 		// build action is a reliable post-approval signal.
 		if (state.phase === "awaiting_approval" && isBuildAction(event)) {
-			state.phase = "building";
+			transitionPhase(state, "building");
 			state.approvalBoundary = ctx.sessionManager.getBranch().length;
 			state.writtenArtifacts = [];
 			persist();
@@ -207,26 +269,26 @@ export default function leanflow(pi: ExtensionAPI): void {
 	// -----------------------------------------------------------------------
 
 	pi.on("tool_result", async (event, ctx) => {
-		if (event.isError) return;
-
-		// Handoff: plan was written successfully → assess, then await approval.
+		// Failed plan/artifact writes must not leave stale pending bookkeeping.
 		if (event.toolName === "write" && pendingPlanWrites.has(event.toolCallId)) {
 			const content = pendingPlanWrites.get(event.toolCallId)!;
 			pendingPlanWrites.delete(event.toolCallId);
+			if (event.isError) return;
 
+			// Handoff: plan was written successfully → assess, then await approval.
 			const result = assessHandoff(content);
 			state.handoffStatus = result.status;
 			state.handoffWarnings = result.warnings;
 
 			if (result.status === "NEEDS_UPDATE") {
 				// Critically incomplete — stay in planning, advise revision.
-				state.phase = "planning";
+				transitionPhase(state, "planning");
 				persist();
 				updateStatus(ctx);
 				ctx.ui.notify(formatHandoffNotification(result), "warn");
 			} else {
 				// Plan artifact ready — wait for native approval, do NOT build yet.
-				state.phase = "awaiting_approval";
+				transitionPhase(state, "awaiting_approval");
 				persist();
 				updateStatus(ctx);
 				ctx.ui.notify(
@@ -234,45 +296,25 @@ export default function leanflow(pi: ExtensionAPI): void {
 					"info",
 				);
 			}
+			return;
 		}
 
-		// Record successfully-written build-evidence artifacts for gate readiness.
 		if (event.toolName === "write" && pendingArtifactWrites.has(event.toolCallId)) {
 			const kind = pendingArtifactWrites.get(event.toolCallId)!;
 			pendingArtifactWrites.delete(event.toolCallId);
+			if (event.isError) return;
 			const written = state.writtenArtifacts ?? [];
 			if (!written.includes(kind)) {
 				state.writtenArtifacts = [...written, kind];
 				persist();
 			}
+			return;
 		}
 
-		// Gate verdict processing.
 		if (event.toolName === "task" && pendingGateCalls.has(event.toolCallId)) {
 			pendingGateCalls.delete(event.toolCallId);
-			const verdict = extractVerdict(event.content);
-
-			if (verdict === "PASS" || state.gateCalls >= 2) {
-				// Done: PASS or second FAIL (no more retries).
-				if (verdict !== "PASS") recordGateFailure(state, false);
-				state.phase = "idle";
-				persist();
-				updateStatus(ctx);
-				ctx.ui.notify(
-					verdict === "PASS"
-						? "LeanFlow: Gate PASS. Run complete."
-						: "LeanFlow: Gate FAIL (2/2). Report findings and finish.",
-					verdict === "PASS" ? "info" : "warn",
-				);
-			} else {
-				// First FAIL → back to building for repair; evidence must be refreshed.
-				recordGateFailure(state, true);
-				state.phase = "building";
-				state.writtenArtifacts = [];
-				persist();
-				updateStatus(ctx);
-				ctx.ui.notify("LeanFlow: Gate FAIL. Repair, refresh evidence, and re-gate (1 retry left).", "warn");
-			}
+			finishGateResult(event.isError ? undefined : extractVerdict(event.content), event.isError, ctx);
+			return;
 		}
 	});
 
@@ -283,12 +325,11 @@ export default function leanflow(pi: ExtensionAPI): void {
 	pi.on("context", async (event) => {
 		const messages = event.messages as Array<Record<string, unknown>>;
 		const filtered = filterForBuilder(messages, state);
-		if (filtered) {
-			// Quantify the handoff reduction: messages removed from the builder context.
-			recordContextFilter(state, messages.length, filtered.length);
-			persist();
-			return { messages: filtered as typeof event.messages };
-		}
+		if (!filtered) return;
+
+		// Filtering is the deliverable; measurements and their persistence are isolated.
+		recordStats(() => recordContextFilter(state, messages, filtered));
+		return { messages: filtered as typeof event.messages };
 	});
 
 	// -----------------------------------------------------------------------
@@ -300,16 +341,18 @@ export default function leanflow(pi: ExtensionAPI): void {
 		const message = event.message;
 		if (message.role !== "assistant") return;
 		const usage = message.usage;
-		if (!usage) return;
-		addUsage(state, { input: usage.input, output: usage.output, cacheRead: usage.cacheRead });
-		persist();
+		recordStats(() => addUsage(state, usage ? { input: usage.input, output: usage.output, cacheRead: usage.cacheRead } : {}));
 	});
 	// -----------------------------------------------------------------------
 
 	pi.registerCommand("flowstats", {
 		description: "Show LeanFlow run statistics (per-phase tokens, context reduction).",
 		handler: async (_args, ctx) => {
-			ctx.ui.notify(formatStats(state), "info");
+			try {
+				ctx.ui.notify(formatStats(state), "info");
+			} catch {
+				ctx.ui.notify("LeanFlow run statistics unavailable for this observation.", "warn");
+			}
 		},
 	});
 }
@@ -319,7 +362,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 // ---------------------------------------------------------------------------
 
 function isBuildAction(event: { toolName: string; input: Record<string, unknown> }): boolean {
-	if (BUILD_ACTION_TOOLS.has(event.toolName)) return true;
+	if (Object.hasOwn(BUILD_ACTION_TOOLS, event.toolName)) return true;
 	// A `write` to a non-plan path (build/diff/evidence/source) is a build action.
 	if (event.toolName === "write") {
 		const path = String(event.input.path ?? "");
@@ -361,6 +404,8 @@ function buildPlanningPrompt(task: string, slug: string): string {
 		"- Understand the request; investigate code directly or via Scout",
 		"- Write a decision-complete canonical plan",
 		"- Request approval via xd://propose",
+		"- Use LSP symbol references and diagnostics best-effort; if unavailable or timed out, continue with read/grep, compiler checks, executable tests, and runtime smoke tests.",
+		"- LSP diagnostics supplement executable validation; record any LSP availability/result in build.md and evidence.md without adding runtime statistics to context.",
 		"",
 		"## Plan artifact",
 		`Write to local://${slug}-plan.md. It is a decision document covering:`,
@@ -387,7 +432,7 @@ function buildPlanningPrompt(task: string, slug: string): string {
 // Gate verdict extraction from tool_result content
 // ---------------------------------------------------------------------------
 
-function extractVerdict(content: unknown): string | undefined {
+function extractVerdict(content: unknown): "PASS" | "FAIL" | undefined {
 	if (!Array.isArray(content)) return undefined;
 	for (const block of content) {
 		if (block && typeof block === "object") {
@@ -395,7 +440,7 @@ function extractVerdict(content: unknown): string | undefined {
 			if (b.type === "text" && typeof b.text === "string") {
 				// Try to parse JSON from the text block.
 				const match = b.text.match(/\{[\s\S]*"verdict"\s*:\s*"(PASS|FAIL)"[\s\S]*\}/);
-				if (match) return match[1];
+				if (match) return match[1] as "PASS" | "FAIL";
 			}
 		}
 	}

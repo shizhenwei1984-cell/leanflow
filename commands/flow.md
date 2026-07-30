@@ -67,9 +67,11 @@ After approval, native plan mode exits and the same Main Session becomes Builder
 1. Re-read the approved canonical plan.
 2. Record Baseline HEAD and baseline status in `local://<slug>-build.md` before edits. Preserve existing user work.
 3. Implement the approved plan; do not create an implementer, developer, coder, or builder subagent.
-4. Run every planned validation command. Record command, exit code, complete output reference, and result in `build.md`.
-5. Write the complete final diff to `local://<slug>-diff.md`; record final status, changed paths, and final HEAD in `build.md`.
-6. Collect runtime evidence for Gate. Write `local://<slug>-evidence.md` with one `## <command>` heading per command. At minimum include:
+4. Use LSP symbol references and diagnostics best-effort before source search. If LSP is unavailable or times out, continue with `read`/`grep`, compiler checks, executable tests, and a runtime smoke test; LSP diagnostics never replace executable validation.
+5. If LSP is used, record its availability and result in `build.md` and `evidence.md`; never inject LSP details or runtime statistics into the Builder context.
+6. Run every planned validation command. Record command, exit code, complete output reference, and result in `build.md`.
+7. Write the complete final diff to `local://<slug>-diff.md`; record final status, changed paths, and final HEAD in `build.md`.
+8. Collect runtime evidence for Gate. Write `local://<slug>-evidence.md` with one `## <command>` heading per command. At minimum include:
    - Every command from the plan's Verification section, with full output
    - `git diff <base> -- <changed-paths>` for each changed file
    - `git status --short` final state

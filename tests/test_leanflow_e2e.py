@@ -65,8 +65,8 @@ class WorkflowPromptTest(unittest.TestCase):
         state = (ROOT / "extensions" / "leanflow" / "state.ts").read_text(encoding="utf-8")
         self.assertIn('"awaiting_approval"', state)
         index = (ROOT / "extensions" / "leanflow" / "index.ts").read_text(encoding="utf-8")
-        # Plan write transitions to awaiting_approval, not building.
-        self.assertIn('state.phase = "awaiting_approval"', index)
+        # Plan write transitions through the single phase helper to awaiting approval.
+        self.assertIn('transitionPhase(state, "awaiting_approval")', index)
         # Building begins only on a post-approval build action.
         self.assertIn("isBuildAction", index)
         self.assertIn("BUILD_ACTION_TOOLS", index)
@@ -118,56 +118,107 @@ class WorkflowPromptTest(unittest.TestCase):
         self.assertIn("state.writtenArtifacts = []", index)
 
     def test_lsp_is_not_a_build_action(self) -> None:
-        """P2: lsp (definition/hover/preview) must not trigger the building phase."""
+        """P2: LSP reads must not trigger the building phase."""
         index = (ROOT / "extensions" / "leanflow" / "index.ts").read_text(encoding="utf-8")
-        self.assertIn('new Set(["edit", "bash", "ast_edit"])', index)
-        self.assertNotIn('"lsp"', index)
+        actions = index[index.index("const BUILD_ACTION_TOOLS") : index.index("export default function")]
+        self.assertIn("edit: true", actions)
+        self.assertIn("bash: true", actions)
+        self.assertIn("ast_edit: true", actions)
+        self.assertNotIn("lsp:", actions)
 
     def test_planner_prompt_has_no_gate_reference(self) -> None:
-        """P2: the Planner prompt must not mention Gate calls or build artifacts."""
+        """P2: the Planner prompt excludes Gate calls while retaining LSP guidance."""
         index = (ROOT / "extensions" / "leanflow" / "index.ts").read_text(encoding="utf-8")
         start = index.index("function buildPlanningPrompt")
         # Bound to the planner function body only (exclude later helpers/comments).
         end = index.index('].join("\\n");', start)
         planner = index[start:end]
         self.assertNotIn("Gate", planner)
-        self.assertNotIn("build.md", planner)
-        self.assertNotIn("evidence.md", planner)
+        self.assertIn("LSP symbol references", planner)
+        self.assertIn("build.md", planner)
+        self.assertIn("evidence.md", planner)
 
     def test_runtime_stats_are_tracked(self) -> None:
-        """Suggestion 3: per-phase tokens and context reduction are quantified."""
+        """Per-phase metrics and distinct context-filter measures are wired."""
         ext_dir = ROOT / "extensions" / "leanflow"
         stats = (ext_dir / "stats.ts").read_text(encoding="utf-8")
         self.assertIn("addUsage", stats)
+        self.assertIn("transitionPhase", stats)
         self.assertIn("recordContextFilter", stats)
+        self.assertIn("stableSerialize", stats)
         self.assertIn("formatStats", stats)
         # Honest accounting: subagent tokens are explicitly NOT fabricated.
         self.assertIn("separate subagent sessions", stats)
         state = (ext_dir / "state.ts").read_text(encoding="utf-8")
         self.assertIn("LeanFlowStats", state)
-        self.assertIn("stats?: LeanFlowStats", state)
+        self.assertIn("awaitingApproval", state)
+        self.assertIn("phaseStartedAt", state)
         index = (ext_dir / "index.ts").read_text(encoding="utf-8")
         self.assertIn("message_end", index)
         self.assertIn("addUsage(state", index)
         self.assertIn("recordContextFilter(state", index)
         self.assertIn('registerCommand("flowstats"', index)
 
-    def test_stats_track_gate_failures_and_repairs(self) -> None:
-        """Suggestion 7: workflow-quality counters (gate failures, repairs)."""
+    def test_stats_track_distinct_gate_outcomes(self) -> None:
+        """Gate verdicts, execution errors, repairs, and terminals stay separate."""
         ext_dir = ROOT / "extensions" / "leanflow"
         state = (ext_dir / "state.ts").read_text(encoding="utf-8")
-        self.assertIn("gateFailures", state)
-        self.assertIn("repairs", state)
+        for counter in (
+            "gatePasses",
+            "gateVerdictFailures",
+            "gateErrors",
+            "gateReadinessBlocks",
+            "repairRounds",
+            "repairSuccesses",
+            "terminalFailures",
+        ):
+            self.assertIn(counter, state)
         stats = (ext_dir / "stats.ts").read_text(encoding="utf-8")
         self.assertIn("recordGateFailure", stats)
+        self.assertIn("recordGateError", stats)
+        self.assertIn("recordGateReadinessBlock", stats)
         index = (ext_dir / "index.ts").read_text(encoding="utf-8")
         self.assertIn("recordGateFailure(state", index)
+        self.assertIn("recordGateError(state", index)
 
-    def test_stats_disclaim_token_impact(self) -> None:
-        """Suggestion 5/6: context filter is message-count only; non-gen phases noted."""
+    def test_gate_readiness_precedes_attempt_increment(self) -> None:
+        """Missing artifacts block before an attempt is counted."""
+        index = (ROOT / "extensions" / "leanflow" / "index.ts").read_text(encoding="utf-8")
+        readiness = index.index("const missing = missingArtifacts(state)")
+        increment = index.index("state.gateCalls++", readiness)
+        self.assertLess(readiness, increment)
+
+    def test_task_role_budgets_preflight_before_mutation(self) -> None:
+        """Exact requested role counts are preflighted before state mutation."""
+        guard = (ROOT / "extensions" / "leanflow" / "guard.ts").read_text(encoding="utf-8")
+        self.assertIn("extractAgentRoles", guard)
+        self.assertIn("checkAgentBudget", guard)
+        self.assertIn("exactly one Gate", guard)
+        self.assertIn("!allowed.includes(role)", guard)
+        index = (ROOT / "extensions" / "leanflow" / "index.ts").read_text(encoding="utf-8")
+        preflight = index.index("const budget = checkAgentBudget")
+        scout_increment = index.index("state.scoutCalls += scoutCount")
+        gate_increment = index.index("state.gateCalls++", scout_increment)
+        self.assertLess(preflight, scout_increment)
+        self.assertLess(preflight, gate_increment)
+
+    def test_stats_keep_token_measurements_honest(self) -> None:
+        """Message and byte reductions are never called provider token reductions."""
         stats = (ROOT / "extensions" / "leanflow" / "stats.ts").read_text(encoding="utf-8")
-        self.assertIn("token impact not measured", stats)
-        self.assertIn("non-generation phases", stats)
+        self.assertIn("Message-count reduction", stats)
+        self.assertIn("latest serialized bytes (KiB)", stats)
+        self.assertIn("provider token reduction: not measured", stats)
+
+    def test_lsp_capability_and_fallback_are_explicit(self) -> None:
+        """TypeScript/JavaScript LSP is configured but remains non-blocking."""
+        config = json.loads((ROOT / ".lsp.json").read_text(encoding="utf-8"))
+        typescript = config["servers"]["typescript"]
+        self.assertEqual(typescript["command"], "typescript-language-server")
+        self.assertEqual(typescript["args"], ["--stdio"])
+        self.assertIn(".git", typescript["rootMarkers"])
+        self.assertNotIn(".lsp.json", (ROOT / "scripts" / "install_leanflow.py").read_text(encoding="utf-8"))
+        self.assertIn("LSP symbol references", (ROOT / "commands" / "flow.md").read_text(encoding="utf-8"))
+        self.assertIn("LSP verification fallback", (ROOT / "docs" / "leanflow.md").read_text(encoding="utf-8"))
 
 
 class InstalledDiscoveryTest(unittest.TestCase):
