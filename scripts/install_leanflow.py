@@ -13,16 +13,34 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Literal, NotRequired, TypedDict, cast
+from collections.abc import Sequence
 
 PACKAGE = "leanflow"
 METADATA_NAME = "leanflow-install.json"
 SCHEMA_VERSION = 2
 
+InstallKind = Literal["file", "directory"]
+InstallMode = Literal["copy", "symlink"]
+InstallScope = Literal["user", "project"]
+InstallSource = tuple[str, Path, InstallKind]
+MetadataEntry = tuple[str, InstallKind, str, str | None]
+
+
+class PlannedEntry(TypedDict):
+    digest: str
+    kind: InstallKind
+    path: str
+    snapshot: str | None
+    source_overlap: bool
+    state: str
+    link_target: NotRequired[str]
+
+
 # Source-relative path -> install-relative path -> kind.
 # Source files live at the leanflow package root; install targets live under
 # <base>/commands, <base>/agents, <base>/skills/leanflow.
-EXPECTED_KINDS_V1 = {
+EXPECTED_KINDS_V1: dict[str, InstallKind] = {
     "commands/flow.md": "file",
     "agents/scout.md": "file",
     "agents/gate.md": "file",
@@ -30,21 +48,21 @@ EXPECTED_KINDS_V1 = {
     "extensions/leanflow-bootstrap.ts": "file",
 }
 
-EXPECTED_KINDS = {
+EXPECTED_KINDS: dict[str, InstallKind] = {
     "commands/flow.md": "file",
     "agents/scout.md": "file",
     "agents/gate.md": "file",
     "skills/leanflow/SKILL.md": "file",
     "extensions/leanflow": "directory",
 }
-EXPECTED_KINDS_BY_VERSION = {1: EXPECTED_KINDS_V1, SCHEMA_VERSION: EXPECTED_KINDS}
+EXPECTED_KINDS_BY_VERSION: dict[int, dict[str, InstallKind]] = {1: EXPECTED_KINDS_V1, SCHEMA_VERSION: EXPECTED_KINDS}
 
 
 class InstallError(Exception):
     pass
 
 
-def stable_json(value: Any) -> str:
+def stable_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
@@ -68,7 +86,7 @@ def sha256_tree(path: Path) -> str:
     return digest.hexdigest()
 
 
-def content_digest(path: Path, kind: str) -> str:
+def content_digest(path: Path, kind: InstallKind) -> str:
     return sha256_tree(path) if kind == "directory" else sha256_file(path)
 
 
@@ -96,7 +114,7 @@ def resolve_user_root() -> Path:
     return (Path.home() / ".omp" / "agent").resolve(strict=False)
 
 
-def resolve_base(scope: str, project_root: Optional[str]) -> Path:
+def resolve_base(scope: InstallScope, project_root: str | None) -> Path:
     if scope == "user":
         if project_root is not None:
             raise InstallError("--project-root is valid only with --scope project")
@@ -106,16 +124,16 @@ def resolve_base(scope: str, project_root: Optional[str]) -> Path:
     return root / ".omp"
 
 
-def package_sources(root: Path) -> List[Tuple[str, Path, str]]:
+def package_sources(root: Path) -> list[InstallSource]:
     """Map install-relative paths to source files at the leanflow package root."""
-    entries: List[Tuple[str, Path, str]] = []
+    entries: list[InstallSource] = []
     for relative, kind in EXPECTED_KINDS.items():
         source = root / relative
         if kind == "directory" and not source.is_dir():
             raise InstallError("missing source directory: %s" % source)
         if kind == "file" and not source.is_file():
             raise InstallError("missing source file: %s" % source)
-        validate_relative(relative)
+        _ = validate_relative(relative)
         entries.append((relative, source, kind))
     return entries
 
@@ -158,7 +176,7 @@ def remove_target(target: Path) -> None:
         shutil.rmtree(str(target))
 
 
-def snapshot_from_stat(info: os.stat_result, link_target: Optional[str] = None) -> str:
+def snapshot_from_stat(info: os.stat_result, link_target: str | None = None) -> str:
     if stat_module.S_ISLNK(info.st_mode):
         kind = "symlink"
     elif stat_module.S_ISDIR(info.st_mode):
@@ -167,7 +185,7 @@ def snapshot_from_stat(info: os.stat_result, link_target: Optional[str] = None) 
         kind = "file"
     else:
         kind = "other"
-    value: Dict[str, Any] = {
+    value: dict[str, object] = {
         "change_time_ns": info.st_ctime_ns,
         "device": info.st_dev,
         "inode": info.st_ino,
@@ -181,7 +199,7 @@ def snapshot_from_stat(info: os.stat_result, link_target: Optional[str] = None) 
     return stable_json(value)
 
 
-def target_snapshot(target: Path) -> Optional[str]:
+def target_snapshot(target: Path) -> str | None:
     try:
         info = os.lstat(str(target))
     except (FileNotFoundError, NotADirectoryError):
@@ -194,11 +212,11 @@ def open_parent_fd(
     root_fd: int,
     relative: str,
     create: bool = False,
-    created: Optional[List[str]] = None,
-) -> Tuple[int, str]:
+    created: list[str] | None = None,
+) -> tuple[int, str]:
     parts = validate_relative(relative).parts
     current_fd = os.dup(root_fd)
-    traversed: List[str] = []
+    traversed: list[str] = []
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         for component in parts[:-1]:
@@ -220,7 +238,7 @@ def open_parent_fd(
         raise
 
 
-def relative_snapshot(root_fd: int, relative: str) -> Optional[str]:
+def relative_snapshot(root_fd: int, relative: str) -> str | None:
     parent_fd, leaf = open_parent_fd(root_fd, relative)
     try:
         try:
@@ -243,7 +261,7 @@ def relative_replace(
     destination_root_fd: int,
     destination_relative: str,
     create_destination: bool = False,
-    created: Optional[List[str]] = None,
+    created: list[str] | None = None,
 ) -> None:
     source_parent_fd, source_leaf = open_parent_fd(source_root_fd, source_relative)
     try:
@@ -284,19 +302,19 @@ def _is_source_overlap(target: Path, source: Path) -> bool:
         return False
 
 def planned_entries(
-    sources: Sequence[Tuple[str, Path, str]], base: Path, mode: str
-) -> List[Dict[str, Any]]:
-    planned: List[Dict[str, Any]] = []
+    sources: Sequence[InstallSource], base: Path, mode: InstallMode
+) -> list[PlannedEntry]:
+    planned: list[PlannedEntry] = []
     for relative, source, kind in sources:
         target = target_for(base, relative)
-        entry: Dict[str, Any] = {
+        entry: PlannedEntry = {
             "digest": content_digest(source, kind),
             "kind": kind,
             "path": relative,
             "snapshot": target_snapshot(target),
+            "source_overlap": _is_source_overlap(target, source),
             "state": target_state(target),
         }
-        entry["source_overlap"] = _is_source_overlap(target, source)
         if mode == "symlink":
             entry["link_target"] = str(source.resolve(strict=True))
         planned.append(entry)
@@ -307,33 +325,87 @@ def metadata_path(base: Path) -> Path:
     return base / METADATA_NAME
 
 
-def read_metadata(base: Path) -> Mapping[str, Any]:
+def read_metadata(base: Path) -> tuple[InstallScope, InstallMode, list[MetadataEntry]]:
     path = metadata_path(base)
     if not path.exists():
         raise InstallError("no LeanFlow installation metadata at %s" % base)
     try:
-        with open(str(path), "r", encoding="utf-8") as handle:
-            data = json.load(handle)
+        with open(str(path), encoding="utf-8") as handle:
+            raw_data = cast(object, json.load(handle))
     except (OSError, json.JSONDecodeError) as exc:
         raise InstallError("invalid LeanFlow install metadata: %s" % exc) from exc
-    if not isinstance(data, dict) or data.get("package") != PACKAGE:
+    if not isinstance(raw_data, dict):
+        raise InstallError("metadata at %s is not a LeanFlow install record" % base)
+    raw_mapping = cast(dict[object, object], raw_data)
+    if not all(isinstance(key, str) for key in raw_mapping):
+        raise InstallError("metadata at %s is not a LeanFlow install record" % base)
+    data: dict[str, object] = {key: value for key, value in raw_mapping.items() if isinstance(key, str)}
+    if data.get("package") != PACKAGE:
         raise InstallError("metadata at %s is not a LeanFlow install record" % base)
     schema_version = data.get("schema_version")
-    if schema_version not in EXPECTED_KINDS_BY_VERSION:
+    if not isinstance(schema_version, int) or schema_version not in EXPECTED_KINDS_BY_VERSION:
         raise InstallError("unknown LeanFlow metadata schema_version: %s" % schema_version)
-    return data
+    raw_scope = data.get("scope")
+    raw_mode = data.get("mode")
+    raw_entries = data.get("entries")
+    if raw_scope == "user":
+        scope: InstallScope = "user"
+    elif raw_scope == "project":
+        scope = "project"
+    else:
+        raise InstallError("metadata has invalid scope")
+    if raw_mode == "copy":
+        mode: InstallMode = "copy"
+    elif raw_mode == "symlink":
+        mode = "symlink"
+    else:
+        raise InstallError("metadata has invalid mode")
+    if not isinstance(raw_entries, list):
+        raise InstallError("metadata has invalid entries")
+    entries = cast(list[object], raw_entries)
+    expected_kinds = EXPECTED_KINDS_BY_VERSION[schema_version]
+    validated_entries: list[MetadataEntry] = []
+    for raw_entry in entries:
+        if not isinstance(raw_entry, dict):
+            raise InstallError("metadata entry is not an object")
+        raw_entry_mapping = cast(dict[object, object], raw_entry)
+        if not all(isinstance(key, str) for key in raw_entry_mapping):
+            raise InstallError("metadata entry is not an object")
+        entry: dict[str, object] = {key: value for key, value in raw_entry_mapping.items() if isinstance(key, str)}
+        relative = entry.get("path")
+        digest = entry.get("digest")
+        link_target = entry.get("link_target")
+        if not isinstance(relative, str) or not isinstance(digest, str):
+            raise InstallError("metadata entry has invalid path or digest")
+        expected_kind = expected_kinds.get(relative)
+        if expected_kind is None or entry.get("kind") != expected_kind:
+            raise InstallError("metadata entry has unexpected path or kind: %s" % relative)
+        _ = validate_relative(relative)
+        if mode == "symlink" and not isinstance(link_target, str):
+            raise InstallError("symlink metadata entry has no link_target: %s" % relative)
+        if mode == "copy" and link_target is not None:
+            raise InstallError("copy metadata entry has unexpected link_target: %s" % relative)
+        validated_entries.append((relative, expected_kind, digest, link_target if isinstance(link_target, str) else None))
+    if {relative for relative, _, _, _ in validated_entries} != set(expected_kinds) or len(validated_entries) != len(expected_kinds):
+        raise InstallError("metadata entries do not match the installed LeanFlow schema")
+    return scope, mode, validated_entries
 
 
-def install_metadata(scope: str, mode: str, entries: List[Dict[str, Any]]) -> Dict[str, Any]:
-    stored: List[Dict[str, Any]] = []
+def install_metadata(
+    scope: InstallScope, mode: InstallMode, entries: Sequence[PlannedEntry]
+) -> dict[str, object]:
+    stored: list[dict[str, object]] = []
     for entry in entries:
-        stored_entry = {
+        stored_entry: dict[str, object] = {
             "digest": entry["digest"],
             "kind": entry["kind"],
             "path": entry["path"],
         }
         if mode == "symlink":
-            stored_entry["link_target"] = entry["link_target"]
+            link_target = entry.get("link_target")
+            if not isinstance(link_target, str):
+                raise InstallError("symlink install entry has no link_target")
+            stored_entry["link_target"] = link_target
         stored.append(stored_entry)
     return {
         "entries": stored,
@@ -344,20 +416,20 @@ def install_metadata(scope: str, mode: str, entries: List[Dict[str, Any]]) -> Di
     }
 
 
-def write_metadata_atomic(base: Path, metadata: Mapping[str, Any]) -> None:
+def write_metadata_atomic(base: Path, metadata: object) -> None:
     base.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix=".%s." % METADATA_NAME, dir=str(base))
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(stable_json(metadata) + "\n")
+            _ = handle.write(stable_json(metadata) + "\n")
         os.replace(temporary, metadata_path(base))
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
 
 
-def ancestor_conflicts(base: Path, entries: Sequence[Mapping[str, Any]]) -> List[str]:
-    conflicts = set()
+def ancestor_conflicts(base: Path, entries: Sequence[PlannedEntry]) -> list[str]:
+    conflicts: set[str] = set()
     for entry in entries:
         current = target_for(base, entry["path"]).parent
         base_str = str(base.resolve(strict=False))
@@ -369,19 +441,19 @@ def ancestor_conflicts(base: Path, entries: Sequence[Mapping[str, Any]]) -> List
     return sorted(conflicts)
 
 
-def materialize(source: Path, kind: str, target: Path, mode: str) -> None:
+def materialize(source: Path, kind: InstallKind, target: Path, mode: InstallMode) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     if mode == "symlink":
-        target.symlink_to(source.resolve(strict=True), target_is_directory=(kind == "directory"))
+        _ = target.symlink_to(source.resolve(strict=True), target_is_directory=(kind == "directory"))
     elif kind == "directory":
-        shutil.copytree(str(source), str(target), symlinks=True)
+        _ = shutil.copytree(str(source), str(target), symlinks=True)
     else:
-        shutil.copy2(str(source), str(target))
+        _ = shutil.copy2(str(source), str(target))
 
-def path_parent(root: Path, relative: str, create: bool = False, created: Optional[List[str]] = None) -> Path:
+def path_parent(root: Path, relative: str, create: bool = False, created: list[str] | None = None) -> Path:
     parts = validate_relative(relative).parts[:-1]
     current = root
-    traversed: List[str] = []
+    traversed: list[str] = []
     for component in parts:
         traversed.append(component)
         current = current / component
@@ -389,7 +461,7 @@ def path_parent(root: Path, relative: str, create: bool = False, created: Option
             if current.is_symlink() or not current.is_dir():
                 raise InstallError("unsafe installation parent: %s" % "/".join(traversed))
         elif create:
-            current.mkdir()
+            _ = current.mkdir()
             if created is not None:
                 created.append("/".join(traversed))
         else:
@@ -397,14 +469,14 @@ def path_parent(root: Path, relative: str, create: bool = False, created: Option
     return current
 
 
-def path_replace(source_root: Path, source_relative: str, destination_root: Path, destination_relative: str, create_destination: bool = False, created: Optional[List[str]] = None) -> None:
+def path_replace(source_root: Path, source_relative: str, destination_root: Path, destination_relative: str, create_destination: bool = False, created: list[str] | None = None) -> None:
     source = target_for(source_root, source_relative)
     destination = target_for(destination_root, destination_relative)
-    path_parent(destination_root, destination_relative, create_destination, created)
-    os.replace(str(source), str(destination))
+    _ = path_parent(destination_root, destination_relative, create_destination, created)
+    _ = os.replace(str(source), str(destination))
 
 
-def install_windows(root: Path, base: Path, scope: str, mode: str, force: bool, apply: bool) -> Mapping[str, Any]:
+def install_windows(root: Path, base: Path, scope: InstallScope, mode: InstallMode, force: bool, apply: bool) -> dict[str, object]:
     sources = package_sources(root)
     entries = planned_entries(sources, base, mode)
     conflicts = [entry["path"] for entry in entries if entry["state"] != "absent"]
@@ -412,7 +484,7 @@ def install_windows(root: Path, base: Path, scope: str, mode: str, force: bool, 
     if metadata_snapshot is not None:
         conflicts.append(METADATA_NAME)
     blocked_ancestors = ancestor_conflicts(base, entries)
-    result: Dict[str, Any] = {
+    result: dict[str, object] = {
         "action": "apply" if apply else "dry-run",
         "ancestor_conflicts": blocked_ancestors,
         "base": str(base),
@@ -444,10 +516,10 @@ def install_windows(root: Path, base: Path, scope: str, mode: str, force: bool, 
     base.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=".leanflow-stage-", dir=str(base)))
     backup = Path(tempfile.mkdtemp(prefix=".leanflow-backup-", dir=str(base)))
-    backed_up: List[str] = []
+    backed_up: list[str] = []
     metadata_backed_up = False
-    created_parents: List[str] = []
-    promoted: List[str] = []
+    created_parents: list[str] = []
+    promoted: list[str] = []
     metadata_promoted = False
     preserve_backup = False
     try:
@@ -455,7 +527,7 @@ def install_windows(root: Path, base: Path, scope: str, mode: str, force: bool, 
             materialize(source, kind, target_for(stage, entry["path"]), mode)
         write_metadata_atomic(stage, install_metadata(scope, mode, entries))
         for entry in entries:
-            path_parent(base, entry["path"], create=True, created=created_parents)
+            _ = path_parent(base, entry["path"], create=True, created=created_parents)
             if target_snapshot(target_for(base, entry["path"])) != entry["snapshot"]:
                 raise InstallError("installation target changed after preflight: %s" % entry["path"])
         if target_snapshot(metadata_path(base)) != metadata_snapshot:
@@ -473,7 +545,7 @@ def install_windows(root: Path, base: Path, scope: str, mode: str, force: bool, 
         path_replace(stage, METADATA_NAME, base, METADATA_NAME)
         metadata_promoted = True
     except Exception as exc:
-        rollback_errors: List[str] = []
+        rollback_errors: list[str] = []
         for relative in reversed(promoted):
             try:
                 path_replace(base, relative, stage, "rollback/" + relative, create_destination=True)
@@ -501,7 +573,7 @@ def install_windows(root: Path, base: Path, scope: str, mode: str, force: bool, 
                 pass
         if rollback_errors:
             preserve_backup = True
-            raise InstallError("installation failed and rollback was incomplete: %s; recoverable originals are preserved at %s; %s" % (exc, backup, "; ".join(rollback_errors))) from exc
+            raise InstallError("installation failed and rollback was incomplete: {}; recoverable originals are preserved at {}; {}".format(exc, backup, "; ".join(rollback_errors))) from exc
         raise InstallError("installation failed before completion: %s" % exc) from exc
     finally:
         shutil.rmtree(str(stage), ignore_errors=True)
@@ -517,8 +589,8 @@ def install_windows(root: Path, base: Path, scope: str, mode: str, force: bool, 
 
 def create_target_parents(
     base_fd: int,
-    entries: Sequence[Mapping[str, Any]],
-    created: List[str],
+    entries: Sequence[PlannedEntry],
+    created: list[str],
 ) -> None:
     for entry in entries:
         parent_fd, _ = open_parent_fd(
@@ -527,7 +599,7 @@ def create_target_parents(
         os.close(parent_fd)
 
 
-def install(root: Path, base: Path, scope: str, mode: str, force: bool, apply: bool) -> Mapping[str, Any]:
+def install(root: Path, base: Path, scope: InstallScope, mode: InstallMode, force: bool, apply: bool) -> dict[str, object]:
     if os.name == "nt":
         return install_windows(root, base, scope, mode, force, apply)
     sources = package_sources(root)
@@ -537,7 +609,7 @@ def install(root: Path, base: Path, scope: str, mode: str, force: bool, apply: b
     if metadata_snapshot is not None:
         conflicts.append(METADATA_NAME)
     blocked_ancestors = ancestor_conflicts(base, entries)
-    result: Dict[str, Any] = {
+    result: dict[str, object] = {
         "action": "apply" if apply else "dry-run",
         "ancestor_conflicts": blocked_ancestors,
         "base": str(base),
@@ -569,10 +641,10 @@ def install(root: Path, base: Path, scope: str, mode: str, force: bool, apply: b
     base.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=".leanflow-stage-", dir=str(base)))
     backup = Path(tempfile.mkdtemp(prefix=".leanflow-backup-", dir=str(base)))
-    backed_up: List[str] = []
+    backed_up: list[str] = []
     metadata_backed_up = False
-    created_parents: List[str] = []
-    promoted: List[str] = []
+    created_parents: list[str] = []
+    promoted: list[str] = []
     metadata_promoted = False
     preserve_backup = False
     directory_flags = (
@@ -623,7 +695,7 @@ def install(root: Path, base: Path, scope: str, mode: str, force: bool, apply: b
         relative_replace(stage_fd, METADATA_NAME, base_fd, METADATA_NAME)
         metadata_promoted = True
     except Exception as exc:
-        rollback_errors: List[str] = []
+        rollback_errors: list[str] = []
         for relative in reversed(promoted):
             try:
                 relative_replace(
@@ -673,8 +745,7 @@ def install(root: Path, base: Path, scope: str, mode: str, force: bool, apply: b
         if rollback_errors:
             preserve_backup = True
             raise InstallError(
-                "installation failed and rollback was incomplete: %s; "
-                "recoverable originals are preserved at %s; %s"
+                "installation failed and rollback was incomplete: %s; recoverable originals are preserved at %s; %s"
                 % (exc, backup, "; ".join(rollback_errors))
             ) from exc
         raise InstallError("installation failed before completion: %s" % exc) from exc
@@ -693,15 +764,16 @@ def install(root: Path, base: Path, scope: str, mode: str, force: bool, apply: b
     return result
 
 
-def verify_installed_entry(base: Path, entry: Mapping[str, Any], mode: str) -> Optional[str]:
-    relative = entry["path"]
+def verify_installed_entry(
+    base: Path, entry: MetadataEntry, mode: InstallMode
+) -> str | None:
+    relative, kind, digest, link_target = entry
     target = target_for(base, relative)
-    kind = entry.get("kind")
     if mode == "symlink":
         if not target.is_symlink():
             return "%s is not the recorded symlink" % relative
         actual = str(target.resolve(strict=False))
-        if actual != entry.get("link_target"):
+        if actual != link_target:
             return "%s symlink target changed" % relative
         return None
     if kind == "directory":
@@ -709,21 +781,17 @@ def verify_installed_entry(base: Path, entry: Mapping[str, Any], mode: str) -> O
             return "%s is not the recorded directory" % relative
     elif not target.is_file() or target.is_symlink():
         return "%s is not the recorded file" % relative
-    if content_digest(target, kind) != entry.get("digest"):
+    if content_digest(target, kind) != digest:
         return "%s content changed after installation" % relative
     return None
 
 
-def uninstall(base: Path, scope: str, apply: bool) -> Mapping[str, Any]:
-    metadata = read_metadata(base)
-    if metadata.get("scope") != scope:
+def uninstall(base: Path, scope: InstallScope, apply: bool) -> dict[str, object]:
+    metadata_scope, mode, entries = read_metadata(base)
+    if metadata_scope != scope:
         raise InstallError("metadata scope does not match requested scope")
-    mode = metadata.get("mode")
-    if mode not in ("copy", "symlink"):
-        raise InstallError("metadata install mode is invalid")
-    entries = metadata["entries"]
     problems = [problem for problem in (verify_installed_entry(base, entry, mode) for entry in entries) if problem]
-    result: Dict[str, Any] = {
+    result: dict[str, object] = {
         "action": "uninstall" if apply else "uninstall-dry-run",
         "base": str(base),
         "entries": entries,
@@ -734,10 +802,10 @@ def uninstall(base: Path, scope: str, apply: bool) -> Mapping[str, Any]:
     }
     if problems or not apply:
         return result
-    for entry in reversed(entries):
-        remove_target(target_for(base, entry["path"]))
+    for relative, _, _, _ in reversed(entries):
+        remove_target(target_for(base, relative))
     metadata_path(base).unlink()
-    parents = sorted({target_for(base, entry["path"]).parent for entry in entries}, key=lambda item: len(item.parts), reverse=True)
+    parents = sorted({target_for(base, relative).parent for relative, _, _, _ in entries}, key=lambda item: len(item.parts), reverse=True)
     for parent in parents:
         if parent == base:
             continue
@@ -748,34 +816,61 @@ def uninstall(base: Path, scope: str, apply: bool) -> Mapping[str, Any]:
     return result
 
 
-def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+def parse_args(
+    argv: Sequence[str] | None = None,
+) -> tuple[bool, bool, bool, InstallMode, InstallScope, str | None]:
     parser = argparse.ArgumentParser(description=__doc__)
     actions = parser.add_mutually_exclusive_group()
-    actions.add_argument("--dry-run", action="store_true", help="show changes without writing (default)")
-    actions.add_argument("--apply", action="store_true", help="perform installation")
-    parser.add_argument("--uninstall", action="store_true", help="select metadata-verified uninstall; combine with --apply to remove")
-    parser.add_argument("--mode", choices=("symlink", "copy"), default="copy" if os.name == "nt" else "symlink")
-    parser.add_argument("--scope", choices=("user", "project"), default="user")
-    parser.add_argument("--project-root", help="target project root; defaults to cwd for project scope")
-    parser.add_argument("--force", action="store_true", help="replace existing install targets during installation")
-    return parser.parse_args(argv)
+    _ = actions.add_argument("--dry-run", action="store_true", help="show changes without writing (default)")
+    _ = actions.add_argument("--apply", action="store_true", help="perform installation")
+    _ = parser.add_argument("--uninstall", action="store_true", help="select metadata-verified uninstall; combine with --apply to remove")
+    _ = parser.add_argument("--mode", choices=("symlink", "copy"), default="copy" if os.name == "nt" else "symlink")
+    _ = parser.add_argument("--scope", choices=("user", "project"), default="user")
+    _ = parser.add_argument("--project-root", help="target project root; defaults to cwd for project scope")
+    _ = parser.add_argument("--force", action="store_true", help="replace existing install targets during installation")
+    parsed_args: object = parser.parse_args(argv)
+    raw_args = cast(dict[str, object], vars(parsed_args))
+    apply = raw_args.get("apply")
+    uninstall = raw_args.get("uninstall")
+    force = raw_args.get("force")
+    raw_mode = raw_args.get("mode")
+    raw_scope = raw_args.get("scope")
+    project_root = raw_args.get("project_root")
+    if not isinstance(apply, bool) or not isinstance(uninstall, bool) or not isinstance(force, bool):
+        raise AssertionError("argparse produced a non-boolean flag")
+    if raw_mode == "copy":
+        mode: InstallMode = "copy"
+    elif raw_mode == "symlink":
+        mode = "symlink"
+    else:
+        raise AssertionError("argparse produced an invalid mode")
+    if raw_scope == "user":
+        scope: InstallScope = "user"
+    elif raw_scope == "project":
+        scope = "project"
+    else:
+        raise AssertionError("argparse produced an invalid scope")
+    if project_root is not None and not isinstance(project_root, str):
+        raise AssertionError("argparse produced an invalid project root")
+    return apply, uninstall, force, mode, scope, project_root
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = parse_args(argv)
+def main(argv: Sequence[str] | None = None) -> int:
+    apply, uninstall_requested, force, mode, scope, project_root = parse_args(argv)
+    result: dict[str, object]
     try:
         root = source_root()
-        base = resolve_base(args.scope, args.project_root)
-        if args.uninstall:
-            result = uninstall(base, args.scope, apply=args.apply)
+        base = resolve_base(scope, project_root)
+        if uninstall_requested:
+            result = uninstall(base, scope, apply=apply)
         else:
-            result = install(root, base, args.scope, args.mode, args.force, apply=args.apply)
+            result = install(root, base, scope, mode, force, apply=apply)
     except (InstallError, OSError) as exc:
-        selected = "uninstall" if args.uninstall else "install"
-        operation = "apply" if args.apply else "dry-run"
-        result = {"action": "%s-%s" % (selected, operation), "error": str(exc), "ok": False}
-    sys.stdout.write(stable_json(result) + "\n")
-    return 0 if result.get("ok") else 2
+        selected = "uninstall" if uninstall_requested else "install"
+        operation = "apply" if apply else "dry-run"
+        result = {"action": "{}-{}".format(selected, operation), "error": str(exc), "ok": False}
+    _ = sys.stdout.write(stable_json(result) + "\n")
+    return 0 if result.get("ok") is True else 2
 
 
 if __name__ == "__main__":

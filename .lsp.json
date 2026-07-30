@@ -1,0 +1,19 @@
+{
+  "servers": {
+    "basedpyright": {
+      "command": "basedpyright-langserver",
+      "args": ["--stdio"],
+      "fileTypes": [".py", ".pyi"],
+      "rootMarkers": [".git"],
+      "settings": {
+        "basedpyright": {
+          "analysis": {
+            "autoSearchPaths": true,
+            "diagnosticMode": "openFilesOnly",
+            "useLibraryCodeForTypes": true
+          }
+        }
+      }
+    }
+  }
+}

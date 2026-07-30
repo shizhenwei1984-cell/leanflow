@@ -157,10 +157,17 @@ class InstallTest(unittest.TestCase):
 
     def test_user_symlink_install_and_uninstall_has_only_minimal_roles(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
+            probe = Path(directory) / "symlink-capability-probe"
+            try:
+                probe.symlink_to(probe.with_name("symlink-capability-target"))
+            except OSError:
+                self.skipTest("symlink creation is unavailable to the test process")
+            else:
+                probe.unlink()
             home = Path(directory) / "home"
             apply = subprocess.run(
                 [sys.executable, str(INSTALLER), "--scope", "user", "--mode", "symlink", "--apply"],
-                env={"HOME": str(home)},
+                env={**os.environ, "HOME": str(home), "PI_CODING_AGENT_DIR": str(home / ".omp" / "agent")},
                 text=True,
                 capture_output=True,
             )
@@ -173,7 +180,7 @@ class InstallTest(unittest.TestCase):
             self.assertFalse((agents / "repo-reviewer.md").exists())
             remove = subprocess.run(
                 [sys.executable, str(INSTALLER), "--scope", "user", "--uninstall", "--apply"],
-                env={"HOME": str(home)},
+                env={**os.environ, "HOME": str(home), "PI_CODING_AGENT_DIR": str(home / ".omp" / "agent")},
                 text=True,
                 capture_output=True,
             )
