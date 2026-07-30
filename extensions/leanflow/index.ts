@@ -7,21 +7,21 @@
  * Phase lifecycle:
  *   /flow            → planning
  *   write *-plan.md  → awaiting_approval  (plan exists; NOT yet approved)
- *   first build action after approval → building
+ *   completed LSP diagnostics + first build action after approval → building
  *   task(gate)       → gating
  *   Gate PASS / 2nd FAIL → idle
  *   Gate 1st FAIL    → building (repair)
  *
  * The critical correctness property: writing the plan artifact does NOT
- * advance to building. The builder phase begins only when the model takes
- * its first implementation action (edit/bash/non-plan write), which can only
- * happen after the native plan-mode approval overlay is accepted.
+ * advance to building. The Builder receives its protocol after approval, must
+ * complete diagnostics before the first repository mutation, and enters
+ * building only on that subsequent implementation action.
  *
  * State persists via appendEntry and restores from the session branch,
  * surviving compaction and session switches.
  */
 
-import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ToolCallEvent } from "@oh-my-pi/pi-coding-agent";
 import { CUSTOM_TYPE, defaultState, defaultStats, restoreState } from "./state";
 import type { LeanFlowState } from "./state";
 import { checkAgentBudget, checkTaskGuard, extractAgentRoles } from "./guard";
@@ -40,14 +40,75 @@ import {
 	transitionPhase,
 } from "./stats";
 
-/** Tools that mutate the repository — signal that building has started.
- * `lsp` is intentionally excluded: definition/hover/rename-preview are reads. */
+/** Tools that mutate the repository — signal that building has started. */
 const BUILD_ACTION_TOOLS: Readonly<Record<string, true>> = { edit: true, bash: true, ast_edit: true };
+
+type WriteToolInput = { content: string; path: string };
+
+function isTaskToolCall(event: ToolCallEvent): event is ToolCallEvent & { input: Record<string, unknown>; toolName: "task" } {
+	return event.toolName === "task" && typeof event.input === "object" && event.input !== null && !Array.isArray(event.input);
+}
+
+function isWriteToolCall(event: ToolCallEvent): event is ToolCallEvent & { input: WriteToolInput; toolName: "write" } {
+	return (
+		event.toolName === "write" &&
+		"path" in event.input &&
+		"content" in event.input &&
+		typeof event.input.path === "string" &&
+		typeof event.input.content === "string"
+	);
+}
+
+function lspDiagnosticsTarget(event: ToolCallEvent): string | undefined {
+	if (!isWriteToolCall(event) || event.input.path !== "xd://lsp") return undefined;
+	try {
+		const input: unknown = JSON.parse(event.input.content);
+		if (
+			typeof input === "object" &&
+			input !== null &&
+			!Array.isArray(input) &&
+			"action" in input &&
+			input.action === "diagnostics" &&
+			"file" in input &&
+			typeof input.file === "string"
+		) {
+			return input.file;
+		}
+	} catch {
+		// Malformed device input is neither a diagnostics probe nor a mutation.
+	}
+	return undefined;
+}
+
+function isProposalWrite(event: ToolCallEvent): event is ToolCallEvent & { input: WriteToolInput; toolName: "write" } {
+	return isWriteToolCall(event) && event.input.path === "xd://propose";
+}
+
+function hasPlanModeExitAfter(branch: Iterable<unknown>, boundary: number): boolean {
+	let index = 0;
+	for (const entry of branch) {
+		if (
+			index >= boundary &&
+			typeof entry === "object" &&
+			entry !== null &&
+			"type" in entry &&
+			entry.type === "mode_change" &&
+			"mode" in entry &&
+			entry.mode === "none"
+		) {
+			return true;
+		}
+		index++;
+	}
+	return false;
+}
 
 export default function leanflow(pi: ExtensionAPI): void {
 	let state: LeanFlowState = defaultState();
-	// Correlate tool_call → tool_result for plan writes and gate calls.
+	// Correlate tool_call → tool_result for plan writes, LSP probes, and gate calls.
 	const pendingPlanWrites = new Map<string, string>(); // toolCallId → plan content
+	const pendingLspProbes = new Map<string, string>(); // toolCallId → diagnostics target
+	const pendingApprovalWrites = new Set<string>(); // toolCallIds
 	const pendingGateCalls = new Set<string>(); // toolCallIds
 	const pendingArtifactWrites = new Map<string, string>(); // toolCallId → artifact kind
 
@@ -69,6 +130,17 @@ export default function leanflow(pi: ExtensionAPI): void {
 		} catch {
 			// Statistics must never break an otherwise valid workflow action.
 		}
+	}
+
+	function nativeApprovalConfirmed(ctx: ExtensionContext): boolean {
+		if (state.phase === "building") return true;
+		if (state.phase !== "awaiting_approval" || state.proposalBoundary === undefined) return false;
+		if (state.approvalBoundary === state.proposalBoundary) return true;
+		if (!hasPlanModeExitAfter(ctx.sessionManager.getBranch(), state.proposalBoundary)) return false;
+
+		state.approvalBoundary = state.proposalBoundary;
+		persist();
+		return true;
 	}
 
 	function finishGateResult(verdict: "PASS" | "FAIL" | undefined, isError: boolean, ctx: ExtensionContext): void {
@@ -100,7 +172,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 			updateStatus(ctx);
 			ctx.ui.notify(
 				"LeanFlow: Gate result unavailable or FAIL. Repair, refresh evidence, and re-gate (1 retry left).",
-				"warn",
+				"warning",
 			);
 			return;
 		}
@@ -108,7 +180,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 		transitionPhase(state, "idle");
 		persist();
 		updateStatus(ctx);
-		ctx.ui.notify("LeanFlow: Gate FAIL (2/2). Report findings and finish.", "warn");
+		ctx.ui.notify("LeanFlow: Gate FAIL (2/2). Report findings and finish.", "warning");
 	}
 
 	function updateStatus(ctx: ExtensionContext): void {
@@ -127,14 +199,15 @@ export default function leanflow(pi: ExtensionAPI): void {
 	// State restoration on session lifecycle events
 	// -----------------------------------------------------------------------
 
-	const restoreEvents = ["session_start", "session_switch", "session_branch", "session_tree"] as const;
-	for (const eventName of restoreEvents) {
-		pi.on(eventName, async (_event, ctx) => {
-			state = restoreState(ctx.sessionManager.getBranch());
-			resumePhaseTiming(state);
-			updateStatus(ctx);
-		});
-	}
+	const restoreSessionState = async (_event: unknown, ctx: ExtensionContext): Promise<void> => {
+		state = restoreState(ctx.sessionManager.getBranch());
+		resumePhaseTiming(state);
+		updateStatus(ctx);
+	};
+	pi.on("session_start", restoreSessionState);
+	pi.on("session_switch", restoreSessionState);
+	pi.on("session_branch", restoreSessionState);
+	pi.on("session_tree", restoreSessionState);
 
 	// -----------------------------------------------------------------------
 	// /flow command
@@ -176,6 +249,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 				scoutCalls: 0,
 				gateCalls: 0,
 				gateAttempt: 0,
+				lspProbeCompleted: false,
 				planSlug: slug,
 				startedAt: now,
 				stats: defaultStats(),
@@ -197,13 +271,13 @@ export default function leanflow(pi: ExtensionAPI): void {
 		if (state.phase === "idle") return;
 
 		// Guard: block forbidden agent spawns via `task` tool.
-		if (event.toolName === "task") {
-			const guard = checkTaskGuard(state.phase, event.input as Record<string, unknown>);
+		if (isTaskToolCall(event)) {
+			const guard = checkTaskGuard(state.phase, event.input);
 			if (guard.block) {
 				return { block: true, reason: guard.reason };
 			}
 
-			const roles = extractAgentRoles(event.input as Record<string, unknown>);
+			const roles = extractAgentRoles(event.input);
 			const budget = checkAgentBudget(state, roles);
 			if (budget.block) return { block: true, reason: budget.reason };
 
@@ -234,29 +308,49 @@ export default function leanflow(pi: ExtensionAPI): void {
 				updateStatus(ctx);
 			}
 		}
-		// Detect plan write for handoff assessment (planning → awaiting_approval).
-		if (event.toolName === "write" && state.phase === "planning") {
-			const path = String((event.input as Record<string, unknown>).path ?? "");
-			if (path.includes("-plan.md")) {
-				const content = String((event.input as Record<string, unknown>).content ?? "");
-				pendingPlanWrites.set(event.toolCallId, content);
-			}
+
+		const approvalConfirmed =
+			state.phase === "awaiting_approval" && nativeApprovalConfirmed(ctx);
+		// Refine keeps native plan mode active, so revised plans remain assessable.
+		if (
+			isWriteToolCall(event) &&
+			(state.phase === "planning" || (state.phase === "awaiting_approval" && !approvalConfirmed)) &&
+			event.input.path.includes("-plan.md")
+		) {
+			pendingPlanWrites.set(event.toolCallId, event.input.content);
+		}
+
+		const diagnosticsTarget = lspDiagnosticsTarget(event);
+		if (state.phase === "awaiting_approval" && approvalConfirmed && diagnosticsTarget !== undefined) {
+			pendingLspProbes.set(event.toolCallId, diagnosticsTarget);
+		}
+
+		if (state.phase === "awaiting_approval" && !approvalConfirmed && isProposalWrite(event)) {
+			pendingApprovalWrites.add(event.toolCallId);
 		}
 
 		// Track build-evidence artifact writes (build/diff/evidence) for gate readiness.
-		if (event.toolName === "write" && state.phase === "building") {
-			const path = String((event.input as Record<string, unknown>).path ?? "");
-			const kind = artifactKind(path);
+		if (isWriteToolCall(event) && state.phase === "building") {
+			const kind = artifactKind(event.input.path);
 			if (kind) pendingArtifactWrites.set(event.toolCallId, kind);
 		}
 
-		// Approval detection: the first repository-mutating action means the
-		// plan was approved and building has begun. Native plan mode only
-		// releases the model to execute after the approval overlay, so a
-		// build action is a reliable post-approval signal.
+		// A mutation is a build action only after native plan mode actually exits.
 		if (state.phase === "awaiting_approval" && isBuildAction(event)) {
+			if (!approvalConfirmed) {
+				return {
+					block: true,
+					reason: "LeanFlow: the plan is still awaiting native approval; approve it before starting BUILD.",
+				};
+			}
+			if (!state.lspProbeCompleted) {
+				return {
+					block: true,
+					reason:
+						"LeanFlow: before the first build action, write a diagnostics request for a planned source path (or `*`) to xd://lsp and wait for its result. Record an unavailable or no-server result as fallback.",
+				};
+			}
 			transitionPhase(state, "building");
-			state.approvalBoundary = ctx.sessionManager.getBranch().length;
 			state.writtenArtifacts = [];
 			persist();
 			updateStatus(ctx);
@@ -269,6 +363,28 @@ export default function leanflow(pi: ExtensionAPI): void {
 	// -----------------------------------------------------------------------
 
 	pi.on("tool_result", async (event, ctx) => {
+		if (event.toolName === "write" && pendingApprovalWrites.has(event.toolCallId)) {
+			pendingApprovalWrites.delete(event.toolCallId);
+			if (event.isError) return;
+			state.proposalBoundary = ctx.sessionManager.getBranch().length;
+			state.approvalBoundary = undefined;
+			state.lspProbeCompleted = false;
+			state.lspProbeTarget = undefined;
+			persist();
+			updateStatus(ctx);
+			return;
+		}
+
+		if (event.toolName === "write" && pendingLspProbes.has(event.toolCallId)) {
+			const target = pendingLspProbes.get(event.toolCallId)!;
+			pendingLspProbes.delete(event.toolCallId);
+			state.lspProbeCompleted = true;
+			state.lspProbeTarget = target;
+			persist();
+			updateStatus(ctx);
+			return;
+		}
+
 		// Failed plan/artifact writes must not leave stale pending bookkeeping.
 		if (event.toolName === "write" && pendingPlanWrites.has(event.toolCallId)) {
 			const content = pendingPlanWrites.get(event.toolCallId)!;
@@ -279,13 +395,17 @@ export default function leanflow(pi: ExtensionAPI): void {
 			const result = assessHandoff(content);
 			state.handoffStatus = result.status;
 			state.handoffWarnings = result.warnings;
+			state.proposalBoundary = undefined;
+			state.approvalBoundary = undefined;
+			state.lspProbeCompleted = false;
+			state.lspProbeTarget = undefined;
 
 			if (result.status === "NEEDS_UPDATE") {
 				// Critically incomplete — stay in planning, advise revision.
 				transitionPhase(state, "planning");
 				persist();
 				updateStatus(ctx);
-				ctx.ui.notify(formatHandoffNotification(result), "warn");
+				ctx.ui.notify(formatHandoffNotification(result), "warning");
 			} else {
 				// Plan artifact ready — wait for native approval, do NOT build yet.
 				transitionPhase(state, "awaiting_approval");
@@ -322,14 +442,15 @@ export default function leanflow(pi: ExtensionAPI): void {
 	// Context filter: remove planning history from builder context
 	// -----------------------------------------------------------------------
 
-	pi.on("context", async (event) => {
-		const messages = event.messages as Array<Record<string, unknown>>;
+	pi.on("context", async (event, ctx) => {
+		const messages = event.messages;
+		if (state.phase === "awaiting_approval" && !nativeApprovalConfirmed(ctx)) return;
 		const filtered = filterForBuilder(messages, state);
 		if (!filtered) return;
 
 		// Filtering is the deliverable; measurements and their persistence are isolated.
 		recordStats(() => recordContextFilter(state, messages, filtered));
-		return { messages: filtered as typeof event.messages };
+		return { messages: filtered };
 	});
 
 	// -----------------------------------------------------------------------
@@ -351,7 +472,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 			try {
 				ctx.ui.notify(formatStats(state), "info");
 			} catch {
-				ctx.ui.notify("LeanFlow run statistics unavailable for this observation.", "warn");
+				ctx.ui.notify("LeanFlow run statistics unavailable for this observation.", "warning");
 			}
 		},
 	});
@@ -361,12 +482,11 @@ export default function leanflow(pi: ExtensionAPI): void {
 // Build-action detection (approval signal)
 // ---------------------------------------------------------------------------
 
-function isBuildAction(event: { toolName: string; input: Record<string, unknown> }): boolean {
+function isBuildAction(event: ToolCallEvent): boolean {
 	if (Object.hasOwn(BUILD_ACTION_TOOLS, event.toolName)) return true;
-	// A `write` to a non-plan path (build/diff/evidence/source) is a build action.
-	if (event.toolName === "write") {
-		const path = String(event.input.path ?? "");
-		return !path.includes("-plan.md");
+	// Plans and mounted devices do not mutate the repository.
+	if (isWriteToolCall(event)) {
+		return !event.input.path.includes("-plan.md") && !event.input.path.startsWith("xd://");
 	}
 	return false;
 }

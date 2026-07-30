@@ -6,33 +6,30 @@
  * builder preamble. This is the primary token optimization: the builder
  * reads the approved plan artifact instead of carrying planning history.
  *
- * Uses `state.approvalBoundary` (message index captured at propose time)
- * instead of scanning messages each call. Falls back to a scan only when
- * the boundary is not set (e.g. state restored from an older version).
+ * Uses `state.approvalBoundary`, which the lifecycle sets only after a native
+ * plan-mode exit. Message filtering locates the proposal call itself because
+ * branch-entry indexes and model-context indexes are different coordinate spaces.
  */
 
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import type { CustomMessage } from "@oh-my-pi/pi-coding-agent";
 import type { LeanFlowState } from "./state";
 
-interface MessageLike {
-	role?: string;
-	content?: unknown;
-	[key: string]: unknown;
-}
-
 /**
- * Filter context messages for the building phase.
- * Returns undefined to pass through unchanged (non-building phases).
+ * Filter context only after native approval, then preserve that compact Builder
+ * context through building.
  */
 export function filterForBuilder(
-	messages: MessageLike[],
+	messages: AgentMessage[],
 	state: LeanFlowState,
-): MessageLike[] | undefined {
-	if (state.phase !== "building") return undefined;
+): AgentMessage[] | undefined {
+	if (state.phase !== "building" && (state.phase !== "awaiting_approval" || state.approvalBoundary === undefined)) return undefined;
 
-	// Use the stored boundary if available; otherwise fall back to a scan.
-	let boundaryIndex = state.approvalBoundary ?? -1;
-	if (boundaryIndex < 0 || boundaryIndex >= messages.length) {
-		boundaryIndex = findProposeBoundary(messages);
+	// Prefer the proposal call in model context; persisted boundaries are branch
+	// positions and only serve as a compatibility fallback for older sessions.
+	let boundaryIndex = findProposeBoundary(messages);
+	if (boundaryIndex < 0) {
+		boundaryIndex = state.approvalBoundary ?? -1;
 	}
 	if (boundaryIndex < 0) return undefined; // can't find boundary, pass through
 
@@ -40,44 +37,41 @@ export function filterForBuilder(
 	const firstUser = messages.find((m) => m.role === "user");
 	const postBoundary = messages.slice(boundaryIndex + 1);
 
-	const filtered: MessageLike[] = [];
+	const filtered: AgentMessage[] = [];
 	if (firstUser && !postBoundary.includes(firstUser)) {
 		filtered.push(firstUser);
 	}
 
 	// Inject compact builder preamble.
-	filtered.push({
+	const preamble: CustomMessage = {
 		role: "custom",
 		customType: "leanflow-builder-context",
 		content: [{ type: "text", text: buildBuilderPreamble(state) }],
-	});
-
+		display: false,
+		timestamp: Date.now(),
+	};
+	filtered.push(preamble);
 	filtered.push(...postBoundary);
 	return filtered;
 }
 
-/** Fallback: find the xd://propose write in message history. */
-function findProposeBoundary(messages: MessageLike[]): number {
+/** Find the xd://propose write in message history. */
+function findProposeBoundary(messages: AgentMessage[]): number {
 	for (let i = messages.length - 1; i >= 0; i--) {
 		if (isProposeMessage(messages[i])) return i;
 	}
 	return -1;
 }
 
-function isProposeMessage(msg: MessageLike): boolean {
-	const content = msg.content;
-	if (!Array.isArray(content)) return false;
-	for (const block of content) {
-		if (block && typeof block === "object") {
-			const b = block as Record<string, unknown>;
-			if (b.type === "tool_use" && b.name === "write") {
-				const input = b.input as Record<string, unknown> | undefined;
-				const path = String(input?.path ?? "");
-				if (path.includes("xd://propose")) return true;
-			}
-			if (b.type === "text" && typeof b.text === "string") {
-				if (b.text.includes("xd://propose")) return true;
-			}
+function isProposeMessage(message: AgentMessage): boolean {
+	if (!("content" in message) || !Array.isArray(message.content)) return false;
+	for (const block of message.content) {
+		if (block.type === "toolCall" && block.name === "write") {
+			const path = String(block.arguments.path ?? "");
+			if (path.includes("xd://propose")) return true;
+		}
+		if (block.type === "text" && block.text.includes("xd://propose")) {
+			return true;
 		}
 	}
 	return false;
@@ -100,8 +94,8 @@ function buildBuilderPreamble(state: LeanFlowState): string {
 		"",
 		"Read the approved plan, implement it, run verification, and write:",
 		`  local://${slug}-build.md, local://${slug}-diff.md, local://${slug}-evidence.md`,
-		"Use LSP references and diagnostics best-effort before source search. If unavailable or timed out, continue with read/grep, compiler checks, executable tests, and runtime smoke tests.",
-		"LSP diagnostics are auxiliary evidence, never a substitute for executable verification. Record LSP availability/result in build.md and evidence.md; do not inject runtime statistics.",
+		"Before Baseline HEAD or any other build action, run LSP diagnostics for the first planned source path (or `*` when none is planned) and wait for its result. This runtime probe is the authoritative LSP configuration detector for project, user/profile, plugin, marketplace, and auto-detected servers. Record the target, responding server or no server, result, and fallback.",
+		"For each changed source path served by LSP, attempt diagnostics before and after edits; a new file has no pre-edit baseline and is checked after creation. Attempt references before exported-symbol edits. Record every probe/request/result in build.md and evidence.md. Repair all introduced errors and warnings; a completed no-server/error probe is a fallback, never a substitute for compiler checks, executable tests, or runtime smoke validation.",
 		"Then call Gate:",
 		"```text",
 		`task({ agent: "gate", task: "Review plan local://${slug}-plan.md, diff local://${slug}-diff.md,`,

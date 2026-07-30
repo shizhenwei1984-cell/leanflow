@@ -210,15 +210,24 @@ class WorkflowPromptTest(unittest.TestCase):
         self.assertIn("provider token reduction: not measured", stats)
 
     def test_lsp_capability_and_fallback_are_explicit(self) -> None:
-        """TypeScript/JavaScript LSP is configured but remains non-blocking."""
+        """Configured LSP detection is comprehensive, attempted, and non-blocking."""
         config = json.loads((ROOT / ".lsp.json").read_text(encoding="utf-8"))
         typescript = config["servers"]["typescript"]
         self.assertEqual(typescript["command"], "typescript-language-server")
         self.assertEqual(typescript["args"], ["--stdio"])
         self.assertIn(".git", typescript["rootMarkers"])
         self.assertNotIn(".lsp.json", (ROOT / "scripts" / "install_leanflow.py").read_text(encoding="utf-8"))
-        self.assertIn("LSP symbol references", (ROOT / "commands" / "flow.md").read_text(encoding="utf-8"))
-        self.assertIn("LSP verification fallback", (ROOT / "docs" / "leanflow.md").read_text(encoding="utf-8"))
+
+        flow = (ROOT / "commands" / "flow.md").read_text(encoding="utf-8")
+        context = (ROOT / "extensions" / "leanflow" / "context.ts").read_text(encoding="utf-8")
+        docs = (ROOT / "docs" / "leanflow.md").read_text(encoding="utf-8")
+        self.assertIn("runtime probe is the authoritative LSP configuration detector", flow)
+        self.assertIn("Before Baseline HEAD", flow)
+        self.assertIn("A completed probe with `no server`", docs)
+        self.assertIn("Before Baseline HEAD", context)
+        gate = (ROOT / "agents" / "gate.md").read_text(encoding="utf-8")
+        self.assertIn("initial LSP diagnostics probe result", gate)
+        self.assertIn("blocking `validation_failure`", gate)
 
 
 class InstalledDiscoveryTest(unittest.TestCase):

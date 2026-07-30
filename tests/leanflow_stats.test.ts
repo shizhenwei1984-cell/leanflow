@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { filterForBuilder } from "../extensions/leanflow/context";
 import { checkAgentBudget, checkTaskGuard, extractAgentRoles } from "../extensions/leanflow/guard";
 
@@ -32,8 +33,9 @@ test("deterministic UTF-8 context bytes use sorted object keys", () => {
 	expect(state.stats?.removedMessages).toBe(1);
 	expect(state.stats?.messageReductionPercent).toBe(100);
 	expect(state.stats?.beforeBytes).toBe(serializedByteLength(first));
-	expect(state.stats?.removedBytes).toBe(state.stats?.beforeBytes);
-	expect(state.stats?.byteReductionPercent).toBe(100);
+	expect(state.stats?.afterBytes).toBe(serializedByteLength([]));
+	expect(state.stats?.removedBytes).toBe(state.stats?.beforeBytes! - state.stats?.afterBytes!);
+	expect(state.stats?.byteReductionPercent).toBe(((state.stats?.beforeBytes! - state.stats?.afterBytes!) / state.stats?.beforeBytes!) * 100);
 });
 
 test("deterministic serialization preserves sparse-array JSON semantics", () => {
@@ -107,6 +109,7 @@ test("restore normalizes an older persisted state without new metric fields", ()
 
 	expect(restored.phase).toBe("building");
 	expect(restored.phaseStartedAt).toBeUndefined();
+	expect(restored.lspProbeCompleted).toBe(false);
 	expect(restored.stats?.planning.responses).toBe(0);
 	expect(restored.stats?.awaitingApproval.elapsedMs).toBe(0);
 	expect(restored.stats?.beforeMessages).toBe(4);
@@ -119,9 +122,12 @@ test("restored phases restart timing observation without charging inactive time"
 	const original = defaultState();
 	original.phase = "building";
 	original.phaseStartedAt = 100;
+	original.lspProbeCompleted = true;
+	original.lspProbeTarget = "*";
 	const restored = restoreState([{ type: "custom", customType: CUSTOM_TYPE, data: original }]);
 
 	resumePhaseTiming(restored, 1_000_000);
+	expect(restored).toMatchObject({ lspProbeCompleted: true, lspProbeTarget: "*" });
 	transitionPhase(restored, "idle", 1_000_010);
 	expect(restored.stats?.building.elapsedMs).toBe(10);
 });
@@ -163,16 +169,10 @@ test("filtering survives an unavailable byte observation and preserves builder e
 	state.phase = "building";
 	state.planSlug = "metrics";
 	state.approvalBoundary = 1;
-	const firstUser = { role: "user", content: "implement metrics" };
-	const approval = { role: "assistant", content: BigInt(1) };
-	const filtered = filterForBuilder(
-		[
-			firstUser,
-			{ role: "assistant", content: "planning history" },
-			approval,
-		],
-		state,
-	);
+	const firstUser: AgentMessage = { role: "user", content: "implement metrics", timestamp: 1 };
+	const planningHistory: AgentMessage = { role: "user", content: "planning history", timestamp: 2 };
+	const approval: AgentMessage = { role: "user", content: "approved", timestamp: 3 };
+	const filtered = filterForBuilder([firstUser, planningHistory, approval], state);
 
 	expect(filtered?.[0]).toBe(firstUser);
 	expect(filtered?.[1]).toMatchObject({ customType: "leanflow-builder-context" });
@@ -180,6 +180,33 @@ test("filtering survives an unavailable byte observation and preserves builder e
 	expect(() => recordContextFilter(state, [{ content: BigInt(1) }], filtered ?? [])).not.toThrow();
 	expect(state.stats?.beforeBytes).toBeUndefined();
 	expect(formatStats(state)).toContain("Byte-count reduction: unavailable");
+});
+
+test("filtering starts at approval so Builder protocol precedes the first mutation", () => {
+	const state = defaultState();
+	state.phase = "awaiting_approval";
+	state.approvalBoundary = 1;
+	state.planSlug = "fallback";
+	const firstUser: AgentMessage = { role: "user", content: "implement fallback", timestamp: 1 };
+	// The filter reads only role/content; transport fields are irrelevant to this context fixture.
+	const approval = {
+		role: "assistant",
+		content: [
+			{
+				type: "toolCall",
+				id: "propose",
+				name: "write",
+				arguments: { path: "xd://propose", content: "fallback" },
+			},
+		],
+	} as unknown as AgentMessage;
+	const postApproval: AgentMessage = { role: "user", content: "approved", timestamp: 2 };
+
+	const filtered = filterForBuilder([firstUser, approval, postApproval], state);
+
+	expect(filtered).toHaveLength(3);
+	expect(filtered?.[0]).toBe(firstUser);
+	expect(filtered?.[2]).toBe(postApproval);
 });
 
 test("guard denies empty phases and atomically preflights actual requested role counts", () => {

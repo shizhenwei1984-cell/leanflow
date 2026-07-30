@@ -65,13 +65,15 @@ task({
 After approval, native plan mode exits and the same Main Session becomes Builder (`@default`). Main is the only writer.
 
 1. Re-read the approved canonical plan.
-2. Record Baseline HEAD and baseline status in `local://<slug>-build.md` before edits. Preserve existing user work.
-3. Implement the approved plan; do not create an implementer, developer, coder, or builder subagent.
-4. Use LSP symbol references and diagnostics best-effort before source search. If LSP is unavailable or times out, continue with `read`/`grep`, compiler checks, executable tests, and a runtime smoke test; LSP diagnostics never replace executable validation.
-5. If LSP is used, record its availability and result in `build.md` and `evidence.md`; never inject LSP details or runtime statistics into the Builder context.
-6. Run every planned validation command. Record command, exit code, complete output reference, and result in `build.md`.
-7. Write the complete final diff to `local://<slug>-diff.md`; record final status, changed paths, and final HEAD in `build.md`.
-8. Collect runtime evidence for Gate. Write `local://<slug>-evidence.md` with one `## <command>` heading per command. At minimum include:
+2. Before Baseline HEAD or any other build action, run `lsp` diagnostics for the first planned source path (or `*` when no source path is planned) and wait for its result. This runtime probe is the authoritative LSP configuration detector: it resolves active project, user/profile, plugin, marketplace, and auto-detected configuration. Record its target, responding server or `no server`, result, and fallback.
+3. Record Baseline HEAD and baseline status in `local://<slug>-build.md` before edits. Preserve existing user work.
+4. Implement the approved plan; do not create an implementer, developer, coder, or builder subagent.
+5. For every changed source path served by the probe or a later LSP call, attempt diagnostics before and after editing. For a new file, record that no pre-edit baseline exists and run diagnostics after creation. Before modifying an exported symbol, attempt LSP references. Treat diagnostics as a decision signal: repair all introduced errors and warnings; record unrelated pre-existing diagnostics exactly.
+6. Record the initial probe and every later configuration/server, target path, diagnostics/references request, and result in both `build.md` and `evidence.md`. If a server is unavailable, times out, fails to initialize, or has no matching file type, record the exact outcome and fallback used.
+7. A completed LSP probe with `no server` or an error is a recorded fallback, not a flow blocker. LSP diagnostics never replace the required `read`/`grep`, compiler checks, executable tests, and runtime smoke test; do not inject runtime statistics into the Builder context.
+8. Run every planned validation command. Record command, exit code, complete output reference, and result in `build.md`.
+9. Write the complete final diff to `local://<slug>-diff.md`; record final status, changed paths, and final HEAD in `build.md`.
+10. Collect runtime evidence for Gate. Write `local://<slug>-evidence.md` with one `## <command>` heading per command. At minimum include:
    - Every command from the plan's Verification section, with full output
    - `git diff <base> -- <changed-paths>` for each changed file
    - `git status --short` final state

@@ -11,7 +11,7 @@
  * Transitions:
  *   /flow command         → planning
  *   write *-plan.md       → awaiting_approval (plan exists, not yet approved)
- *   first edit/bash/write(non-plan) after propose → building (approval implied)
+ *   native mode exit + completed LSP diagnostics + first repository mutation → building
  *   task(gate)            → gating
  *   Gate PASS / 2nd FAIL  → idle
  *   Gate 1st FAIL         → building (repair)
@@ -80,8 +80,14 @@ export interface LeanFlowState {
 	startedAt?: number;
 	handoffStatus?: HandoffStatus;
 	handoffWarnings?: string[];
-	/** Message index of the approval boundary (xd://propose write), for context filter. */
+	/** Branch length immediately after the latest successful xd://propose dispatch. */
+	proposalBoundary?: number;
+	/** Proposal boundary confirmed by a later native plan-mode exit, for context filtering. */
 	approvalBoundary?: number;
+	/** A completed diagnostics probe is required before the first build action. */
+	lspProbeCompleted: boolean;
+	/** Path (or `*`) passed to the completed diagnostics probe. */
+	lspProbeTarget?: string;
 	/** Build evidence artifacts written this round: build / diff / evidence. */
 	writtenArtifacts?: string[];
 	/** Runtime token/context statistics for the current run. */
@@ -111,7 +117,7 @@ export function defaultStats(): LeanFlowStats {
 }
 
 export function defaultState(): LeanFlowState {
-	return { phase: "idle", scoutCalls: 0, gateCalls: 0, gateAttempt: 0, stats: defaultStats() };
+	return { phase: "idle", scoutCalls: 0, gateCalls: 0, gateAttempt: 0, lspProbeCompleted: false, stats: defaultStats() };
 }
 
 interface BranchEntry {
@@ -143,7 +149,10 @@ function normalizeState(value: LeanFlowState | undefined): LeanFlowState {
 		startedAt: optionalNumber(state.startedAt),
 		handoffStatus: isHandoffStatus(state.handoffStatus) ? state.handoffStatus : undefined,
 		handoffWarnings: Array.isArray(state.handoffWarnings) ? state.handoffWarnings.filter((v) => typeof v === "string") : undefined,
+		proposalBoundary: optionalNumber(state.proposalBoundary),
 		approvalBoundary: optionalNumber(state.approvalBoundary),
+		lspProbeCompleted: state.lspProbeCompleted === true,
+		lspProbeTarget: typeof state.lspProbeTarget === "string" ? state.lspProbeTarget : undefined,
 		writtenArtifacts: Array.isArray(state.writtenArtifacts) ? state.writtenArtifacts.filter((v) => typeof v === "string") : undefined,
 		stats: normalizeStats(state.stats),
 	};

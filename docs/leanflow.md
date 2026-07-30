@@ -64,7 +64,9 @@ Each `planning`, `awaiting_approval`, `building`, and `gating` bucket contains M
 
 ## LSP verification fallback
 
-Builder first uses LSP symbol references and diagnostics best-effort. An unavailable server or timeout does not block LeanFlow: continue with `read`/`grep`, compiler checks, executable tests, and runtime smoke tests. LSP diagnostics are supplementary rather than executable validation. If used, record LSP availability and results in `build.md` and `evidence.md`; do not add them to `/flowstats` or Builder context statistics. The repository `.lsp.json` declares Python and TypeScript/JavaScript capabilities but does not install language-server binaries.
+Before Baseline HEAD or any other build action, Builder runs LSP diagnostics for the first planned source path (or `*` when none is planned) and waits for its result. This runtime probe is the authoritative LSP configuration detector: it resolves active project, user/profile, plugin, marketplace, and auto-detected configuration. Record the target, responding server or `no server`, result, and fallback. A completed probe with `no server` or an error is a recorded fallback, not a flow blocker.
+
+For every changed source path served by the probe or a later LSP call, Builder attempts diagnostics before and after edits. A new file has no pre-edit baseline and is checked after creation. Builder attempts references before changing an exported symbol. Record every probe/request/result in `build.md` and `evidence.md`. LSP diagnostics are supplementary rather than executable validation; all introduced errors and warnings must be repaired, while unrelated pre-existing diagnostics are recorded exactly. Builder continues with `read`/`grep`, compiler checks, executable tests, and runtime smoke tests. LSP facts never enter `/flowstats` or Builder context statistics. The repository `.lsp.json` declares Python and TypeScript/JavaScript capabilities but does not install language-server binaries.
 
 ## Budgets
 
