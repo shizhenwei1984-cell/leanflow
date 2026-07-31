@@ -67,9 +67,9 @@ class WorkflowPromptTest(unittest.TestCase):
         index = (ROOT / "extensions" / "leanflow" / "index.ts").read_text(encoding="utf-8")
         # Plan write transitions through the single phase helper to awaiting approval.
         self.assertIn('transitionPhase(state, "awaiting_approval")', index)
-        # Building begins only on a post-approval build action.
-        self.assertIn("isBuildAction", index)
-        self.assertIn("BUILD_ACTION_TOOLS", index)
+        # Building begins only after exact native approval is confirmed.
+        self.assertIn("nativeApprovalConfirmed", index)
+        self.assertIn('transitionPhase(state, "building")', index)
 
     def test_planner_prompt_has_no_gate_schema(self) -> None:
         """Issue 6: the Planner-only prompt must not leak the Gate JSON schema."""
@@ -128,11 +128,14 @@ class WorkflowPromptTest(unittest.TestCase):
     def test_lsp_is_not_a_build_action(self) -> None:
         """P2: LSP reads must not trigger the building phase."""
         index = (ROOT / "extensions" / "leanflow" / "index.ts").read_text(encoding="utf-8")
-        actions = index[index.index("const BUILD_ACTION_TOOLS") : index.index("export default function")]
-        self.assertIn("edit: true", actions)
+        actions = index[
+            index.index("const REPOSITORY_MUTATION_TOOLS") :
+            index.index("type WriteToolInput")
+        ]
         self.assertIn("bash: true", actions)
         self.assertIn("ast_edit: true", actions)
         self.assertNotIn("lsp:", actions)
+        self.assertIn("isRepositoryMutation", index)
 
     def test_planner_prompt_has_no_gate_reference(self) -> None:
         """P2: the Planner prompt excludes Gate calls while retaining LSP guidance."""

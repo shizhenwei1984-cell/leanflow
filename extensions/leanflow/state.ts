@@ -106,6 +106,8 @@ export interface LeanFlowState {
 	approvalRepairBoundary?: number;
 	/** Durable marker copied with local:// artifacts into an approved fresh session. */
 	runMarkerArtifact?: string;
+	/** Terminal truth, independent of marker persistence success. */
+	terminalOutcome?: "pass" | "fail_after_retry" | "gate_operational_failure";
 	/** Latest durable lifecycle status written to the run marker. */
 	runMarkerStatus?: RunMarkerStatus;
 	/** Whether a valid diagnostics probe is required, pending, or completed. */
@@ -196,6 +198,12 @@ function normalizeState(value: LeanFlowState | undefined): LeanFlowState {
 		approvalRepairBoundary: optionalNumber(state.approvalRepairBoundary),
 		lspProbeTarget: typeof state.lspProbeTarget === "string" ? state.lspProbeTarget : undefined,
 		writtenArtifacts: Array.isArray(state.writtenArtifacts) ? state.writtenArtifacts.filter((v) => typeof v === "string") : undefined,
+		terminalOutcome:
+			state.terminalOutcome === "pass" ||
+			state.terminalOutcome === "fail_after_retry" ||
+			state.terminalOutcome === "gate_operational_failure"
+				? state.terminalOutcome
+				: undefined,
 		stats: normalizeStats(state.stats),
 	};
 }

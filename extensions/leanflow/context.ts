@@ -87,9 +87,11 @@ function buildBuilderPreamble(state: LeanFlowState): string {
 		return [
 			"LeanFlow terminal response:",
 			"",
-			state.runMarkerStatus === "completed"
+			state.terminalOutcome === "pass"
 				? "Gate passed."
-				: "Gate did not pass within the bounded retry budget.",
+				: state.terminalOutcome === "gate_operational_failure"
+					? "Gate did not complete within the bounded retry budget."
+					: "Gate returned FAIL after the bounded repair retry.",
 			"",
 			"Do not call tools, modify files, or invoke Gate again.",
 			"Briefly report the terminal outcome and relevant findings to the user, then stop.",

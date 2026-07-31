@@ -39,6 +39,7 @@ type PersistedState = {
 		repairRounds: number;
 		repairSuccesses: number;
 	};
+	terminalOutcome?: "pass" | "fail_after_retry" | "gate_operational_failure";
 	writtenArtifacts?: string[];
 };
 
@@ -94,6 +95,61 @@ function runMarkerPath(harness: Harness): string {
 		"local",
 		`example-${harness.states.at(-1)!.runId}-leanflow-run.json`,
 	);
+}
+
+function writeFreshArtifacts(
+	harness: Harness,
+	options: { planContent: string; markerOverrides?: Record<string, unknown>; pointer?: boolean },
+): { markerPath: string; pointerPath: string; runId: string } {
+	const runId = "4f414c4c-8f8f-4dca-8df3-9e0fabada555";
+	const markerArtifact = `local://example-${runId}-leanflow-run.json`;
+	const markerPath = resolveRunMarkerPath(harness.ctx.localProtocolOptions, markerArtifact)!;
+	const pointerPath = resolveRunMarkerPath(harness.ctx.localProtocolOptions, "local://example-leanflow-active.json")!;
+	const planPath = resolveRunMarkerPath(harness.ctx.localProtocolOptions, "local://example-plan.md")!;
+	mkdirSync(dirname(planPath), { recursive: true });
+	writeFileSync(planPath, options.planContent);
+	const marker = {
+		version: 2,
+		runId,
+		planSlug: "example",
+		planArtifact: "local://example-plan.md",
+		planDigest: createHash("sha256").update(options.planContent).digest("hex"),
+		status: "awaiting_approval",
+		updatedAt: Date.now(),
+		phaseStartedAt: Date.now() - 500,
+		scoutCalls: 0,
+		startedAt: Date.now() - 1_000,
+		stats: {
+			planning: { input: 0, output: 0, cacheRead: 0, responses: 0, elapsedMs: 0 },
+			awaitingApproval: { input: 0, output: 0, cacheRead: 0, responses: 0, elapsedMs: 0 },
+			building: { input: 0, output: 0, cacheRead: 0, responses: 0, elapsedMs: 0 },
+			gating: { input: 0, output: 0, cacheRead: 0, responses: 0, elapsedMs: 0 },
+			gatePasses: 0,
+			gateVerdictFailures: 0,
+			gateErrors: 0,
+			gateReadinessBlocks: 0,
+			repairRounds: 0,
+			repairSuccesses: 0,
+			terminalFailures: 0,
+		},
+		lspProbeStatus: "pending",
+		...options.markerOverrides,
+	};
+	writeFileSync(markerPath, JSON.stringify(marker));
+	if (options.pointer !== false) {
+		writeFileSync(
+			pointerPath,
+			JSON.stringify({
+				version: 1,
+				runId,
+				markerArtifact,
+				planArtifact: "local://example-plan.md",
+				status: "awaiting_approval",
+				updatedAt: Date.now(),
+			}),
+		);
+	}
+	return { markerPath, pointerPath, runId };
 }
 
 async function writeInitialPlan(
@@ -389,13 +445,13 @@ test("fresh approval session recovers the native plan identity before enforcing 
 		join(ordinary.ctx.localProtocolOptions.getArtifactsDir(), "local", `example-${mismatched.runId}-leanflow-run.json`),
 		JSON.stringify(mismatched),
 	);
-	const staleSameSlug = { ...mismatched, planArtifact: "local://example-plan.md" };
+	expect(await ordinaryContext({ messages: approvalMessages }, ordinary.ctx)).toBeUndefined();
+	expect(ordinary.states).toHaveLength(0);
+	const staleSameSlug = { ...mismatched, planArtifact: "local://example-plan.md", status: "completed" };
 	writeFileSync(
 		join(ordinary.ctx.localProtocolOptions.getArtifactsDir(), "local", `example-${staleSameSlug.runId}-leanflow-run.json`),
 		JSON.stringify(staleSameSlug),
 	);
-	expect(await ordinaryContext({ messages: approvalMessages }, ordinary.ctx)).toBeUndefined();
-	expect(ordinary.states).toHaveLength(0);
 	expect(await ordinaryContext({ messages: approvalMessages }, ordinary.ctx)).toBeUndefined();
 	expect(ordinary.states).toHaveLength(0);
 
@@ -443,6 +499,17 @@ test("fresh approval session recovers the native plan identity before enforcing 
 		finalPlanContent,
 	);
 	writeFileSync(markerPath, JSON.stringify(marker));
+	writeFileSync(
+		join(harness.ctx.localProtocolOptions.getArtifactsDir(), "local", "example-leanflow-active.json"),
+		JSON.stringify({
+			version: 1,
+			runId: marker.runId,
+			markerArtifact: `local://example-${marker.runId}-leanflow-run.json`,
+			planArtifact: "local://example-plan.md",
+			status: "awaiting_approval",
+			updatedAt: Date.now(),
+		}),
+	);
 
 	expect(await context({ messages: approvalMessages }, harness.ctx)).toMatchObject({
 		messages: [{ role: "user" }, { customType: "leanflow-builder-context" }],
@@ -572,6 +639,36 @@ test("duplicate and fenced LSP declarations fail safe as required", async () => 
 	);
 	expect(fenced.states.at(-1)!.lspProbeStatus).toBe("pending");
 	expect(fenced.states.at(-1)!.handoffWarnings?.join("\n")).toContain("found 0");
+
+	const backtickFence = createHarness();
+	await writeInitialPlan(
+		backtickFence,
+		[
+			"Change source and run focused tests.",
+			"```md",
+			"~~~",
+			"LSP applicability: not_required",
+			"~~~",
+			"```",
+			"LSP applicability: required",
+		].join("\n"),
+	);
+	expect(backtickFence.states.at(-1)!.handoffWarnings?.join("\n") ?? "").not.toContain("exactly one");
+
+	const tildeFence = createHarness();
+	await writeInitialPlan(
+		tildeFence,
+		[
+			"Change source and run focused tests.",
+			"~~~md",
+			"```",
+			"LSP applicability: not_required",
+			"```",
+			"~~~",
+			"LSP applicability: required",
+		].join("\n"),
+	);
+	expect(tildeFence.states.at(-1)!.handoffWarnings?.join("\n") ?? "").not.toContain("exactly one");
 });
 
 test("NEEDS_UPDATE invalidates the prior active marker", async () => {
@@ -708,6 +805,24 @@ test("Gate PASS completes marker and preserves filtering through final agent end
 		harness.ctx,
 	);
 	expect(harness.states.at(-1)!.phase).toBe("finalizing");
+	for (const event of [
+		{ toolName: "read", toolCallId: "final-read", input: { path: "README.md" } },
+		{ toolName: "grep", toolCallId: "final-grep", input: { pattern: "x" } },
+		{ toolName: "write", toolCallId: "final-lsp", input: { path: "xd://lsp", content: "{}" } },
+		{ toolName: "web_search", toolCallId: "final-web", input: { query: "x" } },
+		{ toolName: "task", toolCallId: "final-task", input: { agent: "gate", task: "again" } },
+		{ toolName: "edit", toolCallId: "final-edit", input: { path: "README.md" } },
+		{
+			toolName: "write",
+			toolCallId: "final-plan-named-write",
+			input: { path: "docs/release-plan.md", content: "x" },
+		},
+	]) {
+		expect(await call(event, harness.ctx)).toMatchObject({
+			block: true,
+			reason: expect.stringContaining("no tools"),
+		});
+	}
 	const marker = JSON.parse(readFileSync(runMarkerPath(harness), "utf8"));
 	expect(marker.status).toBe("completed");
 	const finalContext = await harness.handlers.get("context")!({ messages: approvalMessages }, harness.ctx);
@@ -720,12 +835,54 @@ test("Gate PASS completes marker and preserves filtering through final agent end
 	expect(finalPrompt).toContain("Do not call tools");
 	expect(await call({ toolName: "edit", toolCallId: "late-edit", input: { path: "README.md" } }, harness.ctx)).toMatchObject({
 		block: true,
-		reason: expect.stringContaining("finalizing"),
+		reason: expect.stringContaining("no tools"),
 	});
 	await harness.handlers.get("agent_end")!({ willContinue: true }, harness.ctx);
 	expect(harness.states.at(-1)!.phase).toBe("finalizing");
 	await harness.handlers.get("agent_end")!({}, harness.ctx);
 	expect(harness.states.at(-1)!.phase).toBe("idle");
+});
+
+test("terminal PASS remains authoritative when marker persistence fails", async () => {
+	const harness = createHarness();
+	await writeInitialPlan(harness, "Update docs only.\nLSP applicability: not_required");
+	const call = harness.handlers.get("tool_call")!;
+	const result = harness.handlers.get("tool_result")!;
+	await call(
+		{ toolName: "write", toolCallId: "propose-marker-failure", input: { path: "xd://propose", content: "example" } },
+		harness.ctx,
+	);
+	await result({ toolName: "write", toolCallId: "propose-marker-failure", isError: false }, harness.ctx);
+	harness.branch.push({ type: "mode_change", mode: "none" });
+	await harness.handlers.get("context")!({ messages: approvalMessages }, harness.ctx);
+	for (const kind of ["build", "diff", "evidence"]) {
+		await call(
+			{
+				toolName: "write",
+				toolCallId: `marker-failure-${kind}`,
+				input: { path: `local://example-${kind}.md`, content: kind },
+			},
+			harness.ctx,
+		);
+		await result({ toolName: "write", toolCallId: `marker-failure-${kind}`, isError: false }, harness.ctx);
+	}
+	await call(
+		{ toolName: "task", toolCallId: "gate-marker-failure", input: { agent: "gate", task: "review" } },
+		harness.ctx,
+	);
+	harness.ctx.localProtocolOptions = { getArtifactsDir: () => "/dev/null" };
+	await result(
+		{
+			toolName: "task",
+			toolCallId: "gate-marker-failure",
+			isError: false,
+			content: [{ type: "text", text: JSON.stringify({ verdict: "PASS", findings: [] }) }],
+		},
+		harness.ctx,
+	);
+	expect(harness.states.at(-1)).toMatchObject({ phase: "finalizing", terminalOutcome: "pass" });
+	const finalContext = await harness.handlers.get("context")!({ messages: approvalMessages }, harness.ctx);
+	expect(JSON.stringify(finalContext)).toContain("Gate passed");
 });
 
 test("second Gate FAIL marks the run failed before final response", async () => {
@@ -897,7 +1054,7 @@ test("native approval rereads overlay-modified plan content before BUILD", async
 	expect(await invalid.handlers.get("context")!({ messages: approvalMessages }, invalid.ctx)).toBeUndefined();
 	expect(
 		await invalidCall({ toolName: "edit", toolCallId: "invalid-overlay-build", input: { path: "src/example.ts" } }, invalid.ctx),
-	).toMatchObject({ block: true, reason: expect.stringContaining("became invalid") });
+	).toMatchObject({ block: true, reason: expect.stringContaining("before native plan approval") });
 	expect(invalid.states.at(-1)).toMatchObject({ phase: "planning", approvalInvalidated: true });
 	expect(invalid.editorTexts.at(-1)).toContain("/plan Repair the existing LeanFlow plan");
 	const repairedContent = [
@@ -938,4 +1095,154 @@ test("native approval rereads overlay-modified plan content before BUILD", async
 		proposedPlanArtifact: "local://example-plan.md",
 		approvalRepairBoundary: undefined,
 	});
+});
+
+test("repository mutation guards distinguish canonical and plan-named working-tree paths", async () => {
+	const planning = createHarness();
+	await planning.commands.get("flow")!.handler("example", planning.ctx);
+	const call = planning.handlers.get("tool_call")!;
+	for (const event of [
+		{ toolName: "edit", toolCallId: "planning-edit", input: { path: "src/example.ts" } },
+		{ toolName: "ast_edit", toolCallId: "planning-ast", input: {} },
+		{ toolName: "bash", toolCallId: "planning-bash", input: { command: "touch changed" } },
+		{ toolName: "write", toolCallId: "planning-named-plan", input: { path: "docs/release-plan.md", content: "x" } },
+	]) {
+		expect(await call(event, planning.ctx)).toMatchObject({
+			block: true,
+			reason: expect.stringContaining("before native plan approval"),
+		});
+	}
+	expect(
+		await call(
+			{
+				toolName: "write",
+				toolCallId: "planning-canonical",
+				input: { path: "local://example-plan.md", content: "plan" },
+			},
+			planning.ctx,
+		),
+	).toBeUndefined();
+	planning.branch.push({ type: "mode_change", mode: "none" });
+	expect(
+		await call({ toolName: "edit", toolCallId: "manual-exit-edit", input: { path: "src/example.ts" } }, planning.ctx),
+	).toMatchObject({ block: true, reason: expect.stringContaining("before native plan approval") });
+
+	const awaiting = createHarness();
+	await writeInitialPlan(awaiting);
+	expect(
+		await awaiting.handlers.get("tool_call")!(
+			{
+				toolName: "write",
+				toolCallId: "awaiting-named-plan",
+				input: { path: "docs/release-plan.md", content: "x" },
+			},
+			awaiting.ctx,
+		),
+	).toMatchObject({ block: true, reason: expect.stringContaining("awaiting exact native approval") });
+
+	const building = createHarness();
+	await writeInitialPlan(building, "Update documentation only and verify text.\nLSP applicability: not_required");
+	const buildingCall = building.handlers.get("tool_call")!;
+	const buildingResult = building.handlers.get("tool_result")!;
+	await buildingCall(
+		{ toolName: "write", toolCallId: "build-propose", input: { path: "xd://propose", content: "example" } },
+		building.ctx,
+	);
+	await buildingResult({ toolName: "write", toolCallId: "build-propose", isError: false }, building.ctx);
+	building.branch.push({ type: "mode_change", mode: "none" });
+	await building.handlers.get("context")!({ messages: approvalMessages }, building.ctx);
+	expect(
+		await buildingCall(
+			{
+				toolName: "write",
+				toolCallId: "building-named-plan",
+				input: { path: "docs/release-plan.md", content: "x" },
+			},
+			building.ctx,
+		),
+	).toBeUndefined();
+});
+
+test("proposal waits for canonical plan mutation result", async () => {
+	const harness = createHarness();
+	await writeInitialPlan(harness);
+	const call = harness.handlers.get("tool_call")!;
+	expect(
+		await call(
+			{ toolName: "edit", toolCallId: "unsettled-plan-edit", input: { path: "local://example-plan.md" } },
+			harness.ctx,
+		),
+	).toBeUndefined();
+	expect(
+		await call(
+			{ toolName: "write", toolCallId: "racing-proposal", input: { path: "xd://propose", content: "example" } },
+			harness.ctx,
+		),
+	).toMatchObject({ block: true, reason: expect.stringContaining("mutation to finish") });
+});
+
+test("fresh recovery locks invalid, expired, corrupt, and ambiguous identities", async () => {
+	const validPlan = (runId: string) =>
+		[
+			"Update src/example.ts and run focused tests.",
+			`LeanFlow run ID: ${runId}`,
+			"LSP applicability: required",
+		].join("\n");
+	const cases: Array<{
+		name: string;
+		plan: (runId: string) => string;
+		markerOverrides?: Record<string, unknown>;
+		corruptMarker?: boolean;
+	}> = [
+		{ name: "removed run ID", plan: () => "Update src/example.ts.\nLSP applicability: required" },
+		{
+			name: "changed run ID",
+			plan: () =>
+				"Update src/example.ts.\nLeanFlow run ID: 2d3ef6f7-f14c-4898-a658-65577ef446af\nLSP applicability: required",
+		},
+		{ name: "duplicate run ID", plan: (runId) => `${validPlan(runId)}\nLeanFlow run ID: ${runId}` },
+		{
+			name: "expired marker",
+			plan: validPlan,
+			markerOverrides: { updatedAt: Date.now() - 25 * 60 * 60 * 1_000 },
+		},
+		{ name: "corrupt marker", plan: validPlan, corruptMarker: true },
+		{
+			name: "pointer marker run mismatch",
+			plan: validPlan,
+			markerOverrides: { runId: "2d3ef6f7-f14c-4898-a658-65577ef446af" },
+		},
+	];
+	for (const scenario of cases) {
+		const harness = createHarness();
+		const runId = "4f414c4c-8f8f-4dca-8df3-9e0fabada555";
+		const artifacts = writeFreshArtifacts(harness, {
+			planContent: scenario.plan(runId),
+			markerOverrides: scenario.markerOverrides,
+		});
+		if (scenario.corruptMarker) writeFileSync(artifacts.markerPath, "{");
+		expect(await harness.handlers.get("context")!({ messages: approvalMessages }, harness.ctx), scenario.name).toBeUndefined();
+		expect(harness.states.at(-1), scenario.name).toMatchObject({
+			phase: "planning",
+			approvalInvalidated: true,
+		});
+	}
+
+	const ambiguous = createHarness();
+	const first = writeFreshArtifacts(ambiguous, {
+		planContent: validPlan("4f414c4c-8f8f-4dca-8df3-9e0fabada555"),
+		pointer: false,
+	});
+	const secondRunId = "2d3ef6f7-f14c-4898-a658-65577ef446af";
+	const secondMarker = JSON.parse(readFileSync(first.markerPath, "utf8"));
+	secondMarker.runId = secondRunId;
+	writeFileSync(
+		resolveRunMarkerPath(
+			ambiguous.ctx.localProtocolOptions,
+			`local://example-${secondRunId}-leanflow-run.json`,
+		)!,
+		JSON.stringify(secondMarker),
+	);
+	expect(await ambiguous.handlers.get("context")!({ messages: approvalMessages }, ambiguous.ctx)).toBeUndefined();
+	expect(ambiguous.states.at(-1)).toMatchObject({ phase: "planning", approvalInvalidated: true });
 });
