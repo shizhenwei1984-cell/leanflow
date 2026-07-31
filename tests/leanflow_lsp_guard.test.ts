@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { expect, test } from "bun:test";
@@ -40,6 +40,7 @@ type PersistedState = {
 		repairSuccesses: number;
 	};
 	terminalOutcome?: "pass" | "fail_after_retry" | "gate_operational_failure";
+	persistenceDegraded?: boolean;
 	writtenArtifacts?: string[];
 };
 
@@ -90,11 +91,10 @@ function createHarness(): Harness {
 }
 
 function runMarkerPath(harness: Harness): string {
-	return join(
-		harness.ctx.localProtocolOptions.getArtifactsDir(),
-		"local",
-		`example-${harness.states.at(-1)!.runId}-leanflow-run.json`,
-	);
+	return resolveRunMarkerPath(
+		harness.ctx.localProtocolOptions,
+		harness.states.at(-1)!.runMarkerArtifact!,
+	)!;
 }
 
 function writeFreshArtifacts(
@@ -102,9 +102,9 @@ function writeFreshArtifacts(
 	options: { planContent: string; markerOverrides?: Record<string, unknown>; pointer?: boolean },
 ): { markerPath: string; pointerPath: string; runId: string } {
 	const runId = "4f414c4c-8f8f-4dca-8df3-9e0fabada555";
-	const markerArtifact = `local://example-${runId}-leanflow-run.json`;
+	const markerArtifact = `local://.leanflow/runs/${runId}.json`;
 	const markerPath = resolveRunMarkerPath(harness.ctx.localProtocolOptions, markerArtifact)!;
-	const pointerPath = resolveRunMarkerPath(harness.ctx.localProtocolOptions, "local://example-leanflow-active.json")!;
+	const pointerPath = resolveRunMarkerPath(harness.ctx.localProtocolOptions, "local://.leanflow/active/example.json")!;
 	const planPath = resolveRunMarkerPath(harness.ctx.localProtocolOptions, "local://example-plan.md")!;
 	mkdirSync(dirname(planPath), { recursive: true });
 	writeFileSync(planPath, options.planContent);
@@ -135,6 +135,8 @@ function writeFreshArtifacts(
 		lspProbeStatus: "pending",
 		...options.markerOverrides,
 	};
+	mkdirSync(dirname(markerPath), { recursive: true });
+	mkdirSync(dirname(pointerPath), { recursive: true });
 	writeFileSync(markerPath, JSON.stringify(marker));
 	if (options.pointer !== false) {
 		writeFileSync(
@@ -220,7 +222,7 @@ test("proposal is fail-closed until the canonical plan is valid and marked", asy
 		{ toolName: "write", toolCallId: "planning-proposal", input: { path: "xd://propose", content: "example" } },
 		planning.ctx,
 	);
-	expect(planningProposal).toMatchObject({ block: true, reason: expect.stringContaining("only allowed") });
+	expect(planningProposal).toMatchObject({ block: true, reason: expect.stringContaining("explicitly read-only") });
 
 	const needsUpdate = createHarness();
 	await needsUpdate.commands.get("flow")!.handler("example", needsUpdate.ctx);
@@ -246,7 +248,7 @@ test("proposal is fail-closed until the canonical plan is valid and marked", asy
 			{ toolName: "write", toolCallId: "invalid-proposal", input: { path: "xd://propose", content: "example" } },
 			needsUpdate.ctx,
 		),
-	).toMatchObject({ block: true, reason: expect.stringContaining("only allowed") });
+	).toMatchObject({ block: true, reason: expect.stringContaining("explicitly read-only") });
 
 	const missingMarker = createHarness();
 	await writeInitialPlan(missingMarker);
@@ -330,7 +332,7 @@ test("native approval requires a real write-device diagnostics result before the
 		{ toolName: "edit", toolCallId: "edit-before-approval", input: {} },
 		harness.ctx,
 	);
-	expect(beforeApproval).toMatchObject({ block: true, reason: expect.stringContaining("native approval") });
+	expect(beforeApproval).toMatchObject({ block: true, reason: expect.stringContaining("native plan approval") });
 	expect(harness.states.at(-1)!.phase).toBe("awaiting_approval");
 
 	harness.branch.push({ type: "mode_change", mode: "none" });
@@ -338,7 +340,7 @@ test("native approval requires a real write-device diagnostics result before the
 		{ toolName: "edit", toolCallId: "edit-after-mode-exit", input: {} },
 		harness.ctx,
 	);
-	expect(afterModeExit).toMatchObject({ block: true, reason: expect.stringContaining("exact native approval") });
+	expect(afterModeExit).toMatchObject({ block: true, reason: expect.stringContaining("native plan approval") });
 
 	const contextResult = await context({ messages: approvalMessages }, harness.ctx);
 	expect(contextResult).toMatchObject({
@@ -350,7 +352,7 @@ test("native approval requires a real write-device diagnostics result before the
 			{ toolName: "write", toolCallId: "other-device", input: { path: "xd://other", content: "{}" } },
 			harness.ctx,
 		),
-	).toBeUndefined();
+	).toMatchObject({ block: true });
 	expect(harness.states.at(-1)!.phase).toBe("building");
 
 	expect(
@@ -362,25 +364,36 @@ test("native approval requires a real write-device diagnostics result before the
 			},
 			harness.ctx,
 		),
-	).toBeUndefined();
-	await result({ toolName: "write", toolCallId: "malformed-probe", isError: false }, harness.ctx);
+	).toMatchObject({ block: true });
 	expect(harness.states.at(-1)!.lspProbeStatus).toBe("pending");
-	for (const file of ["", "   ", "../outside.ts", "/tmp/outside.ts", "src/does-not-exist.ts"]) {
+	for (const file of ["", "   ", "../outside.ts", "/tmp/outside.ts"]) {
 		const toolCallId = `invalid-probe-${JSON.stringify(file)}`;
+		expect(
+			await call(
+				{
+					toolName: "write",
+					toolCallId,
+					input: { path: "xd://lsp", content: JSON.stringify({ action: "diagnostics", file }) },
+				},
+				harness.ctx,
+			),
+		).toMatchObject({ block: true });
+		expect(harness.states.at(-1)!.lspProbeStatus).toBe("pending");
+	}
+	expect(
 		await call(
 			{
 				toolName: "write",
-				toolCallId,
-				input: { path: "xd://lsp", content: JSON.stringify({ action: "diagnostics", file }) },
+				toolCallId: "missing-probe-target",
+				input: { path: "xd://lsp", content: JSON.stringify({ action: "diagnostics", file: "src/does-not-exist.ts" }) },
 			},
 			harness.ctx,
-		);
-		await result({ toolName: "write", toolCallId, isError: true }, harness.ctx);
-		expect(harness.states.at(-1)!.lspProbeStatus).toBe("pending");
-	}
+		),
+	).toBeUndefined();
+	expect(harness.states.at(-1)!.lspProbeStatus).toBe("pending");
 
 	const blocked = await call({ toolName: "edit", toolCallId: "edit-before-probe", input: {} }, harness.ctx);
-	expect(blocked).toMatchObject({ block: true, reason: expect.stringContaining("xd://lsp") });
+	expect(blocked).toMatchObject({ block: true, reason: expect.stringContaining("valid LSP diagnostics probe") });
 
 	expect(
 		await call(
@@ -423,35 +436,20 @@ test("fresh approval session recovers the native plan identity before enforcing 
 	const ordinaryContext = ordinary.handlers.get("context")!;
 	expect(await ordinaryContext({ messages: approvalMessages }, ordinary.ctx)).toBeUndefined();
 	expect(ordinary.states).toHaveLength(0);
-	const mismatched = {
-		version: 2,
-		runId: "4f414c4c-8f8f-4dca-8df3-9e0fabada555",
-		planSlug: "example",
-		planArtifact: "local://different-plan.md",
-		status: "awaiting_approval",
-		updatedAt: Date.now(),
-		phaseStartedAt: Date.now() - 500,
-		scoutCalls: 0,
-		startedAt: 1_780_000_000_000,
-		stats: {},
-		lspProbeStatus: "pending",
-	};
-	const ordinaryPlanRunId = "d94517d9-5882-4d02-b0fc-1ae90a912c6a";
-	writeFileSync(
-		join(ordinary.ctx.localProtocolOptions.getArtifactsDir(), "local", "example-plan.md"),
-		`Ordinary plan.\nLeanFlow run ID: ${ordinaryPlanRunId}`,
-	);
-	writeFileSync(
-		join(ordinary.ctx.localProtocolOptions.getArtifactsDir(), "local", `example-${mismatched.runId}-leanflow-run.json`),
-		JSON.stringify(mismatched),
-	);
+	writeFreshArtifacts(ordinary, {
+		planContent:
+			"Ordinary plan.\nLeanFlow run ID: 4f414c4c-8f8f-4dca-8df3-9e0fabada555\nLSP applicability: required",
+		markerOverrides: { planArtifact: "local://different-plan.md" },
+		pointer: false,
+	});
 	expect(await ordinaryContext({ messages: approvalMessages }, ordinary.ctx)).toBeUndefined();
 	expect(ordinary.states).toHaveLength(0);
-	const staleSameSlug = { ...mismatched, planArtifact: "local://example-plan.md", status: "completed" };
-	writeFileSync(
-		join(ordinary.ctx.localProtocolOptions.getArtifactsDir(), "local", `example-${staleSameSlug.runId}-leanflow-run.json`),
-		JSON.stringify(staleSameSlug),
-	);
+	writeFreshArtifacts(ordinary, {
+		planContent:
+			"Ordinary plan.\nLeanFlow run ID: 4f414c4c-8f8f-4dca-8df3-9e0fabada555\nLSP applicability: required",
+		markerOverrides: { status: "completed" },
+		pointer: false,
+	});
 	expect(await ordinaryContext({ messages: approvalMessages }, ordinary.ctx)).toBeUndefined();
 	expect(ordinary.states).toHaveLength(0);
 
@@ -493,18 +491,24 @@ test("fresh approval session recovers the native plan identity before enforcing 
 		},
 		lspProbeStatus: "pending",
 	};
-	const markerPath = join(harness.ctx.localProtocolOptions.getArtifactsDir(), "local", `example-${marker.runId}-leanflow-run.json`);
+	const markerArtifact = `local://.leanflow/runs/${marker.runId}.json`;
+	const markerPath = resolveRunMarkerPath(harness.ctx.localProtocolOptions, markerArtifact)!;
 	writeFileSync(
 		join(harness.ctx.localProtocolOptions.getArtifactsDir(), "local", "example-plan.md"),
 		finalPlanContent,
 	);
+	mkdirSync(dirname(markerPath), { recursive: true });
 	writeFileSync(markerPath, JSON.stringify(marker));
+	mkdirSync(
+		dirname(resolveRunMarkerPath(harness.ctx.localProtocolOptions, "local://.leanflow/active/example.json")!),
+		{ recursive: true },
+	);
 	writeFileSync(
-		join(harness.ctx.localProtocolOptions.getArtifactsDir(), "local", "example-leanflow-active.json"),
+		resolveRunMarkerPath(harness.ctx.localProtocolOptions, "local://.leanflow/active/example.json")!,
 		JSON.stringify({
 			version: 1,
 			runId: marker.runId,
-			markerArtifact: `local://example-${marker.runId}-leanflow-run.json`,
+			markerArtifact,
 			planArtifact: "local://example-plan.md",
 			status: "awaiting_approval",
 			updatedAt: Date.now(),
@@ -528,7 +532,7 @@ test("fresh approval session recovers the native plan identity before enforcing 
 
 	expect(await call({ toolName: "edit", toolCallId: "fresh-edit-before-probe", input: {} }, harness.ctx)).toMatchObject({
 		block: true,
-		reason: expect.stringContaining("xd://lsp"),
+		reason: expect.stringContaining("valid LSP diagnostics probe"),
 	});
 	expect(harness.states.at(-1)!.stats!.awaitingApproval.elapsedMs).toBeGreaterThanOrEqual(502);
 	await call(
@@ -711,15 +715,15 @@ test("marker storage uses the session-scoped fallback local root", async () => {
 	};
 	await writeInitialPlan(harness);
 	const runId = harness.states.at(-1)!.runId!;
-	const markerPath = join(tmpdir(), "omp-local", sessionId, `example-${runId}-leanflow-run.json`);
+	const artifact = `local://.leanflow/runs/${runId}.json`;
+	const markerPath = join(tmpdir(), "omp-local", sessionId, ".leanflow", "runs", `${runId}.json`);
 	expect(existsSync(markerPath)).toBe(true);
-	const artifact = `local://example-${runId}-leanflow-run.json`;
 	const windowsPath = resolveRunMarkerPath(
 		{ getArtifactsDir: () => `C:\\${"very-long-root\\".repeat(20)}`, getSessionId: () => sessionId },
 		artifact,
 		"win32",
 	);
-	expect(windowsPath).toBe(join(tmpdir(), "omp-local", sessionId, `example-${runId}-leanflow-run.json`));
+	expect(windowsPath).toBe(join(tmpdir(), "omp-local", sessionId, ".leanflow", "runs", `${runId}.json`));
 	rmSync(join(tmpdir(), "omp-local", sessionId), { recursive: true, force: true });
 });
 
@@ -974,7 +978,7 @@ test("canonical plan edits are reread and reassessed from actual content", async
 			},
 			harness.ctx,
 		),
-	).toMatchObject({ block: true, reason: expect.stringContaining("awaiting exact native approval") });
+	).toMatchObject({ block: true, reason: expect.stringContaining("native plan approval") });
 
 	const docsContent = [
 		"Update documentation only and verify the rendered text.",
@@ -1138,7 +1142,7 @@ test("repository mutation guards distinguish canonical and plan-named working-tr
 			},
 			awaiting.ctx,
 		),
-	).toMatchObject({ block: true, reason: expect.stringContaining("awaiting exact native approval") });
+	).toMatchObject({ block: true, reason: expect.stringContaining("native plan approval") });
 
 	const building = createHarness();
 	await writeInitialPlan(building, "Update documentation only and verify text.\nLSP applicability: not_required");
@@ -1236,13 +1240,11 @@ test("fresh recovery locks invalid, expired, corrupt, and ambiguous identities",
 	const secondRunId = "2d3ef6f7-f14c-4898-a658-65577ef446af";
 	const secondMarker = JSON.parse(readFileSync(first.markerPath, "utf8"));
 	secondMarker.runId = secondRunId;
-	writeFileSync(
-		resolveRunMarkerPath(
-			ambiguous.ctx.localProtocolOptions,
-			`local://example-${secondRunId}-leanflow-run.json`,
-		)!,
-		JSON.stringify(secondMarker),
-	);
+	const secondMarkerPath = resolveRunMarkerPath(
+		ambiguous.ctx.localProtocolOptions,
+		`local://.leanflow/runs/${secondRunId}.json`,
+	)!;
+	writeFileSync(secondMarkerPath, JSON.stringify(secondMarker));
 	const corruptPointer = createHarness();
 	const corruptPointerRunId = "4f414c4c-8f8f-4dca-8df3-9e0fabada555";
 	const corruptPointerPlan = validPlan(corruptPointerRunId);
@@ -1251,8 +1253,12 @@ test("fresh recovery locks invalid, expired, corrupt, and ambiguous identities",
 		"local://example-plan.md",
 	)!;
 	writeFileSync(corruptPointerPlanPath, corruptPointerPlan);
+	mkdirSync(
+		dirname(resolveRunMarkerPath(corruptPointer.ctx.localProtocolOptions, "local://.leanflow/active/example.json")!),
+		{ recursive: true },
+	);
 	writeFileSync(
-		resolveRunMarkerPath(corruptPointer.ctx.localProtocolOptions, "local://example-leanflow-active.json")!,
+		resolveRunMarkerPath(corruptPointer.ctx.localProtocolOptions, "local://.leanflow/active/example.json")!,
 		"{",
 	);
 	expect(await corruptPointer.handlers.get("context")!({ messages: approvalMessages }, corruptPointer.ctx)).toBeUndefined();
@@ -1260,4 +1266,222 @@ test("fresh recovery locks invalid, expired, corrupt, and ambiguous identities",
 
 	expect(await ambiguous.handlers.get("context")!({ messages: approvalMessages }, ambiguous.ctx)).toBeUndefined();
 	expect(ambiguous.states.at(-1)).toMatchObject({ phase: "planning", approvalInvalidated: true });
+});
+
+test("locked phases allow only explicit read-only LSP actions", async () => {
+	const planning = createHarness();
+	await planning.commands.get("flow")!.handler("example", planning.ctx);
+	const call = planning.handlers.get("tool_call")!;
+	for (const [action, input] of [
+		["diagnostics", { action: "diagnostics", file: "src/example.ts" }],
+		["references", { action: "references", file: "src/example.ts", line: 1, symbol: "example" }],
+	] as const) {
+		expect(
+			await call(
+				{ toolName: "write", toolCallId: `safe-${action}`, input: { path: "xd://lsp", content: JSON.stringify(input) } },
+				planning.ctx,
+			),
+		).toBeUndefined();
+	}
+	for (const event of [
+		{
+			toolName: "write",
+			toolCallId: "locked-rename",
+			input: { path: "xd://lsp", content: JSON.stringify({ action: "rename", file: "src/example.ts", line: 1, symbol: "example", new_name: "changed" }) },
+		},
+		{
+			toolName: "write",
+			toolCallId: "locked-code-action",
+			input: { path: "xd://lsp", content: JSON.stringify({ action: "code_actions", file: "src/example.ts", line: 1 }) },
+		},
+		{ toolName: "eval", toolCallId: "locked-eval", input: { language: "js", code: "1" } },
+		{ toolName: "resolve", toolCallId: "locked-resolve", input: { action: "apply" } },
+		{ toolName: "recipe", toolCallId: "locked-unknown", input: {} },
+	]) {
+		expect(await call(event, planning.ctx)).toMatchObject({
+			block: true,
+			reason: expect.stringContaining("not explicitly read-only"),
+		});
+	}
+
+	const awaiting = createHarness();
+	await writeInitialPlan(awaiting);
+	expect(
+		await awaiting.handlers.get("tool_call")!(
+			{
+				toolName: "write",
+				toolCallId: "awaiting-rename",
+				input: { path: "xd://lsp", content: JSON.stringify({ action: "rename", file: "src/example.ts", line: 1, symbol: "example", new_name: "changed" }) },
+			},
+			awaiting.ctx,
+		),
+	).toMatchObject({ block: true });
+
+	const building = createHarness();
+	await writeInitialPlan(building);
+	const buildingCall = building.handlers.get("tool_call")!;
+	const buildingResult = building.handlers.get("tool_result")!;
+	await buildingCall(
+		{ toolName: "write", toolCallId: "locked-propose", input: { path: "xd://propose", content: "example" } },
+		building.ctx,
+	);
+	await buildingResult({ toolName: "write", toolCallId: "locked-propose", isError: false }, building.ctx);
+	building.branch.push({ type: "mode_change", mode: "none" });
+	await building.handlers.get("context")!({ messages: approvalMessages }, building.ctx);
+	expect(
+		await buildingCall(
+			{
+				toolName: "write",
+				toolCallId: "building-rename",
+				input: { path: "xd://lsp", content: JSON.stringify({ action: "rename", file: "src/example.ts", line: 1, symbol: "example", new_name: "changed" }) },
+			},
+			building.ctx,
+		),
+	).toMatchObject({ block: true, reason: expect.stringContaining("diagnostics probe") });
+});
+
+test("canonical and evidence artifacts use normalized filesystem identity", async () => {
+	const harness = createHarness();
+	await writeInitialPlan(harness);
+	const call = harness.handlers.get("tool_call")!;
+	const result = harness.handlers.get("tool_result")!;
+	const absolutePlan = resolveRunMarkerPath(harness.ctx.localProtocolOptions, "local://example-plan.md")!;
+	for (const [toolCallId, target] of [
+		["hashline-plan", "[local://example-plan.md#ABCD]"],
+		["single-slash-plan", "local:/example-plan.md"],
+		["absolute-plan", absolutePlan],
+	]) {
+		expect(await call({ toolName: "edit", toolCallId, input: { path: target } }, harness.ctx)).toBeUndefined();
+		await result({ toolName: "edit", toolCallId, isError: false }, harness.ctx);
+	}
+	expect(
+		await call(
+			{
+				toolName: "edit",
+				toolCallId: "mixed-normalized-plan",
+				input: { paths: ["[local://example-plan.md#ABCD]", "src/example.ts"] },
+			},
+			harness.ctx,
+		),
+	).toMatchObject({ block: true });
+
+	await call(
+		{ toolName: "write", toolCallId: "normalized-propose", input: { path: "xd://propose", content: "example" } },
+		harness.ctx,
+	);
+	await result({ toolName: "write", toolCallId: "normalized-propose", isError: false }, harness.ctx);
+	harness.branch.push({ type: "mode_change", mode: "none" });
+	await harness.handlers.get("context")!({ messages: approvalMessages }, harness.ctx);
+	await call(
+		{
+			toolName: "write",
+			toolCallId: "normalized-probe",
+			input: { path: "xd://lsp", content: JSON.stringify({ action: "diagnostics", file: "src/example.ts" }) },
+		},
+		harness.ctx,
+	);
+	await result({ toolName: "write", toolCallId: "normalized-probe", isError: false }, harness.ctx);
+	const absoluteEvidence = resolveRunMarkerPath(harness.ctx.localProtocolOptions, "local://example-evidence.md")!;
+	for (const [toolCallId, target] of [
+		["hashline-build", "[local://example-build.md#1234]"],
+		["hashline-diff", "[local://example-diff.md#5678]"],
+		["absolute-evidence", `[${absoluteEvidence}#9ABC]`],
+	]) {
+		await call({ toolName: "edit", toolCallId, input: { path: target } }, harness.ctx);
+		await result({ toolName: "edit", toolCallId, isError: false }, harness.ctx);
+	}
+	expect(harness.states.at(-1)!.writtenArtifacts?.sort()).toEqual(["build", "diff", "evidence"]);
+});
+
+test("extension-owned state namespace is blocked in every authored target form", async () => {
+	const harness = createHarness();
+	await harness.commands.get("flow")!.handler("example", harness.ctx);
+	const call = harness.handlers.get("tool_call")!;
+	const absoluteState = resolveRunMarkerPath(
+		harness.ctx.localProtocolOptions,
+		"local://.leanflow/active/example.json",
+	)!;
+	for (const [name, event] of [
+		["local", { toolName: "write", toolCallId: "reserved-local", input: { path: "local://.leanflow/active/example.json", content: "{}" } }],
+		["encoded", { toolName: "write", toolCallId: "reserved-encoded", input: { path: "local://%2Eleanflow/active/example.json", content: "{}" } }],
+		["hashline", { toolName: "edit", toolCallId: "reserved-hashline", input: { path: "[local://.leanflow/active/example.json#ABCD]" } }],
+		["absolute", { toolName: "edit", toolCallId: "reserved-absolute", input: { path: absoluteState } }],
+		["mixed", { toolName: "edit", toolCallId: "reserved-mixed", input: { paths: ["local://notes.md", absoluteState] } }],
+	] as const) {
+		expect(await call(event, harness.ctx), name).toMatchObject({
+			block: true,
+			reason: expect.stringContaining("extension-owned"),
+		});
+	}
+});
+
+test("marker durability is required before proposal but best-effort after approval", async () => {
+	const preProposal = createHarness();
+	await preProposal.commands.get("flow")!.handler("example", preProposal.ctx);
+	const planContent = [
+		"Update src/example.ts and run focused tests.",
+		`LeanFlow run ID: ${preProposal.states.at(-1)!.runId}`,
+		"LSP applicability: required",
+	].join("\n");
+	const planPath = resolveRunMarkerPath(preProposal.ctx.localProtocolOptions, "local://example-plan.md")!;
+	writeFileSync(planPath, planContent);
+	const stateRoot = resolveRunMarkerPath(preProposal.ctx.localProtocolOptions, "local://.leanflow")!;
+	writeFileSync(stateRoot, "blocks marker directory creation");
+	const preCall = preProposal.handlers.get("tool_call")!;
+	const preResult = preProposal.handlers.get("tool_result")!;
+	await preCall(
+		{ toolName: "write", toolCallId: "pre-marker-failure", input: { path: "local://example-plan.md", content: planContent } },
+		preProposal.ctx,
+	);
+	await preResult({ toolName: "write", toolCallId: "pre-marker-failure", isError: false }, preProposal.ctx);
+	expect(preProposal.states.at(-1)).toMatchObject({ phase: "planning", persistenceDegraded: true });
+
+	const approved = createHarness();
+	await writeInitialPlan(approved);
+	const approvedCall = approved.handlers.get("tool_call")!;
+	const approvedResult = approved.handlers.get("tool_result")!;
+	await approvedCall(
+		{ toolName: "write", toolCallId: "approved-propose", input: { path: "xd://propose", content: "example" } },
+		approved.ctx,
+	);
+	await approvedResult({ toolName: "write", toolCallId: "approved-propose", isError: false }, approved.ctx);
+	const approvedStateRoot = resolveRunMarkerPath(approved.ctx.localProtocolOptions, "local://.leanflow")!;
+	rmSync(approvedStateRoot, { recursive: true, force: true });
+	writeFileSync(approvedStateRoot, "blocks marker updates");
+	approved.branch.push({ type: "mode_change", mode: "none" });
+	await approved.handlers.get("context")!({ messages: approvalMessages }, approved.ctx);
+	expect(approved.states.at(-1)).toMatchObject({ phase: "building", persistenceDegraded: true });
+
+	const fresh = createHarness();
+	const freshRunId = "4f414c4c-8f8f-4dca-8df3-9e0fabada555";
+	const freshArtifacts = writeFreshArtifacts(fresh, {
+		planContent: [
+			"Update src/example.ts and run focused tests.",
+			`LeanFlow run ID: ${freshRunId}`,
+			"LSP applicability: required",
+		].join("\n"),
+	});
+	const markerDirectory = dirname(freshArtifacts.markerPath);
+	const pointerDirectory = dirname(freshArtifacts.pointerPath);
+	chmodSync(markerDirectory, 0o555);
+	chmodSync(pointerDirectory, 0o555);
+	try {
+		await fresh.handlers.get("context")!({ messages: approvalMessages }, fresh.ctx);
+		expect(fresh.states.at(-1)).toMatchObject({ phase: "building", persistenceDegraded: true });
+	} finally {
+		chmodSync(pointerDirectory, 0o755);
+		chmodSync(markerDirectory, 0o755);
+	}
+});
+
+test("expired orphan markers do not claim ordinary native approvals", async () => {
+	const harness = createHarness();
+	const runId = "4f414c4c-8f8f-4dca-8df3-9e0fabada555";
+	writeFreshArtifacts(harness, {
+		planContent: `Ordinary plan.\nLeanFlow run ID: ${runId}\nLSP applicability: required`,
+		markerOverrides: { updatedAt: Date.now() - 25 * 60 * 60 * 1_000 },
+		pointer: false,
+	});
+	expect(await harness.handlers.get("context")!({ messages: approvalMessages }, harness.ctx)).toBeUndefined();
+	expect(harness.states).toHaveLength(0);
 });

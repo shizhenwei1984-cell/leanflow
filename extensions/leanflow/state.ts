@@ -110,6 +110,8 @@ export interface LeanFlowState {
 	terminalOutcome?: "pass" | "fail_after_retry" | "gate_operational_failure";
 	/** Latest durable lifecycle status written to the run marker. */
 	runMarkerStatus?: RunMarkerStatus;
+	/** Marker/pointer persistence failed; current in-memory control remains authoritative. */
+	persistenceDegraded?: boolean;
 	/** Whether a valid diagnostics probe is required, pending, or completed. */
 	lspProbeStatus: LspProbeStatus;
 	/** Path (or `*`) passed to the completed diagnostics probe. */
@@ -192,6 +194,7 @@ function normalizeState(value: LeanFlowState | undefined): LeanFlowState {
 		approvedPlanArtifact: typeof state.approvedPlanArtifact === "string" ? state.approvedPlanArtifact : undefined,
 		runMarkerArtifact: typeof state.runMarkerArtifact === "string" ? state.runMarkerArtifact : undefined,
 		runMarkerStatus: isRunMarkerStatus(state.runMarkerStatus) ? state.runMarkerStatus : undefined,
+		persistenceDegraded: state.persistenceDegraded === true,
 		lspProbeStatus: normalizeLspProbeStatus(state),
 		proposedPlanDigest: typeof state.proposedPlanDigest === "string" ? state.proposedPlanDigest : undefined,
 		approvalInvalidated: state.approvalInvalidated === true,

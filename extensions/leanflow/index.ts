@@ -23,13 +23,16 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
+import * as fsSync from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolCallEvent } from "@oh-my-pi/pi-coding-agent";
+import { resolvePlanPath } from "@oh-my-pi/pi-coding-agent/tools/plan-mode-guard";
 import { approvedPlanArtifact, filterForBuilder } from "./context";
 import { CUSTOM_TYPE, defaultState, defaultStats, hasPersistedState, restoreState } from "./state";
 import type { LeanFlowState } from "./state";
 import { checkAgentBudget, checkTaskGuard, extractAgentRoles } from "./guard";
+import type { LeanFlowAgentRole } from "./guard";
 import { assessHandoff, formatHandoffNotification } from "./handoff";
 import {
 	addUsage,
@@ -44,8 +47,26 @@ import {
 	transitionPhase,
 } from "./stats";
 
-/** Built-in tools that always target the working tree in LeanFlow policy. */
-const REPOSITORY_MUTATION_TOOLS: Readonly<Record<string, true>> = { bash: true, ast_edit: true };
+const READ_ONLY_TOOLS = new Set(["read", "grep", "glob", "web_search"]);
+const LSP_READ_ONLY_ACTIONS = new Set([
+	"diagnostics",
+	"definition",
+	"type_definition",
+	"implementation",
+	"references",
+	"hover",
+	"symbols",
+	"status",
+	"capabilities",
+]);
+const REPOSITORY_MUTATION_TOOLS = new Set(["bash", "ast_edit", "eval", "resolve"]);
+type ToolEffect =
+	| "read_only"
+	| "canonical_plan_mutation"
+	| "local_scratch_mutation"
+	| "repository_mutation"
+	| "control_plane_mutation"
+	| "unknown";
 
 type WriteToolInput = { content: string; path: string };
 
@@ -145,18 +166,103 @@ function expectedPlanArtifact(state: LeanFlowState): string | undefined {
 	return state.planSlug ? `local://${state.planSlug}-plan.md` : undefined;
 }
 
-function toolTargetsPath(event: ToolCallEvent, target: string): boolean {
-	if (event.toolName !== "write" && event.toolName !== "edit") return false;
-	if ("path" in event.input && event.input.path === target) return true;
-	return "paths" in event.input && Array.isArray(event.input.paths) && event.input.paths.includes(target);
+
+
+function normalizeFilesystemIdentity(target: string): string {
+	const absolute = path.resolve(target);
+	let existing = absolute;
+	const suffix: string[] = [];
+	for (;;) {
+		try {
+			return path.join(fsSync.realpathSync.native(existing), ...suffix.reverse());
+		} catch {
+			const parent = path.dirname(existing);
+			if (parent === existing) return absolute;
+			suffix.push(path.basename(existing));
+			existing = parent;
+		}
+	}
 }
 
-function toolTargetsOnlyPath(event: ToolCallEvent, target: string): boolean {
-	if (event.toolName !== "write" && event.toolName !== "edit") return false;
-	const targets: unknown[] = [];
-	if ("path" in event.input) targets.push(event.input.path);
-	if ("paths" in event.input && Array.isArray(event.input.paths)) targets.push(...event.input.paths);
-	return targets.length > 0 && targets.every((candidate) => candidate === target);
+function resolveLeanFlowTarget(ctx: ExtensionContext, rawTarget: string): string | undefined {
+	try {
+		return normalizeFilesystemIdentity(resolvePlanPath(ctx as never, rawTarget));
+	} catch {
+		return undefined;
+	}
+}
+
+function toolTargets(event: ToolCallEvent): string[] {
+	if (event.toolName !== "write" && event.toolName !== "edit") return [];
+	const targets: string[] = [];
+	if ("path" in event.input && typeof event.input.path === "string") targets.push(event.input.path);
+	if ("paths" in event.input && Array.isArray(event.input.paths)) {
+		for (const candidate of event.input.paths) if (typeof candidate === "string") targets.push(candidate);
+	}
+	return targets;
+}
+
+function toolTargetsPath(ctx: ExtensionContext, event: ToolCallEvent, target: string): boolean {
+	const expected = resolveLeanFlowTarget(ctx, target);
+	return expected !== undefined && toolTargets(event).some((candidate) => resolveLeanFlowTarget(ctx, candidate) === expected);
+}
+
+function toolTargetsOnlyPath(ctx: ExtensionContext, event: ToolCallEvent, target: string): boolean {
+	const expected = resolveLeanFlowTarget(ctx, target);
+	const targets = toolTargets(event);
+	return expected !== undefined && targets.length > 0 && targets.every((candidate) => resolveLeanFlowTarget(ctx, candidate) === expected);
+}
+
+function lspAction(event: ToolCallEvent): string | undefined {
+	if (!isWriteToolCall(event) || event.input.path !== "xd://lsp") return undefined;
+	try {
+		const input: unknown = JSON.parse(event.input.content);
+		return input && typeof input === "object" && !Array.isArray(input) && "action" in input && typeof input.action === "string"
+			? input.action
+			: undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function targetsLocalSandbox(ctx: ExtensionContext, event: ToolCallEvent): boolean {
+	if (!ctx.localProtocolOptions) return false;
+	const localRoot = resolveRunMarkerPath(ctx.localProtocolOptions, "local://");
+	if (!localRoot) return false;
+	const root = normalizeFilesystemIdentity(localRoot);
+	const targets = toolTargets(event);
+	return (
+		targets.length > 0 &&
+		targets.every((candidate) => {
+			const resolved = resolveLeanFlowTarget(ctx, candidate);
+			return resolved !== undefined && (resolved === root || resolved.startsWith(`${root}${path.sep}`));
+		})
+	);
+}
+
+function classifyToolEffect(
+	ctx: ExtensionContext,
+	event: ToolCallEvent,
+	canonicalPlanArtifact: string | undefined,
+): ToolEffect {
+	if (READ_ONLY_TOOLS.has(event.toolName)) return "read_only";
+	if (isWriteToolCall(event) && event.input.path === "xd://lsp") {
+		const action = lspAction(event);
+		if (action === "diagnostics" && lspDiagnosticsTarget(event) === undefined) return "control_plane_mutation";
+		return action !== undefined && LSP_READ_ONLY_ACTIONS.has(action) ? "read_only" : "control_plane_mutation";
+	}
+	if (
+		canonicalPlanArtifact !== undefined &&
+		toolTargetsOnlyPath(ctx, event, canonicalPlanArtifact)
+	) {
+		return "canonical_plan_mutation";
+	}
+	if (isProposalWrite(event) || isTaskToolCall(event)) return "control_plane_mutation";
+	if (targetsLocalSandbox(ctx, event)) return "local_scratch_mutation";
+	if (REPOSITORY_MUTATION_TOOLS.has(event.toolName) || event.toolName === "write" || event.toolName === "edit") {
+		return "repository_mutation";
+	}
+	return "unknown";
 }
 
 function hasPlanModeExitAfter(branch: Iterable<unknown>, boundary: number): boolean {
@@ -221,12 +327,23 @@ function planSlugFromArtifact(artifact: string): string {
 	return artifact.slice("local://".length, -"-plan.md".length);
 }
 
-function runMarkerArtifact(planSlug: string, runId: string): string {
-	return `local://${planSlug}-${runId}-leanflow-run.json`;
+function runMarkerArtifact(_planSlug: string, runId: string): string {
+	return `local://.leanflow/runs/${runId}.json`;
 }
 
 function activePointerArtifact(planSlug: string): string {
-	return `local://${planSlug}-leanflow-active.json`;
+	return `local://.leanflow/active/${encodeURIComponent(planSlug)}.json`;
+}
+
+function targetsReservedLeanFlowState(ctx: ExtensionContext, event: ToolCallEvent): boolean {
+	if (!ctx.localProtocolOptions) return false;
+	const reservedRoot = resolveRunMarkerPath(ctx.localProtocolOptions, "local://.leanflow");
+	if (!reservedRoot) return false;
+	const root = normalizeFilesystemIdentity(reservedRoot);
+	return toolTargets(event).some((candidate) => {
+		const resolved = resolveLeanFlowTarget(ctx, candidate);
+		return resolved !== undefined && (resolved === root || resolved.startsWith(`${root}${path.sep}`));
+	});
 }
 
 function linesOutsideMarkdownFences(content: string): string[] {
@@ -372,9 +489,15 @@ export default function leanflow(pi: ExtensionAPI): void {
 	}
 
 	async function writeRunMarker(ctx: ExtensionContext, status: NonNullable<LeanFlowState["runMarkerStatus"]>): Promise<boolean> {
-		if (!state.runId || !state.planSlug || !state.planArtifact || !state.planDigest || !state.startedAt || !state.stats) return false;
+		if (!state.runId || !state.planSlug || !state.planArtifact || !state.planDigest || !state.startedAt || !state.stats) {
+			state.persistenceDegraded = true;
+			return false;
+		}
 		const options = ctx.localProtocolOptions;
-		if (!options) return false;
+		if (!options) {
+			state.persistenceDegraded = true;
+			return false;
+		}
 		const artifact = runMarkerArtifact(state.planSlug, state.runId);
 		const markerPath = resolveRunMarkerPath(options, artifact);
 		const pointerPath = resolveRunMarkerPath(options, activePointerArtifact(state.planSlug));
@@ -416,7 +539,13 @@ export default function leanflow(pi: ExtensionAPI): void {
 			}
 			return true;
 		} catch {
-			if (ctx.hasUI) ctx.ui.notify("LeanFlow: state persistence degraded; continuing with in-memory workflow truth.", "warning");
+			state.persistenceDegraded = true;
+			if (ctx.hasUI) {
+				ctx.ui.notify(
+					"LeanFlow: workflow state persistence degraded; this approved session may continue, but future fresh-session recovery is unavailable.",
+					"warning",
+				);
+			}
 			return false;
 		}
 	}
@@ -434,28 +563,23 @@ export default function leanflow(pi: ExtensionAPI): void {
 		} catch (error) {
 			const missing = typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
 			if (!missing) return { kind: "invalid", reason: "corrupt active pointer" };
+			const runsPath = resolveRunMarkerPath(options, "local://.leanflow/runs");
+			if (!runsPath) return { kind: "invalid", reason: "invalid active marker directory" };
 			try {
-				const names = await fs.readdir(path.dirname(pointerPath));
-				const candidates = names.filter(
-					(name) => name.startsWith(`${slug}-`) && name.endsWith("-leanflow-run.json"),
-				);
+				const names = await fs.readdir(runsPath);
 				let activeMatches = 0;
-				for (const name of candidates) {
+				for (const name of names.filter((candidate) => candidate.endsWith(".json"))) {
 					try {
-						const candidate: unknown = JSON.parse(await fs.readFile(path.join(path.dirname(pointerPath), name), "utf8"));
+						const candidate: unknown = JSON.parse(await fs.readFile(path.join(runsPath, name), "utf8"));
 						if (
-							candidate &&
-							typeof candidate === "object" &&
-							!Array.isArray(candidate) &&
-							"status" in candidate &&
-							candidate.status === "awaiting_approval" &&
-							"planArtifact" in candidate &&
-							candidate.planArtifact === approvedArtifact
+							isRunMarker(candidate, approvedArtifact) &&
+							candidate.planSlug === slug &&
+							name === `${candidate.runId}.json`
 						) {
 							activeMatches++;
 						}
 					} catch {
-						// A corrupt orphan without an active pointer is not sufficient to claim this approval.
+						// Corrupt and expired orphan markers cannot claim an ordinary approval.
 					}
 				}
 				if (activeMatches === 0) return { kind: "none" };
@@ -463,9 +587,15 @@ export default function leanflow(pi: ExtensionAPI): void {
 					kind: "invalid",
 					reason: activeMatches > 1 ? "multiple active marker candidates" : "orphan active marker",
 				};
-			}
-			catch {
-				return { kind: "none" };
+			} catch (scanError) {
+				const noRuns =
+					typeof scanError === "object" &&
+					scanError !== null &&
+					"code" in scanError &&
+					scanError.code === "ENOENT";
+				return noRuns
+					? { kind: "none" }
+					: { kind: "invalid", reason: "unreadable active marker directory" };
 			}
 		}
 		if (!rawPointer || typeof rawPointer !== "object" || Array.isArray(rawPointer)) {
@@ -568,8 +698,8 @@ export default function leanflow(pi: ExtensionAPI): void {
 
 		state.approvalInvalidated = false;
 		if (reason === "mutation") transitionPhase(state, "awaiting_approval");
-		if (!(await writeRunMarker(ctx, "awaiting_approval"))) {
-			state.approvalInvalidated ||= reason === "approval" || reason === "recovery";
+		const markerWritten = await writeRunMarker(ctx, "awaiting_approval");
+		if (!markerWritten && (reason === "mutation" || reason === "proposal")) {
 			transitionPhase(state, "planning");
 			persist();
 			updateStatus(ctx);
@@ -894,14 +1024,63 @@ export default function leanflow(pi: ExtensionAPI): void {
 			};
 		}
 
+		const canonicalPlanArtifact = expectedPlanArtifact(state);
+		const canonicalPlanMutation =
+			canonicalPlanArtifact !== undefined && toolTargetsPath(ctx, event, canonicalPlanArtifact);
+
+		if (targetsReservedLeanFlowState(ctx, event)) {
+			return {
+				block: true,
+				reason: "LeanFlow: internal workflow state artifacts are extension-owned.",
+			};
+		}
+
+		const approvalConfirmed =
+			state.phase === "building" || (state.phase === "awaiting_approval" && (await nativeApprovalConfirmed(ctx)));
+
+		if (
+			canonicalPlanMutation &&
+			(state.phase === "building" || state.phase === "gating")
+		) {
+			return {
+				block: true,
+				reason: "LeanFlow: the approved canonical plan is immutable after BUILD begins.",
+			};
+		}
+		let roles: LeanFlowAgentRole[] = [];
 		if (isTaskToolCall(event)) {
 			const guard = checkTaskGuard(state.phase, event.input);
 			if (guard.block) return { block: true, reason: guard.reason };
-
-			const roles = extractAgentRoles(event.input);
+			roles = extractAgentRoles(event.input);
 			const budget = checkAgentBudget(state, roles);
 			if (budget.block) return { block: true, reason: budget.reason };
+		}
 
+		const effect = classifyToolEffect(ctx, event, canonicalPlanArtifact);
+		const locked =
+			state.phase === "planning" ||
+			(state.phase === "awaiting_approval" && !approvalConfirmed) ||
+			(state.phase === "building" && state.lspProbeStatus === "pending");
+		const planningScout =
+			state.phase === "planning" && isTaskToolCall(event) && roles.length > 0 && roles.every((role) => role === "scout");
+		const allowedWhileLocked =
+			effect === "read_only" ||
+			((state.phase === "planning" || state.phase === "awaiting_approval") &&
+				effect === "canonical_plan_mutation") ||
+			(state.phase === "awaiting_approval" && isProposalWrite(event)) ||
+			planningScout;
+		if (locked && !allowedWhileLocked) {
+			return {
+				block: true,
+				reason:
+					state.phase === "building"
+						? "LeanFlow: only read-only tools and a valid LSP diagnostics probe are allowed before the first BUILD mutation."
+						: "LeanFlow: this tool or operation is not explicitly read-only before native plan approval.",
+			};
+		}
+
+
+		if (isTaskToolCall(event)) {
 			const scoutCount = roles.filter((role) => role === "scout").length;
 			const gateCount = roles.filter((role) => role === "gate").length;
 			if (gateCount > 0) {
@@ -914,7 +1093,6 @@ export default function leanflow(pi: ExtensionAPI): void {
 					};
 				}
 			}
-
 			state.scoutCalls += scoutCount;
 			if (gateCount === 1) {
 				state.gateCalls++;
@@ -927,37 +1105,6 @@ export default function leanflow(pi: ExtensionAPI): void {
 				updateStatus(ctx);
 			}
 		}
-
-		const canonicalPlanArtifact = expectedPlanArtifact(state);
-		const canonicalPlanMutation =
-			canonicalPlanArtifact !== undefined && toolTargetsPath(event, canonicalPlanArtifact);
-		const canonicalPlanOnlyMutation =
-			canonicalPlanArtifact !== undefined && toolTargetsOnlyPath(event, canonicalPlanArtifact);
-		if (state.phase === "planning" && isRepositoryMutation(event) && !canonicalPlanOnlyMutation) {
-			return {
-				block: true,
-				reason: "LeanFlow: repository mutations are not allowed before native plan approval.",
-			};
-		}
-
-		const approvalConfirmed =
-			state.phase === "building" || (state.phase === "awaiting_approval" && (await nativeApprovalConfirmed(ctx)));
-		if (state.phase === "planning" && isRepositoryMutation(event) && !canonicalPlanOnlyMutation) {
-			return {
-				block: true,
-				reason: "LeanFlow: repository mutations are not allowed before native plan approval.",
-			};
-		}
-		if (
-			canonicalPlanMutation &&
-				(state.phase === "building" || state.phase === "gating")
-		) {
-			return {
-				block: true,
-				reason: "LeanFlow: the approved canonical plan is immutable after BUILD begins.",
-			};
-		}
-
 
 		if (
 			canonicalPlanMutation &&
@@ -1020,22 +1167,8 @@ export default function leanflow(pi: ExtensionAPI): void {
 			pendingApprovalWrites.set(event.toolCallId, expected);
 		}
 
-		if (state.phase === "awaiting_approval" && isRepositoryMutation(event) && !canonicalPlanOnlyMutation) {
-			return {
-				block: true,
-				reason: "LeanFlow: the plan is still awaiting exact native approval; approve its proposed artifact before starting BUILD.",
-			};
-		}
-		if (state.phase === "building" && state.lspProbeStatus === "pending" && isRepositoryMutation(event)) {
-			return {
-				block: true,
-				reason:
-					"LeanFlow: before the first build action, write a valid diagnostics request for a planned source path (or `*`) to xd://lsp and wait for its result. Record an unavailable or no-server result as fallback.",
-			};
-		}
-
 		if (state.phase === "building") {
-			const kinds = artifactKindsForEvent(event, state);
+			const kinds = artifactKindsForEvent(ctx, event, state);
 			if (kinds.length > 0) pendingArtifactUpdates.set(event.toolCallId, kinds);
 		}
 	});
@@ -1155,23 +1288,6 @@ export default function leanflow(pi: ExtensionAPI): void {
 	});
 }
 
-// Repository-mutation classification
-// ---------------------------------------------------------------------------
-
-function isRepositoryMutation(event: ToolCallEvent): boolean {
-	if (Object.hasOwn(REPOSITORY_MUTATION_TOOLS, event.toolName)) return true;
-	if (isWriteToolCall(event)) {
-		return !event.input.path.startsWith("local://") && !event.input.path.startsWith("xd://");
-	}
-	if (event.toolName !== "edit") return false;
-	const targets: string[] = [];
-	if ("path" in event.input && typeof event.input.path === "string") targets.push(event.input.path);
-	if ("paths" in event.input && Array.isArray(event.input.paths)) {
-		for (const candidate of event.input.paths) if (typeof candidate === "string") targets.push(candidate);
-	}
-	if (targets.length === 0) return true;
-	return targets.some((target) => !target.startsWith("local://"));
-}
 
 // ---------------------------------------------------------------------------
 // Build-evidence artifact tracking (gate readiness)
@@ -1182,27 +1298,24 @@ const REQUIRED_ARTIFACTS = ["build", "diff", "evidence"] as const;
 
 
 /** Canonical evidence artifacts targeted by a successful write or edit. */
-function artifactKindsForEvent(event: ToolCallEvent, state: LeanFlowState): string[] {
+function artifactKindsForEvent(ctx: ExtensionContext, event: ToolCallEvent, state: LeanFlowState): string[] {
 	if (event.toolName !== "write" && event.toolName !== "edit") return [];
-	const candidates: string[] = [];
-	if ("path" in event.input && typeof event.input.path === "string") candidates.push(event.input.path);
-	if ("paths" in event.input && Array.isArray(event.input.paths)) {
-		for (const candidate of event.input.paths) {
-			if (typeof candidate === "string") candidates.push(candidate);
-		}
-	}
 	const kinds = new Set<string>();
-	for (const candidate of candidates) {
-		const kind = artifactKind(candidate, state);
+	for (const candidate of toolTargets(event)) {
+		const kind = artifactKind(ctx, candidate, state);
 		if (kind) kinds.add(kind);
 	}
 	return [...kinds];
 }
+
 /** Classify only this run's canonical evidence artifacts. */
-function artifactKind(path: string, state: LeanFlowState): string | undefined {
+function artifactKind(ctx: ExtensionContext, rawTarget: string, state: LeanFlowState): string | undefined {
 	if (!state.planSlug) return undefined;
+	const candidate = resolveLeanFlowTarget(ctx, rawTarget);
+	if (!candidate) return undefined;
 	for (const kind of REQUIRED_ARTIFACTS) {
-		if (path === `local://${state.planSlug}-${kind}.md`) return kind;
+		const expected = resolveLeanFlowTarget(ctx, `local://${state.planSlug}-${kind}.md`);
+		if (expected !== undefined && candidate === expected) return kind;
 	}
 	return undefined;
 }

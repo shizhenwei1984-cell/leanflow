@@ -27,8 +27,8 @@ There are no reviewer, audit, validator, planner, implementer, developer, coder,
 The LeanFlow extension (`extensions/leanflow/`) provides:
 
 - **State machine** — tracks `idle → planning → awaiting_approval → building → gating → finalizing → idle`, persists it via session entries, and measures Main Session provider usage, response count, and elapsed time
-- **Durable approval identity** — binds the approved plan's opaque run ID and SHA-256 content digest to a run-ID-named marker; write/edit/proposal/approval/fresh-recovery boundaries reread the actual plan, while terminal, cancelled, invalidated, and expired markers cannot recover
-- **Tool guard** — blocks unknown, implicit, and phase-forbidden agent spawns; Main remains the sole writer
+- **Durable approval identity** — binds the approved plan's opaque run ID and SHA-256 content digest to extension-owned `local://.leanflow/runs/<runId>.json` state plus `local://.leanflow/active/<slug>.json`; model tool calls cannot modify that namespace, while terminal, cancelled, invalidated, expired, or malformed markers cannot recover
+- **Tool guard** — fails closed before approval and while the initial LSP probe is pending: only explicit read-only tools/LSP actions and exact workflow exceptions are allowed; Hashline, `local:/`, `local://`, and absolute sandbox targets resolve to filesystem identity; Main remains the sole writer
 - **Handoff advisor** — assesses plan completeness after write; a missing or mismatched run identity blocks approval
 - **Gate readiness** — Gate is blocked until build/diff/evidence artifacts are refreshed, preventing premature calls without consuming an attempt
 - **Context filter** — through BUILD, GATE, and finalization, removes planning history, injects a compact builder preamble, and records message-count and serialized-byte observations separately

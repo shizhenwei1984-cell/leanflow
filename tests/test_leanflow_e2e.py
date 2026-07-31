@@ -132,10 +132,11 @@ class WorkflowPromptTest(unittest.TestCase):
             index.index("const REPOSITORY_MUTATION_TOOLS") :
             index.index("type WriteToolInput")
         ]
-        self.assertIn("bash: true", actions)
-        self.assertIn("ast_edit: true", actions)
-        self.assertNotIn("lsp:", actions)
-        self.assertIn("isRepositoryMutation", index)
+        self.assertIn('"bash"', actions)
+        self.assertIn('"ast_edit"', actions)
+        self.assertNotIn('"lsp"', actions)
+        self.assertIn("classifyToolEffect", index)
+        self.assertIn("LSP_READ_ONLY_ACTIONS", index)
 
     def test_planner_prompt_has_no_gate_reference(self) -> None:
         """P2: the Planner prompt excludes Gate calls while retaining LSP guidance."""
