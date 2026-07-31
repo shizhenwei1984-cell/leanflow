@@ -25,6 +25,7 @@ type ToolHandler = (event: Record<string, unknown>, ctx: TestContext) => Promise
 type PersistedState = {
 	phase: string;
 	handoffStatus?: string;
+	handoffWarnings?: string[];
 	planArtifact?: string;
 	proposalBoundary?: number;
 	proposedPlanArtifact?: string;
@@ -1183,6 +1184,60 @@ test("proposal waits for canonical plan mutation result", async () => {
 			harness.ctx,
 		),
 	).toMatchObject({ block: true, reason: expect.stringContaining("mutation to finish") });
+});
+
+test("agent end clears and refreshes an interrupted canonical plan mutation", async () => {
+	const harness = createHarness();
+	await writeInitialPlan(harness);
+	const call = harness.handlers.get("tool_call")!;
+	const result = harness.handlers.get("tool_result")!;
+	const runId = harness.states.at(-1)!.runId!;
+	const planPath = resolveRunMarkerPath(harness.ctx.localProtocolOptions, "local://example-plan.md")!;
+
+	expect(
+		await call(
+			{
+				toolName: "edit",
+				toolCallId: "interrupted-plan-edit",
+				input: { path: "local://example-plan.md" },
+			},
+			harness.ctx,
+		),
+	).toBeUndefined();
+
+	writeFileSync(planPath, `Needs more detail.\nLeanFlow run ID: ${runId}`);
+	await harness.handlers.get("agent_end")!({}, harness.ctx);
+	expect(harness.states.at(-1)).toMatchObject({ phase: "planning", handoffStatus: "NEEDS_UPDATE" });
+
+	const repairedContent = [
+		"Update src/example.ts with the requested behavior and run focused tests.",
+		`LeanFlow run ID: ${runId}`,
+		"LSP applicability: required",
+	].join("\n");
+	expect(
+		await call(
+			{
+				toolName: "write",
+				toolCallId: "repaired-plan",
+				input: { path: "local://example-plan.md", content: repairedContent },
+			},
+			harness.ctx,
+		),
+	).toBeUndefined();
+	writeFileSync(planPath, repairedContent);
+	await result({ toolName: "write", toolCallId: "repaired-plan", isError: false }, harness.ctx);
+
+	expect(harness.states.at(-1)!.phase).toBe("awaiting_approval");
+	expect(
+		await call(
+			{
+				toolName: "write",
+				toolCallId: "proposal-after-interrupt",
+				input: { path: "xd://propose", content: "example" },
+			},
+			harness.ctx,
+		),
+	).toBeUndefined();
 });
 
 test("fresh recovery locks invalid, expired, corrupt, and ambiguous identities", async () => {

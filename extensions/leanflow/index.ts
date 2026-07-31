@@ -967,6 +967,13 @@ export default function leanflow(pi: ExtensionAPI): void {
 	};
 	pi.on("agent_end", async (event, ctx) => {
 		if (
+			(state.phase === "planning" || state.phase === "awaiting_approval") &&
+			pendingPlanRefreshes.size > 0
+		) {
+			pendingPlanRefreshes.clear();
+			await refreshCanonicalPlanState(ctx, "mutation");
+		}
+		if (
 			state.phase === "finalizing" &&
 			(typeof event !== "object" || event === null || !("willContinue" in event) || event.willContinue !== true)
 		) {
