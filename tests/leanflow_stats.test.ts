@@ -132,6 +132,16 @@ test("restored phases restart timing observation without charging inactive time"
 	expect(restored.stats?.building.elapsedMs).toBe(10);
 });
 
+test("finalizing usage remains attributed to gating until the terminal response settles", () => {
+	const state = defaultState();
+	state.phase = "gating";
+	state.phaseStartedAt = 100;
+	transitionPhase(state, "finalizing", 110);
+	addUsage(state, { input: 5, output: 2 });
+	transitionPhase(state, "idle", 120);
+	expect(state.stats?.gating).toMatchObject({ input: 5, output: 2, responses: 1, elapsedMs: 20 });
+});
+
 test("Gate counters distinguish repair entry, repair success, terminal failure, error, and readiness block", () => {
 	const state = defaultState();
 	recordGateFailure(state, true); // first FAIL enters repair

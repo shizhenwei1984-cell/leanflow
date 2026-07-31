@@ -6,11 +6,11 @@
  *
  * Phase lifecycle:
  *   /flow                          → planning
- *   write canonical *-plan.md      → awaiting_approval
- *   exact native approved-plan prompt + completed LSP diagnostics + first build action → building
+ *   write/edit canonical *-plan.md → awaiting_approval
+ *   exact native approved-plan prompt → building (LSP may still lock mutation)
  *   task(gate)                     → gating
- *   Gate PASS / 2nd FAIL           → idle
- *   Gate 1st FAIL                  → building (repair)
+ *   Gate PASS / 2nd FAIL           → finalizing → idle
+ *   Gate 1st valid FAIL            → building (repair)
  *
  * The critical correctness property: a successful proposal is not approval.
  * BUILD begins only when OMP's synthetic approval prompt names the exact plan
@@ -21,8 +21,9 @@
  * surviving compaction and session switches.
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolCallEvent } from "@oh-my-pi/pi-coding-agent";
 import { approvedPlanArtifact, filterForBuilder } from "./context";
@@ -49,11 +50,14 @@ const BUILD_ACTION_TOOLS: Readonly<Record<string, true>> = { edit: true, bash: t
 type WriteToolInput = { content: string; path: string };
 
 interface RunMarker {
-	version: 1;
+	version: 2;
 	runId: string;
 	planSlug: string;
 	planArtifact: string;
-	phase: "awaiting_approval";
+	planDigest: string;
+	status: LeanFlowState["runMarkerStatus"];
+	updatedAt: number;
+	phaseStartedAt: number;
 	scoutCalls: number;
 	startedAt: number;
 	handoffStatus?: LeanFlowState["handoffStatus"];
@@ -63,6 +67,8 @@ interface RunMarker {
 }
 
 const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const SHA256_PATTERN = /^[0-9a-f]{64}$/;
+const ACTIVE_MARKER_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 function isTaskToolCall(event: ToolCallEvent): event is ToolCallEvent & { input: Record<string, unknown>; toolName: "task" } {
 	return event.toolName === "task" && typeof event.input === "object" && event.input !== null && !Array.isArray(event.input);
@@ -106,12 +112,37 @@ function lspDiagnosticsTarget(event: ToolCallEvent): string | undefined {
 	}
 }
 
+async function isUsableLspTarget(ctx: ExtensionContext, target: string): Promise<boolean> {
+	if (target === "*") return true;
+	const candidate = path.resolve(ctx.cwd, target);
+	if (candidate !== ctx.cwd && !candidate.startsWith(`${path.resolve(ctx.cwd)}${path.sep}`)) return false;
+	try {
+		return (await fs.stat(candidate)).isFile();
+	} catch {
+		return false;
+	}
+}
+
 function isProposalWrite(event: ToolCallEvent): event is ToolCallEvent & { input: WriteToolInput; toolName: "write" } {
 	return isWriteToolCall(event) && event.input.path === "xd://propose";
 }
 
 function expectedPlanArtifact(state: LeanFlowState): string | undefined {
 	return state.planSlug ? `local://${state.planSlug}-plan.md` : undefined;
+}
+
+function toolTargetsPath(event: ToolCallEvent, target: string): boolean {
+	if (event.toolName !== "write" && event.toolName !== "edit") return false;
+	if ("path" in event.input && event.input.path === target) return true;
+	return "paths" in event.input && Array.isArray(event.input.paths) && event.input.paths.includes(target);
+}
+
+function toolTargetsOnlyPath(event: ToolCallEvent, target: string): boolean {
+	if (event.toolName !== "write" && event.toolName !== "edit") return false;
+	const targets: unknown[] = [];
+	if ("path" in event.input) targets.push(event.input.path);
+	if ("paths" in event.input && Array.isArray(event.input.paths)) targets.push(...event.input.paths);
+	return targets.length > 0 && targets.every((candidate) => candidate === target);
 }
 
 function hasPlanModeExitAfter(branch: Iterable<unknown>, boundary: number): boolean {
@@ -125,6 +156,25 @@ function hasPlanModeExitAfter(branch: Iterable<unknown>, boundary: number): bool
 			entry.type === "mode_change" &&
 			"mode" in entry &&
 			entry.mode === "none"
+		) {
+			return true;
+		}
+		index++;
+	}
+	return false;
+}
+
+function hasPlanModeEntryAfter(branch: Iterable<unknown>, boundary: number): boolean {
+	let index = 0;
+	for (const entry of branch) {
+		if (
+			index >= boundary &&
+			typeof entry === "object" &&
+			entry !== null &&
+			"type" in entry &&
+			entry.type === "mode_change" &&
+			"mode" in entry &&
+			entry.mode === "plan"
 		) {
 			return true;
 		}
@@ -157,19 +207,63 @@ function planSlugFromArtifact(artifact: string): string {
 	return artifact.slice("local://".length, -"-plan.md".length);
 }
 
-function runMarkerArtifact(planSlug: string): string {
-	return `local://${planSlug}-leanflow-run.json`;
+function runMarkerArtifact(planSlug: string, runId: string): string {
+	return `local://${planSlug}-${runId}-leanflow-run.json`;
 }
 
-function lspStatusFromPlan(content: string): LeanFlowState["lspProbeStatus"] {
-	const declared = /^LSP applicability:\s*(required|not_required)\s*$/im.exec(content)?.[1];
-	return declared === "not_required" ? "not_required" : "pending";
+function lspStatusFromPlan(content: string): { status: LeanFlowState["lspProbeStatus"]; warning?: string } {
+	const declarations: string[] = [];
+	let fenced = false;
+	for (const line of content.split(/\r?\n/)) {
+		if (/^\s*(```|~~~)/.test(line)) {
+			fenced = !fenced;
+			continue;
+		}
+		if (fenced) continue;
+		const match = /^LSP applicability:\s*(required|not_required)\s*$/i.exec(line);
+		if (match) declarations.push(match[1].toLowerCase());
+	}
+	if (declarations.length !== 1) {
+		return {
+			status: "pending",
+			warning: `Expected exactly one LSP applicability declaration outside fenced code; found ${declarations.length}.`,
+		};
+	}
+	return { status: declarations[0] === "not_required" ? "not_required" : "pending" };
 }
 
-function markerFilePath(ctx: ExtensionContext, artifact: string): string | undefined {
-	const artifactsDir = ctx.localProtocolOptions?.getArtifactsDir?.();
-	if (!artifactsDir || !artifact.startsWith("local://")) return undefined;
-	const root = path.resolve(artifactsDir, "local");
+function runIdFromPlan(content: string): string | undefined {
+	const declarations: string[] = [];
+	let fenced = false;
+	for (const line of content.split(/\r?\n/)) {
+		if (/^\s*(```|~~~)/.test(line)) {
+			fenced = !fenced;
+			continue;
+		}
+		if (fenced) continue;
+		const match = /^LeanFlow run ID:\s*([0-9a-f-]+)\s*$/i.exec(line);
+		if (match) declarations.push(match[1]);
+	}
+	return declarations.length === 1 && RUN_ID_PATTERN.test(declarations[0]) ? declarations[0] : undefined;
+}
+
+function planDigest(content: string): string {
+	return createHash("sha256").update(content, "utf8").digest("hex");
+}
+
+export function resolveRunMarkerPath(
+	options: NonNullable<ExtensionContext["localProtocolOptions"]>,
+	artifact: string,
+	platform: NodeJS.Platform = process.platform,
+): string | undefined {
+	if (!artifact.startsWith("local://")) return undefined;
+	const artifactsDir = options.getArtifactsDir?.();
+	const sessionId = (options.getSessionId?.() ?? "session").replace(/[^a-zA-Z0-9_.-]/g, "_") || "session";
+	const candidateRoot = artifactsDir ? path.resolve(artifactsDir, "local") : path.join(os.tmpdir(), "omp-local", sessionId);
+	const root =
+		platform === "win32" && candidateRoot.length >= 180
+			? path.join(os.tmpdir(), "omp-local", sessionId)
+			: candidateRoot;
 	const target = path.resolve(root, artifact.slice("local://".length));
 	if (target !== root && !target.startsWith(`${root}${path.sep}`)) return undefined;
 	return target;
@@ -179,13 +273,21 @@ function isRunMarker(value: unknown, approvedArtifact: string): value is RunMark
 	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
 	const marker = value as Partial<RunMarker>;
 	return (
-		marker.version === 1 &&
+		marker.version === 2 &&
 		typeof marker.runId === "string" &&
 		RUN_ID_PATTERN.test(marker.runId) &&
 		typeof marker.planSlug === "string" &&
 		marker.planSlug.length > 0 &&
 		marker.planArtifact === approvedArtifact &&
-		marker.phase === "awaiting_approval" &&
+		typeof marker.planDigest === "string" &&
+		SHA256_PATTERN.test(marker.planDigest) &&
+		marker.status === "awaiting_approval" &&
+		typeof marker.updatedAt === "number" &&
+		Number.isFinite(marker.updatedAt) &&
+		Date.now() - marker.updatedAt >= 0 &&
+		Date.now() - marker.updatedAt <= ACTIVE_MARKER_MAX_AGE_MS &&
+		typeof marker.phaseStartedAt === "number" &&
+		Number.isFinite(marker.phaseStartedAt) &&
 		typeof marker.scoutCalls === "number" &&
 		Number.isInteger(marker.scoutCalls) &&
 		marker.scoutCalls >= 0 &&
@@ -201,7 +303,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 	let state: LeanFlowState = defaultState();
 	let hasPersistedLeanFlowState = false;
 	// Correlate tool_call → tool_result for plan writes, LSP probes, and gate calls.
-	const pendingPlanWrites = new Map<string, { content: string; path: string }>();
+	const pendingPlanRefreshes = new Set<string>(); // successful canonical write/edit → reread and reassess
 	const pendingLspProbes = new Map<string, string>(); // toolCallId → diagnostics target
 	const pendingApprovalWrites = new Map<string, string>(); // toolCallId → exact plan artifact
 	const pendingGateCalls = new Set<string>(); // toolCallIds
@@ -228,17 +330,21 @@ export default function leanflow(pi: ExtensionAPI): void {
 		}
 	}
 
-	async function writeRunMarker(ctx: ExtensionContext): Promise<boolean> {
-		if (!state.runId || !state.planSlug || !state.planArtifact || !state.startedAt || !state.stats) return false;
-		const artifact = runMarkerArtifact(state.planSlug);
-		const filePath = markerFilePath(ctx, artifact);
+	async function writeRunMarker(ctx: ExtensionContext, status: NonNullable<LeanFlowState["runMarkerStatus"]>): Promise<boolean> {
+		if (!state.runId || !state.planSlug || !state.planArtifact || !state.planDigest || !state.startedAt || !state.stats) return false;
+		const artifact = runMarkerArtifact(state.planSlug, state.runId);
+		const filePath = ctx.localProtocolOptions ? resolveRunMarkerPath(ctx.localProtocolOptions, artifact) : undefined;
 		if (!filePath) return false;
+		const now = Date.now();
 		const marker: RunMarker = {
-			version: 1,
+			version: 2,
 			runId: state.runId,
 			planSlug: state.planSlug,
 			planArtifact: state.planArtifact,
-			phase: "awaiting_approval",
+			planDigest: state.planDigest,
+			status,
+			updatedAt: now,
+			phaseStartedAt: state.phaseStartedAt ?? now,
 			scoutCalls: state.scoutCalls,
 			startedAt: state.startedAt,
 			handoffStatus: state.handoffStatus,
@@ -250,6 +356,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 			await fs.mkdir(path.dirname(filePath), { recursive: true });
 			await fs.writeFile(filePath, JSON.stringify(marker), "utf8");
 			state.runMarkerArtifact = artifact;
+			state.runMarkerStatus = status;
 			return true;
 		} catch {
 			return false;
@@ -257,15 +364,92 @@ export default function leanflow(pi: ExtensionAPI): void {
 	}
 
 	async function readRunMarker(ctx: ExtensionContext, approvedArtifact: string): Promise<RunMarker | undefined> {
-		const slug = planSlugFromArtifact(approvedArtifact);
-		const filePath = markerFilePath(ctx, runMarkerArtifact(slug));
-		if (!filePath) return undefined;
+		const options = ctx.localProtocolOptions;
+		if (!options) return undefined;
+		const planPath = resolveRunMarkerPath(options, approvedArtifact);
+		if (!planPath) return undefined;
 		try {
-			const marker: unknown = JSON.parse(await fs.readFile(filePath, "utf8"));
-			return isRunMarker(marker, approvedArtifact) && marker.planSlug === slug ? marker : undefined;
+			const runId = runIdFromPlan(await fs.readFile(planPath, "utf8"));
+			if (!runId) return undefined;
+			const slug = planSlugFromArtifact(approvedArtifact);
+			const markerPath = resolveRunMarkerPath(options, runMarkerArtifact(slug, runId));
+			if (!markerPath) return undefined;
+			const marker: unknown = JSON.parse(await fs.readFile(markerPath, "utf8"));
+			return isRunMarker(marker, approvedArtifact) && marker.planSlug === slug && marker.runId === runId ? marker : undefined;
 		} catch {
 			return undefined;
 		}
+	}
+
+	async function refreshCanonicalPlanState(
+		ctx: ExtensionContext,
+		reason: "mutation" | "proposal" | "approval" | "recovery",
+	): Promise<boolean> {
+		const artifact = expectedPlanArtifact(state);
+		const options = ctx.localProtocolOptions;
+		if (!artifact || !options || !state.runId) return false;
+		const filePath = resolveRunMarkerPath(options, artifact);
+		if (!filePath) return false;
+		let content: string;
+		try {
+			content = await fs.readFile(filePath, "utf8");
+		} catch {
+			return false;
+		}
+
+		const assessed = assessHandoff(content);
+		const identityValid = runIdFromPlan(content) === state.runId;
+		const lsp = lspStatusFromPlan(content);
+		const warnings = [...assessed.warnings];
+		if (!identityValid) {
+			warnings.push("Plan must contain exactly one matching `LeanFlow run ID` metadata line outside fenced code.");
+		}
+		if (lsp.warning) warnings.push(lsp.warning);
+
+		state.planArtifact = artifact;
+		state.planDigest = planDigest(content);
+		state.handoffStatus = identityValid ? assessed.status : "NEEDS_UPDATE";
+		state.handoffWarnings = warnings;
+		state.lspProbeStatus = lsp.status;
+		state.lspProbeTarget = undefined;
+
+		if (reason === "mutation") {
+			state.proposalBoundary = undefined;
+			state.proposedPlanArtifact = undefined;
+			state.proposedPlanDigest = undefined;
+			state.approvedPlanArtifact = undefined;
+		}
+
+		if (state.handoffStatus === "NEEDS_UPDATE") {
+			state.approvalInvalidated ||= reason === "approval" || reason === "recovery";
+			if ((reason === "approval" || reason === "recovery") && state.planSlug) {
+				state.approvalRepairBoundary = ctx.sessionManager.getBranch().length;
+				if (ctx.hasUI) {
+					ctx.ui.setEditorText(
+						`/plan Repair the existing LeanFlow plan at local://${state.planSlug}-plan.md in place. Preserve its run ID, fix only the invalid final-plan content, write the same artifact, then re-propose ${state.planSlug}. Do not repeat repository investigation.`,
+					);
+				}
+			}
+			transitionPhase(state, "planning");
+			await writeRunMarker(ctx, "invalidated");
+			persist();
+			updateStatus(ctx);
+			ctx.ui.notify(formatHandoffNotification({ status: "NEEDS_UPDATE", warnings }), "warning");
+			return false;
+		}
+
+		state.approvalInvalidated = false;
+		if (reason === "mutation") transitionPhase(state, "awaiting_approval");
+		await writeRunMarker(ctx, "awaiting_approval");
+		persist();
+		updateStatus(ctx);
+		if (reason === "mutation") {
+			ctx.ui.notify(
+				`${formatHandoffNotification({ status: state.handoffStatus, warnings })}\nRequest approval by writing \`${state.planSlug}\` to xd://propose.`,
+				"info",
+			);
+		}
+		return true;
 	}
 
 	/**
@@ -273,22 +457,23 @@ export default function leanflow(pi: ExtensionAPI): void {
 	 * without approving. Require its post-proposal synthetic developer prompt to
 	 * name the exact artifact proposed by this workflow.
 	 */
-	function nativeApprovalConfirmed(ctx: ExtensionContext, messages?: readonly unknown[]): boolean {
+	async function nativeApprovalConfirmed(ctx: ExtensionContext, messages?: readonly unknown[]): Promise<boolean> {
 		if (state.phase === "building") return true;
 		const artifact = state.proposedPlanArtifact;
-		if (state.phase !== "awaiting_approval" || !artifact) return false;
-		if (state.approvedPlanArtifact !== artifact) {
-			if (state.proposalBoundary === undefined) return false;
-			const branch = ctx.sessionManager.getBranch();
-			if (!hasPlanModeExitAfter(branch, state.proposalBoundary)) return false;
-			const promptArtifact =
-				messages?.reduceRight<string | undefined>((match, message) => match ?? approvedPlanArtifact(message), undefined) ??
-				approvedArtifactAfter(branch, state.proposalBoundary);
-			if (promptArtifact !== artifact) return false;
-			state.approvedPlanArtifact = artifact;
-		}
+		if (state.phase !== "awaiting_approval" || !artifact || state.proposalBoundary === undefined) return false;
+		const branch = ctx.sessionManager.getBranch();
+		if (!hasPlanModeExitAfter(branch, state.proposalBoundary)) return false;
+		const promptArtifact =
+			messages?.reduceRight<string | undefined>((match, message) => match ?? approvedPlanArtifact(message), undefined) ??
+			approvedArtifactAfter(branch, state.proposalBoundary);
+		if (promptArtifact !== artifact) return false;
+		if (!(await refreshCanonicalPlanState(ctx, "approval"))) return false;
+
+		state.approvedPlanArtifact = artifact;
+		state.proposedPlanDigest = state.planDigest;
 		transitionPhase(state, "building");
 		state.writtenArtifacts = [];
+		await writeRunMarker(ctx, "building");
 		persist();
 		return true;
 	}
@@ -310,17 +495,20 @@ export default function leanflow(pi: ExtensionAPI): void {
 				type: "custom",
 				customType: CUSTOM_TYPE,
 				data: {
-					phase: "building",
-					phaseStartedAt: now,
+					phase: "awaiting_approval",
+					phaseStartedAt: marker.phaseStartedAt,
 					runId: marker.runId,
 					scoutCalls: marker.scoutCalls,
 					gateCalls: 0,
 					gateAttempt: 0,
 					planSlug: marker.planSlug,
 					planArtifact: marker.planArtifact,
+					planDigest: marker.planDigest,
+					proposedPlanDigest: marker.planDigest,
 					proposedPlanArtifact: marker.planArtifact,
-					approvedPlanArtifact: marker.planArtifact,
-					runMarkerArtifact: runMarkerArtifact(marker.planSlug),
+					approvedPlanArtifact: undefined,
+					runMarkerArtifact: runMarkerArtifact(marker.planSlug, marker.runId),
+					runMarkerStatus: marker.status,
 					lspProbeStatus: marker.lspProbeStatus,
 					startedAt: marker.startedAt,
 					handoffStatus: marker.handoffStatus,
@@ -330,45 +518,72 @@ export default function leanflow(pi: ExtensionAPI): void {
 				},
 			},
 		]);
+		if (!(await refreshCanonicalPlanState(ctx, "recovery"))) return true;
+		state.approvedPlanArtifact = marker.planArtifact;
+		state.proposedPlanDigest = state.planDigest;
+		transitionPhase(state, "building", now);
+		await writeRunMarker(ctx, "building");
 		persist();
 		return true;
 	}
 
-	function finishGateResult(verdict: "PASS" | "FAIL" | undefined, isError: boolean, ctx: ExtensionContext): void {
-		const repaired = state.gateCalls < 2;
+	async function finishGateResult(
+		verdict: "PASS" | "FAIL" | undefined,
+		isError: boolean,
+		ctx: ExtensionContext,
+	): Promise<void> {
+		const retryAvailable = state.gateCalls < 2;
 		if (verdict === "PASS") {
-			recordStats(() => recordGatePass(state, state.gateAttempt > 1), false);
-			transitionPhase(state, "idle");
+			const followedImplementationRepair = state.gateRetryMode === "repair";
+			state.gateRetryMode = undefined;
+			recordStats(() => recordGatePass(state, followedImplementationRepair), false);
+			transitionPhase(state, "finalizing");
+			await writeRunMarker(ctx, "completed");
 			persist();
 			updateStatus(ctx);
-			ctx.ui.notify("LeanFlow: Gate PASS. Run complete.", "info");
+			ctx.ui.notify("LeanFlow: Gate PASS. Finalizing the run.", "info");
 			return;
 		}
 
-		recordStats(
-			() => {
-				if (isError || verdict === undefined) {
-					recordGateError(state, repaired);
-				} else {
-					recordGateFailure(state, repaired);
-				}
-				if (!repaired) recordTerminalFailure(state);
-			},
-			false,
-		);
-		if (repaired) {
+		if (isError || verdict === undefined) {
+			recordStats(() => {
+				recordGateError(state, false);
+				if (!retryAvailable) recordTerminalFailure(state);
+			}, false);
+			if (retryAvailable) {
+				state.gateRetryMode = "operational";
+				transitionPhase(state, "building");
+				persist();
+				updateStatus(ctx);
+				ctx.ui.notify("LeanFlow: Gate did not complete. Retry review with unchanged evidence (1 retry left).", "warning");
+				return;
+			}
+			state.gateRetryMode = undefined;
+			transitionPhase(state, "finalizing");
+			await writeRunMarker(ctx, "failed");
+			persist();
+			updateStatus(ctx);
+			ctx.ui.notify("LeanFlow: Gate did not complete (2/2). Report the operational failure.", "warning");
+			return;
+		}
+
+		recordStats(() => {
+			recordGateFailure(state, retryAvailable);
+			if (!retryAvailable) recordTerminalFailure(state);
+		}, false);
+		if (retryAvailable) {
+			state.gateRetryMode = "repair";
 			transitionPhase(state, "building");
 			state.writtenArtifacts = [];
 			persist();
 			updateStatus(ctx);
-			ctx.ui.notify(
-				"LeanFlow: Gate result unavailable or FAIL. Repair, refresh evidence, and re-gate (1 retry left).",
-				"warning",
-			);
+			ctx.ui.notify("LeanFlow: Gate returned FAIL. Repair, refresh evidence, and re-gate (1 retry left).", "warning");
 			return;
 		}
 
-		transitionPhase(state, "idle");
+		state.gateRetryMode = undefined;
+		transitionPhase(state, "finalizing");
+		await writeRunMarker(ctx, "failed");
 		persist();
 		updateStatus(ctx);
 		ctx.ui.notify("LeanFlow: Gate FAIL (2/2). Report findings and finish.", "warning");
@@ -394,7 +609,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 		const branch = ctx.sessionManager.getBranch();
 		hasPersistedLeanFlowState = hasPersistedState(branch);
 		state = restoreState(branch);
-		pendingPlanWrites.clear();
+		pendingPlanRefreshes.clear();
 		pendingLspProbes.clear();
 		pendingApprovalWrites.clear();
 		pendingGateCalls.clear();
@@ -402,6 +617,16 @@ export default function leanflow(pi: ExtensionAPI): void {
 		resumePhaseTiming(state);
 		updateStatus(ctx);
 	};
+	pi.on("agent_end", async (event, ctx) => {
+		if (
+			state.phase === "finalizing" &&
+			(typeof event !== "object" || event === null || !("willContinue" in event) || event.willContinue !== true)
+		) {
+			transitionPhase(state, "idle");
+			persist();
+			updateStatus(ctx);
+		}
+	});
 	pi.on("session_start", restoreSessionState);
 	pi.on("session_switch", restoreSessionState);
 	pi.on("session_branch", restoreSessionState);
@@ -439,6 +664,13 @@ export default function leanflow(pi: ExtensionAPI): void {
 					.replace(/^-+|-+$/g, "")
 					.slice(0, 40) || "task";
 
+			if (
+				state.runMarkerArtifact &&
+				(state.runMarkerStatus === "awaiting_approval" || state.runMarkerStatus === "building")
+			) {
+				await writeRunMarker(ctx, "abandoned");
+			}
+
 			// Initialize state machine and the first observable phase.
 			const now = Date.now();
 			state = {
@@ -457,7 +689,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 			updateStatus(ctx);
 
 			// Enter native plan mode with a Planner-only prompt.
-			const prompt = buildPlanningPrompt(task, slug);
+			const prompt = buildPlanningPrompt(task, slug, state.runId!);
 			ctx.ui.setEditorText(`/plan ${prompt}`);
 		},
 	});
@@ -465,16 +697,12 @@ export default function leanflow(pi: ExtensionAPI): void {
 	// -----------------------------------------------------------------------
 	// Tool guard + phase transitions (pre-execution)
 	// -----------------------------------------------------------------------
-
 	pi.on("tool_call", async (event, ctx) => {
 		if (state.phase === "idle") return;
 
-		// Guard: block forbidden agent spawns via `task` tool.
 		if (isTaskToolCall(event)) {
 			const guard = checkTaskGuard(state.phase, event.input);
-			if (guard.block) {
-				return { block: true, reason: guard.reason };
-			}
+			if (guard.block) return { block: true, reason: guard.reason };
 
 			const roles = extractAgentRoles(event.input);
 			const budget = checkAgentBudget(state, roles);
@@ -483,7 +711,6 @@ export default function leanflow(pi: ExtensionAPI): void {
 			const scoutCount = roles.filter((role) => role === "scout").length;
 			const gateCount = roles.filter((role) => role === "gate").length;
 			if (gateCount > 0) {
-				// Readiness is still checked before any Gate attempt is counted.
 				const missing = missingArtifacts(state);
 				if (missing.length > 0) {
 					recordStats(() => recordGateReadinessBlock(state));
@@ -494,7 +721,6 @@ export default function leanflow(pi: ExtensionAPI): void {
 				}
 			}
 
-			// Every preflight passed; mutate exact request counts atomically.
 			state.scoutCalls += scoutCount;
 			if (gateCount === 1) {
 				state.gateCalls++;
@@ -508,40 +734,102 @@ export default function leanflow(pi: ExtensionAPI): void {
 			}
 		}
 
-		const approvalConfirmed = state.phase === "building" || (state.phase === "awaiting_approval" && nativeApprovalConfirmed(ctx));
 		const canonicalPlanArtifact = expectedPlanArtifact(state);
-		// Refine keeps native plan mode active, so revised canonical plans remain assessable.
+		const canonicalPlanMutation =
+			canonicalPlanArtifact !== undefined && toolTargetsPath(event, canonicalPlanArtifact);
+		const canonicalPlanOnlyMutation =
+			canonicalPlanArtifact !== undefined && toolTargetsOnlyPath(event, canonicalPlanArtifact);
 		if (
-			isWriteToolCall(event) &&
-			canonicalPlanArtifact !== undefined &&
-			(state.phase === "planning" || (state.phase === "awaiting_approval" && !approvalConfirmed)) &&
-			event.input.path === canonicalPlanArtifact
+			state.phase === "planning" &&
+			state.approvalInvalidated &&
+			isBuildAction(event) &&
+			!canonicalPlanOnlyMutation
 		) {
-			pendingPlanWrites.set(event.toolCallId, { content: event.input.content, path: canonicalPlanArtifact });
+			return {
+				block: true,
+				reason: "LeanFlow: the final approved plan became invalid; repair and re-propose it before repository mutations.",
+			};
+		}
+
+		const approvalConfirmed =
+			state.phase === "building" || (state.phase === "awaiting_approval" && (await nativeApprovalConfirmed(ctx)));
+		if (
+			state.phase === "planning" &&
+			state.approvalInvalidated &&
+			isBuildAction(event) &&
+			!canonicalPlanOnlyMutation
+		) {
+			return {
+				block: true,
+				reason: "LeanFlow: the final approved plan became invalid; repair and re-propose it before repository mutations.",
+			};
+		}
+		if (
+			canonicalPlanMutation &&
+			(state.phase === "building" || state.phase === "gating" || state.phase === "finalizing")
+		) {
+			return {
+				block: true,
+				reason: "LeanFlow: the approved canonical plan is immutable after BUILD begins.",
+			};
+		}
+
+
+		if (
+			canonicalPlanMutation &&
+			(state.phase === "planning" || (state.phase === "awaiting_approval" && !approvalConfirmed))
+		) {
+			pendingPlanRefreshes.add(event.toolCallId);
 		}
 
 		const diagnosticsTarget = lspDiagnosticsTarget(event);
-		if (state.phase === "building" && state.lspProbeStatus === "pending" && diagnosticsTarget !== undefined) {
+		if (
+			state.phase === "building" &&
+			state.lspProbeStatus === "pending" &&
+			diagnosticsTarget !== undefined &&
+			(await isUsableLspTarget(ctx, diagnosticsTarget))
+		) {
 			pendingLspProbes.set(event.toolCallId, diagnosticsTarget);
 		}
 
-		if (state.phase === "awaiting_approval" && !approvalConfirmed && isProposalWrite(event)) {
+		if (isProposalWrite(event)) {
+			if (state.phase !== "awaiting_approval" || approvalConfirmed) {
+				return {
+					block: true,
+					reason: "LeanFlow: approval is only allowed after the current canonical plan passes handoff assessment.",
+				};
+			}
+			if (
+				state.approvalRepairBoundary !== undefined &&
+				!hasPlanModeEntryAfter(ctx.sessionManager.getBranch(), state.approvalRepairBoundary)
+			) {
+				return {
+					block: true,
+					reason: "LeanFlow: re-enter native plan mode for the queued local repair before requesting approval again.",
+				};
+			}
 			const expected = state.planArtifact ?? canonicalPlanArtifact;
 			if (
 				!expected ||
 				event.input.content.trim() !== state.planSlug ||
 				!state.runId ||
-				state.runMarkerArtifact !== (state.planSlug ? runMarkerArtifact(state.planSlug) : undefined)
+				!(await readRunMarker(ctx, expected))
 			) {
 				return {
 					block: true,
 					reason: "LeanFlow: write the canonical plan and durable run marker before proposing its exact slug.",
 				};
 			}
+			if (!(await refreshCanonicalPlanState(ctx, "proposal"))) {
+				return {
+					block: true,
+					reason: "LeanFlow: the current canonical plan is invalid; repair it before requesting approval.",
+				};
+			}
 			pendingApprovalWrites.set(event.toolCallId, expected);
 		}
 
-		if (state.phase === "awaiting_approval" && isBuildAction(event)) {
+		if (state.phase === "awaiting_approval" && isBuildAction(event) && !canonicalPlanOnlyMutation) {
 			return {
 				block: true,
 				reason: "LeanFlow: the plan is still awaiting exact native approval; approve its proposed artifact before starting BUILD.",
@@ -552,6 +840,12 @@ export default function leanflow(pi: ExtensionAPI): void {
 				block: true,
 				reason:
 					"LeanFlow: before the first build action, write a valid diagnostics request for a planned source path (or `*`) to xd://lsp and wait for its result. Record an unavailable or no-server result as fallback.",
+			};
+		}
+		if (state.phase === "finalizing" && isBuildAction(event)) {
+			return {
+				block: true,
+				reason: "LeanFlow: repository mutations are not allowed while the terminal response is finalizing.",
 			};
 		}
 
@@ -572,9 +866,11 @@ export default function leanflow(pi: ExtensionAPI): void {
 			if (event.isError) return;
 			state.proposalBoundary = ctx.sessionManager.getBranch().length;
 			state.proposedPlanArtifact = artifact;
+			state.approvalRepairBoundary = undefined;
 			state.approvedPlanArtifact = undefined;
+			state.proposedPlanDigest = state.planDigest;
 			state.lspProbeTarget = undefined;
-			await writeRunMarker(ctx);
+			await writeRunMarker(ctx, "awaiting_approval");
 			persist();
 			updateStatus(ctx);
 			return;
@@ -590,47 +886,10 @@ export default function leanflow(pi: ExtensionAPI): void {
 			return;
 		}
 
-		// Failed plan/artifact writes must not leave stale pending bookkeeping.
-		if (event.toolName === "write" && pendingPlanWrites.has(event.toolCallId)) {
-			const plan = pendingPlanWrites.get(event.toolCallId)!;
-			pendingPlanWrites.delete(event.toolCallId);
+		if (pendingPlanRefreshes.has(event.toolCallId)) {
+			pendingPlanRefreshes.delete(event.toolCallId);
 			if (event.isError) return;
-
-			// Handoff: plan was written successfully → assess, then await approval.
-			const result = assessHandoff(plan.content);
-			state.planArtifact = plan.path;
-			state.handoffStatus = result.status;
-			state.handoffWarnings = result.warnings;
-			state.proposalBoundary = undefined;
-			state.proposedPlanArtifact = undefined;
-			state.approvedPlanArtifact = undefined;
-			state.lspProbeStatus = lspStatusFromPlan(plan.content);
-			state.lspProbeTarget = undefined;
-			state.runMarkerArtifact = undefined;
-
-			if (result.status === "NEEDS_UPDATE") {
-				// Critically incomplete — stay in planning, advise revision.
-				transitionPhase(state, "planning");
-				persist();
-				updateStatus(ctx);
-				ctx.ui.notify(formatHandoffNotification(result), "warning");
-			} else {
-				// Plan artifact ready — persist the minimal cross-session marker, then await approval.
-				transitionPhase(state, "awaiting_approval");
-				if (!(await writeRunMarker(ctx))) {
-					transitionPhase(state, "planning");
-					persist();
-					updateStatus(ctx);
-					ctx.ui.notify("LeanFlow: could not persist the fresh-session run marker; approval remains blocked.", "error");
-					return;
-				}
-				persist();
-				updateStatus(ctx);
-				ctx.ui.notify(
-					`${formatHandoffNotification(result)}\nRequest approval by writing \`${state.planSlug}\` to xd://propose.`,
-					"info",
-				);
-			}
+			await refreshCanonicalPlanState(ctx, "mutation");
 			return;
 		}
 
@@ -647,7 +906,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 
 		if (event.toolName === "task" && pendingGateCalls.has(event.toolCallId)) {
 			pendingGateCalls.delete(event.toolCallId);
-			finishGateResult(event.isError ? undefined : extractVerdict(event.content), event.isError, ctx);
+			await finishGateResult(event.isError ? undefined : extractVerdict(event.content), event.isError, ctx);
 			return;
 		}
 	});
@@ -660,7 +919,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 		const messages = event.messages;
 		const recovered = await recoverFreshApprovedPlan(ctx, messages);
 		if (recovered) updateStatus(ctx);
-		if (state.phase === "awaiting_approval" && !recovered && !nativeApprovalConfirmed(ctx, messages)) return;
+		if (state.phase === "awaiting_approval" && !recovered && !(await nativeApprovalConfirmed(ctx, messages))) return;
 		const filtered = filterForBuilder(messages, state);
 		if (!filtered) return;
 
@@ -681,6 +940,23 @@ export default function leanflow(pi: ExtensionAPI): void {
 		recordStats(() => addUsage(state, usage ? { input: usage.input, output: usage.output, cacheRead: usage.cacheRead } : {}));
 	});
 	// -----------------------------------------------------------------------
+
+	pi.registerCommand("flowcancel", {
+		description: "Cancel the active LeanFlow run and invalidate its recovery marker.",
+		handler: async (_args, ctx) => {
+			if (state.phase === "idle") {
+				ctx.ui.notify("LeanFlow: no active run to cancel.", "warning");
+				return;
+			}
+			if (state.runMarkerStatus === "awaiting_approval" || state.runMarkerStatus === "building") {
+				await writeRunMarker(ctx, "abandoned");
+			}
+			transitionPhase(state, "idle");
+			persist();
+			updateStatus(ctx);
+			ctx.ui.notify("LeanFlow: run cancelled and recovery marker abandoned.", "info");
+		},
+	});
 
 	pi.registerCommand("flowstats", {
 		description: "Show LeanFlow run statistics (per-phase tokens, context reduction).",
@@ -751,7 +1027,7 @@ function missingArtifacts(state: LeanFlowState): string[] {
 // Planner-only prompt — no Gate schema, no build artifact detail
 // ---------------------------------------------------------------------------
 
-function buildPlanningPrompt(task: string, slug: string): string {
+function buildPlanningPrompt(task: string, slug: string, runId: string): string {
 	return [
 		`You are LeanFlow Planner (@plan). Task: ${task}`,
 		"",
@@ -766,7 +1042,8 @@ function buildPlanningPrompt(task: string, slug: string): string {
 		`Write to local://${slug}-plan.md. It is a decision document covering:`,
 		"what changes, which files/symbols, how it will be verified, and key assumptions.",
 		"The Builder needs no planning reasoning — only the decisions.",
-		"Include exactly one metadata line: `LSP applicability: required` for source/code changes, or `LSP applicability: not_required` only for documentation, static resources, or other changes with no serviceable source path. Missing/invalid metadata fails safe as required.",
+		`Include exactly one identity line outside fenced code: \`LeanFlow run ID: ${runId}\`. Approval is blocked if it is missing, duplicated, or changed.`,
+		"Include exactly one metadata line outside fenced code: `LSP applicability: required` for source/code changes, or `LSP applicability: not_required` only for documentation, static resources, or other changes with no serviceable source path. Missing, duplicated, or invalid metadata fails safe as required.",
 		"",
 		"## Scout (optional, max 3)",
 		"```text",

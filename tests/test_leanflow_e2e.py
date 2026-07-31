@@ -107,6 +107,13 @@ class WorkflowPromptTest(unittest.TestCase):
         self.assertIn("approvedPlanArtifact", context)
         self.assertIn("Plan approved", context)
 
+    def test_gate_conditionally_accepts_lsp_not_required(self) -> None:
+        """Documentation-only plans may reach Gate without a meaningless probe."""
+        gate = (ROOT / "agents" / "gate.md").read_text(encoding="utf-8")
+        self.assertIn("For `not_required`, do not require a probe", gate)
+        self.assertIn("final diff contains no LSP-serviceable source changes", gate)
+        self.assertIn("Missing, invalid, duplicated, or diff-contradicted metadata", gate)
+
     def test_gate_requires_build_evidence(self) -> None:
         """P1: Gate is blocked until build/diff/evidence artifacts are written."""
         state = (ROOT / "extensions" / "leanflow" / "state.ts").read_text(encoding="utf-8")

@@ -21,6 +21,7 @@ const TRACKED_PHASES: ReadonlySet<ObservablePhase> = new Set([
 	"awaiting_approval",
 	"building",
 	"gating",
+	"finalizing",
 ]);
 
 /** Add one observable Main Session provider response to the current phase. */
@@ -185,7 +186,8 @@ function isTrackedPhase(phase: LeanFlowPhase): phase is ObservablePhase {
 }
 
 function phaseMetricKey(phase: ObservablePhase): "planning" | "awaitingApproval" | "building" | "gating" {
-	return phase === "awaiting_approval" ? "awaitingApproval" : phase;
+	if (phase === "awaiting_approval") return "awaitingApproval";
+	return phase === "finalizing" ? "gating" : phase;
 }
 
 function serializeValue(value: unknown, ancestors: Set<object>, inArray: boolean): string | undefined {

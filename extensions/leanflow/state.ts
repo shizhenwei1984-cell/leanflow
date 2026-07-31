@@ -6,14 +6,15 @@
  * survive compaction, so the state machine recovers without conversation history.
  *
  * Phase lifecycle:
- *   idle → planning → awaiting_approval → building → gating → idle
+ *   idle → planning → awaiting_approval → building → gating → finalizing → idle
  *
  * Transitions:
  *   write canonical plan artifact → awaiting_approval (plan exists; not yet approved)
- *   native approved-plan prompt + completed LSP diagnostics + first build action → building
+ *   native approved-plan prompt    → building
  *   task(gate)                     → gating
- *   Gate PASS / 2nd FAIL  → idle
- *   Gate 1st FAIL         → building (repair)
+ *   Gate PASS / 2nd FAIL           → finalizing
+ *   settled final response         → idle
+ *   Gate 1st FAIL                  → building (repair)
  */
 
 export type LeanFlowPhase =
@@ -21,7 +22,9 @@ export type LeanFlowPhase =
 	| "planning"
 	| "awaiting_approval"
 	| "building"
-	| "gating";
+	| "gating"
+	| "finalizing";
+export type RunMarkerStatus = "awaiting_approval" | "building" | "completed" | "failed" | "abandoned" | "invalidated";
 
 export type ObservablePhase = Exclude<LeanFlowPhase, "idle">;
 
@@ -78,10 +81,14 @@ export interface LeanFlowState {
 	gateAttempt: number;
 	/** Stable opaque identity persisted in the fresh-session run marker. */
 	runId?: string;
+	/** Why BUILD resumed after a Gate attempt. */
+	gateRetryMode?: "repair" | "operational";
 	/** Stable slug naming all canonical workflow artifacts. */
 	planSlug?: string;
 	/** Canonical local:// plan artifact written for this run. */
 	planArtifact?: string;
+	/** SHA-256 of the latest assessed canonical plan content. */
+	planDigest?: string;
 	startedAt?: number;
 	handoffStatus?: HandoffStatus;
 	handoffWarnings?: string[];
@@ -91,8 +98,16 @@ export interface LeanFlowState {
 	proposedPlanArtifact?: string;
 	/** Canonical artifact named by OMP's native approved-plan execution prompt. */
 	approvedPlanArtifact?: string;
+	/** Plan digest captured when the current approval proposal completed. */
+	proposedPlanDigest?: string;
+	/** Native approval saw an invalid final plan; repository mutations stay locked. */
+	approvalInvalidated?: boolean;
+	/** Branch boundary after invalid approval; re-proposal requires a later native plan-mode entry. */
+	approvalRepairBoundary?: number;
 	/** Durable marker copied with local:// artifacts into an approved fresh session. */
 	runMarkerArtifact?: string;
+	/** Latest durable lifecycle status written to the run marker. */
+	runMarkerStatus?: RunMarkerStatus;
 	/** Whether a valid diagnostics probe is required, pending, or completed. */
 	lspProbeStatus: LspProbeStatus;
 	/** Path (or `*`) passed to the completed diagnostics probe. */
@@ -166,13 +181,19 @@ function normalizeState(value: LeanFlowState | undefined): LeanFlowState {
 		planSlug: typeof state.planSlug === "string" ? state.planSlug : undefined,
 		planArtifact: typeof state.planArtifact === "string" ? state.planArtifact : undefined,
 		startedAt: optionalNumber(state.startedAt),
+		gateRetryMode: state.gateRetryMode === "repair" || state.gateRetryMode === "operational" ? state.gateRetryMode : undefined,
 		handoffStatus: isHandoffStatus(state.handoffStatus) ? state.handoffStatus : undefined,
 		handoffWarnings: Array.isArray(state.handoffWarnings) ? state.handoffWarnings.filter((v) => typeof v === "string") : undefined,
 		proposalBoundary: optionalNumber(state.proposalBoundary),
+		planDigest: typeof state.planDigest === "string" ? state.planDigest : undefined,
 		proposedPlanArtifact: typeof state.proposedPlanArtifact === "string" ? state.proposedPlanArtifact : undefined,
 		approvedPlanArtifact: typeof state.approvedPlanArtifact === "string" ? state.approvedPlanArtifact : undefined,
 		runMarkerArtifact: typeof state.runMarkerArtifact === "string" ? state.runMarkerArtifact : undefined,
+		runMarkerStatus: isRunMarkerStatus(state.runMarkerStatus) ? state.runMarkerStatus : undefined,
 		lspProbeStatus: normalizeLspProbeStatus(state),
+		proposedPlanDigest: typeof state.proposedPlanDigest === "string" ? state.proposedPlanDigest : undefined,
+		approvalInvalidated: state.approvalInvalidated === true,
+		approvalRepairBoundary: optionalNumber(state.approvalRepairBoundary),
 		lspProbeTarget: typeof state.lspProbeTarget === "string" ? state.lspProbeTarget : undefined,
 		writtenArtifacts: Array.isArray(state.writtenArtifacts) ? state.writtenArtifacts.filter((v) => typeof v === "string") : undefined,
 		stats: normalizeStats(state.stats),
@@ -243,7 +264,11 @@ function normalizeLspProbeStatus(state: LeanFlowState): LspProbeStatus {
 }
 
 function isPhase(value: unknown): value is LeanFlowPhase {
-	return value === "idle" || value === "planning" || value === "awaiting_approval" || value === "building" || value === "gating";
+	return value === "idle" || value === "planning" || value === "awaiting_approval" || value === "building" || value === "gating" || value === "finalizing";
+}
+
+function isRunMarkerStatus(value: unknown): value is RunMarkerStatus {
+	return value === "awaiting_approval" || value === "building" || value === "completed" || value === "failed" || value === "abandoned" || value === "invalidated";
 }
 
 function isHandoffStatus(value: unknown): value is HandoffStatus {

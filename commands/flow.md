@@ -57,7 +57,8 @@ task({
 ```
 
 4. Planner owns completeness, runtime feasibility, acceptance coverage, and implementation feasibility. Convert Scout facts into decisions; do not call a reviewer or audit role.
-5. Write the decision-complete canonical plan in Simplified Chinese to `local://<slug>-plan.md`. Include exact paths/symbols, ordered implementation steps, edge cases, executable verification, and exactly one metadata line: `LSP applicability: required` for source/code changes or `LSP applicability: not_required` only for documentation/static-resource work with no serviceable source path. Missing or invalid metadata fails safe as `required`. Preserve technical identifiers exactly as required by the USER LANGUAGE policy.
+5. Write the decision-complete canonical plan in Simplified Chinese to `local://<slug>-plan.md`. Include exact paths/symbols, ordered implementation steps, edge cases, executable verification, exactly one extension-provided `LeanFlow run ID: <uuid>` identity line outside fenced code, and exactly one metadata line outside fenced code: `LSP applicability: required` for source/code changes or `LSP applicability: not_required` only for documentation/static-resource work with no serviceable source path. Missing, duplicated, changed, or invalid metadata blocks approval or fails safe as `required`. Preserve technical identifiers exactly as required by the USER LANGUAGE policy.
+   Any later canonical-plan `edit` is reread and reassessed by the extension. After each plan change, wait for handoff status and request approval again; never call `xd://propose` while still in `planning` or `NEEDS_UPDATE`.
 6. Request approval only by writing `<slug>` to `xd://propose`.
 
 ## BUILD

@@ -45,7 +45,7 @@ export function findApprovedPlanBoundary(messages: AgentMessage[], artifact: str
  * Builder context through building.
  */
 export function filterForBuilder(messages: AgentMessage[], state: LeanFlowState): AgentMessage[] | undefined {
-	if (state.phase !== "building" && state.phase !== "awaiting_approval") return undefined;
+	if (state.phase !== "building" && state.phase !== "awaiting_approval" && state.phase !== "finalizing") return undefined;
 	const artifact = state.approvedPlanArtifact;
 	if (!artifact) return undefined;
 
@@ -83,29 +83,45 @@ function isTextBlock(block: unknown): block is { type: "text"; text: string } {
 
 function buildBuilderPreamble(state: LeanFlowState): string {
 	const slug = state.planSlug ?? "<slug>";
+	if (state.phase === "finalizing") {
+		return [
+			"LeanFlow terminal response:",
+			"",
+			state.runMarkerStatus === "completed"
+				? "Gate passed."
+				: "Gate did not pass within the bounded retry budget.",
+			"",
+			"Do not call tools, modify files, or invoke Gate again.",
+			"Briefly report the terminal outcome and relevant findings to the user, then stop.",
+		].join("\n");
+	}
 	const lines = [
 		"LeanFlow Builder context (injected by extension):",
 		"",
-		`Phase: building | Plan: local://${slug}-plan.md`,
+		`Phase: ${state.phase} | Plan: local://${slug}-plan.md`,
 	];
-	if (state.gateAttempt > 0) {
-		lines.push(`Gate attempt: ${state.gateAttempt}/2 — this is a repair round.`);
+	if (state.gateRetryMode === "repair") {
+		lines.push(`Gate attempt: ${state.gateAttempt}/2 — repair the implementation and refresh evidence.`);
+	} else if (state.gateRetryMode === "operational") {
+		lines.push(`Gate attempt: ${state.gateAttempt}/2 — Gate did not complete; retry Gate with unchanged evidence.`);
 	}
 	if (state.handoffWarnings && state.handoffWarnings.length > 0) {
 		lines.push(`Handoff warnings: ${state.handoffWarnings.join("; ")}`);
 	}
-	lines.push(
-		"",
-		"Read the approved plan, implement it, run verification, and write:",
-		`  local://${slug}-build.md, local://${slug}-diff.md, local://${slug}-evidence.md`,
-	);
-	if (state.lspProbeStatus === "not_required") {
-		lines.push("The approved plan declares LSP not required for this documentation/resource-only change.");
-	} else {
+	if (state.gateRetryMode !== "operational") {
 		lines.push(
-			"Before Baseline HEAD or any other build action, run LSP diagnostics for the first planned source path (or `*` when none is planned) and wait for its result. This runtime probe is the authoritative LSP configuration detector for project, user/profile, plugin, marketplace, and auto-detected servers. Record the target, responding server or no server, result, and fallback.",
-			"For each changed source path served by LSP, attempt diagnostics before and after edits; a new file has no pre-edit baseline and is checked after creation. Attempt references before exported-symbol edits. Record every probe/request/result in build.md and evidence.md. Repair all introduced errors and warnings; a completed no-server/error probe is a fallback, never a substitute for compiler checks, executable tests, or runtime smoke validation.",
+			"",
+			"Read the approved plan, implement it, run verification, and write:",
+			`  local://${slug}-build.md, local://${slug}-diff.md, local://${slug}-evidence.md`,
 		);
+		if (state.lspProbeStatus === "not_required") {
+			lines.push("The approved plan declares LSP not required for this documentation/resource-only change.");
+		} else {
+			lines.push(
+				"Before Baseline HEAD or any other build action, run LSP diagnostics for the first planned source path (or `*` when none is planned) and wait for its result. This runtime probe is the authoritative LSP configuration detector for project, user/profile, plugin, marketplace, and auto-detected servers. Record the target, responding server or no server, result, and fallback.",
+				"For each changed source path served by LSP, attempt diagnostics before and after edits; a new file has no pre-edit baseline and is checked after creation. Attempt references before exported-symbol edits. Record every probe/request/result in build.md and evidence.md. Repair all introduced errors and warnings; a completed no-server/error probe is a fallback, never a substitute for compiler checks, executable tests, or runtime smoke validation.",
+			);
+		}
 	}
 	lines.push(
 		"Then call Gate:",

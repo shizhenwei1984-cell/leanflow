@@ -36,6 +36,7 @@ const ALLOWED_BY_PHASE: Record<LeanFlowPhase, readonly LeanFlowAgentRole[]> = {
 	awaiting_approval: [],
 	building: ["gate"],
 	gating: [],
+	finalizing: [],
 };
 
 export interface GuardResult {
