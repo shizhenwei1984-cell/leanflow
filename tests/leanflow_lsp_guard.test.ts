@@ -1243,6 +1243,21 @@ test("fresh recovery locks invalid, expired, corrupt, and ambiguous identities",
 		)!,
 		JSON.stringify(secondMarker),
 	);
+	const corruptPointer = createHarness();
+	const corruptPointerRunId = "4f414c4c-8f8f-4dca-8df3-9e0fabada555";
+	const corruptPointerPlan = validPlan(corruptPointerRunId);
+	const corruptPointerPlanPath = resolveRunMarkerPath(
+		corruptPointer.ctx.localProtocolOptions,
+		"local://example-plan.md",
+	)!;
+	writeFileSync(corruptPointerPlanPath, corruptPointerPlan);
+	writeFileSync(
+		resolveRunMarkerPath(corruptPointer.ctx.localProtocolOptions, "local://example-leanflow-active.json")!,
+		"{",
+	);
+	expect(await corruptPointer.handlers.get("context")!({ messages: approvalMessages }, corruptPointer.ctx)).toBeUndefined();
+	expect(corruptPointer.states.at(-1)).toMatchObject({ phase: "planning", approvalInvalidated: true });
+
 	expect(await ambiguous.handlers.get("context")!({ messages: approvalMessages }, ambiguous.ctx)).toBeUndefined();
 	expect(ambiguous.states.at(-1)).toMatchObject({ phase: "planning", approvalInvalidated: true });
 });
