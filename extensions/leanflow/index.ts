@@ -27,7 +27,6 @@ import * as fsSync from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolCallEvent } from "@oh-my-pi/pi-coding-agent";
-import { resolvePlanPath } from "@oh-my-pi/pi-coding-agent/tools/plan-mode-guard";
 import { approvedPlanArtifact, filterForBuilder } from "./context";
 import { CUSTOM_TYPE, defaultState, defaultStats, hasPersistedState, restoreState } from "./state";
 import type { LeanFlowState } from "./state";
@@ -168,6 +167,32 @@ function expectedPlanArtifact(state: LeanFlowState): string | undefined {
 
 
 
+function unwrapHashlineTarget(rawTarget: string): string {
+	const trimmed = rawTarget.trimEnd();
+	if (!trimmed.startsWith("[") || !trimmed.endsWith("]")) return rawTarget;
+	const inner = trimmed.slice(1, -1);
+	const tag = /#[0-9A-Fa-f]{4}$/.exec(inner);
+	const target = tag ? inner.slice(0, tag.index) : inner;
+	return target && !target.includes("#") ? target : rawTarget;
+}
+
+function resolveLocalTarget(ctx: ExtensionContext, target: string): string | undefined {
+	if (!ctx.localProtocolOptions) return undefined;
+	const root = resolveRunMarkerPath(ctx.localProtocolOptions, "local://");
+	if (!root) return undefined;
+	let relative: string;
+	try {
+		relative = decodeURIComponent(target.slice("local://".length).replaceAll("\\", "/").replace(/^\/+/, ""));
+	} catch {
+		return undefined;
+	}
+	if (relative.includes("\0") || path.isAbsolute(relative)) return undefined;
+	const normalized = path.posix.normalize(relative);
+	if (normalized === ".." || normalized.startsWith("../")) return undefined;
+	const resolved = path.resolve(root, normalized === "." ? "" : normalized);
+	return resolved === root || resolved.startsWith(`${root}${path.sep}`) ? resolved : undefined;
+}
+
 function normalizeFilesystemIdentity(target: string): string {
 	const absolute = path.resolve(target);
 	let existing = absolute;
@@ -185,11 +210,16 @@ function normalizeFilesystemIdentity(target: string): string {
 }
 
 function resolveLeanFlowTarget(ctx: ExtensionContext, rawTarget: string): string | undefined {
-	try {
-		return normalizeFilesystemIdentity(resolvePlanPath(ctx as never, rawTarget));
-	} catch {
-		return undefined;
+	const unwrapped = unwrapHashlineTarget(rawTarget);
+	const target = unwrapped.replace(/^(local:)\/(?!\/)/, "$1//");
+	if (target.startsWith("local://")) {
+		const resolved = resolveLocalTarget(ctx, target);
+		return resolved ? normalizeFilesystemIdentity(resolved) : undefined;
 	}
+	if (/^[a-z][a-z0-9+.-]*:\/\//i.test(target)) return undefined;
+	const expanded = target === "~" ? os.homedir() : target.startsWith("~/") ? path.join(os.homedir(), target.slice(2)) : target;
+	const resolved = /^\/+$/.test(expanded) ? ctx.cwd : path.isAbsolute(expanded) ? expanded : path.resolve(ctx.cwd, expanded);
+	return normalizeFilesystemIdentity(resolved);
 }
 
 function toolTargets(event: ToolCallEvent): string[] {
