@@ -109,7 +109,7 @@ test("restore normalizes an older persisted state without new metric fields", ()
 
 	expect(restored.phase).toBe("building");
 	expect(restored.phaseStartedAt).toBeUndefined();
-	expect(restored.lspProbeCompleted).toBe(false);
+	expect(restored.lspProbeStatus).toBe("pending");
 	expect(restored.stats?.planning.responses).toBe(0);
 	expect(restored.stats?.awaitingApproval.elapsedMs).toBe(0);
 	expect(restored.stats?.beforeMessages).toBe(4);
@@ -122,12 +122,12 @@ test("restored phases restart timing observation without charging inactive time"
 	const original = defaultState();
 	original.phase = "building";
 	original.phaseStartedAt = 100;
-	original.lspProbeCompleted = true;
+	original.lspProbeStatus = "completed";
 	original.lspProbeTarget = "*";
 	const restored = restoreState([{ type: "custom", customType: CUSTOM_TYPE, data: original }]);
 
 	resumePhaseTiming(restored, 1_000_000);
-	expect(restored).toMatchObject({ lspProbeCompleted: true, lspProbeTarget: "*" });
+	expect(restored).toMatchObject({ lspProbeStatus: "completed", lspProbeTarget: "*" });
 	transitionPhase(restored, "idle", 1_000_010);
 	expect(restored.stats?.building.elapsedMs).toBe(10);
 });
@@ -173,7 +173,7 @@ test("filtering survives an unavailable byte observation and preserves builder e
 	const planningHistory: AgentMessage = { role: "user", content: "planning history", timestamp: 2 };
 	const approval = {
 		role: "developer",
-		content: "Plan approved.\n\n<instruction>\nYou MUST read local://metrics-plan.md before executing.\n</instruction>",
+		content: "Plan approved.\n\n<instruction>\nYou MUST read `local://metrics-plan.md` before executing.\n</instruction>",
 		timestamp: 3,
 	} as unknown as AgentMessage;
 	const postApproval: AgentMessage = { role: "user", content: "implement", timestamp: 4 };
@@ -195,7 +195,7 @@ test("filtering starts at the exact native approval identity", () => {
 	const firstUser: AgentMessage = { role: "user", content: "implement fallback", timestamp: 1 };
 	const approval = {
 		role: "developer",
-		content: "Plan approved.\n\n<instruction>\nYou MUST read local://fallback-plan.md before executing.\n</instruction>",
+		content: "Plan approved.\n\n<instruction>\nYou MUST read `local://fallback-plan.md` before executing.\n</instruction>",
 	} as unknown as AgentMessage;
 	const postApproval: AgentMessage = { role: "user", content: "approved", timestamp: 2 };
 
@@ -209,6 +209,12 @@ test("filtering starts at the exact native approval identity", () => {
 test("guard denies empty phases and atomically preflights actual requested role counts", () => {
 	expect(checkTaskGuard("awaiting_approval", { agent: "scout" }).block).toBe(true);
 	expect(checkTaskGuard("gating", { agent: "gate" }).block).toBe(true);
+	for (const phase of ["planning", "awaiting_approval", "building", "gating"] as const) {
+		expect(checkTaskGuard(phase, { agent: "helper" }).block).toBe(true);
+	}
+	expect(checkTaskGuard("planning", { task: "investigate" }).block).toBe(true);
+	expect(checkTaskGuard("planning", { tasks: [{ agent: "scout" }, { name: "missing-agent" }] }).block).toBe(true);
+	expect(checkTaskGuard("planning", { tasks: [{ agent: "scout", name: "review-test-coverage" }] }).block).toBe(false);
 
 	const state = { phase: "building", scoutCalls: 2, gateCalls: 1 };
 	const duplicateScouts = extractAgentRoles({

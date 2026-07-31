@@ -26,6 +26,7 @@ export type LeanFlowPhase =
 export type ObservablePhase = Exclude<LeanFlowPhase, "idle">;
 
 export type HandoffStatus = "READY" | "READY_WITH_WARNINGS" | "NEEDS_UPDATE";
+export type LspProbeStatus = "not_required" | "pending" | "completed";
 
 /** Main-session provider usage accrued while a workflow phase is active. */
 export interface PhaseMetrics {
@@ -75,6 +76,8 @@ export interface LeanFlowState {
 	gateCalls: number;
 	/** Which gate round: 0 = not yet gated, 1 = first gate, 2 = repair gate. */
 	gateAttempt: number;
+	/** Stable opaque identity persisted in the fresh-session run marker. */
+	runId?: string;
 	/** Stable slug naming all canonical workflow artifacts. */
 	planSlug?: string;
 	/** Canonical local:// plan artifact written for this run. */
@@ -88,8 +91,10 @@ export interface LeanFlowState {
 	proposedPlanArtifact?: string;
 	/** Canonical artifact named by OMP's native approved-plan execution prompt. */
 	approvedPlanArtifact?: string;
-	/** A completed diagnostics probe is required before the first build action. */
-	lspProbeCompleted: boolean;
+	/** Durable marker copied with local:// artifacts into an approved fresh session. */
+	runMarkerArtifact?: string;
+	/** Whether a valid diagnostics probe is required, pending, or completed. */
+	lspProbeStatus: LspProbeStatus;
 	/** Path (or `*`) passed to the completed diagnostics probe. */
 	lspProbeTarget?: string;
 	/** Build evidence artifacts written this round: build / diff / evidence. */
@@ -121,7 +126,7 @@ export function defaultStats(): LeanFlowStats {
 }
 
 export function defaultState(): LeanFlowState {
-	return { phase: "idle", scoutCalls: 0, gateCalls: 0, gateAttempt: 0, lspProbeCompleted: false, stats: defaultStats() };
+	return { phase: "idle", scoutCalls: 0, gateCalls: 0, gateAttempt: 0, lspProbeStatus: "pending", stats: defaultStats() };
 }
 
 interface BranchEntry {
@@ -157,6 +162,7 @@ function normalizeState(value: LeanFlowState | undefined): LeanFlowState {
 		scoutCalls: numberOr(state.scoutCalls, 0),
 		gateCalls: numberOr(state.gateCalls, 0),
 		gateAttempt: numberOr(state.gateAttempt, 0),
+		runId: typeof state.runId === "string" ? state.runId : undefined,
 		planSlug: typeof state.planSlug === "string" ? state.planSlug : undefined,
 		planArtifact: typeof state.planArtifact === "string" ? state.planArtifact : undefined,
 		startedAt: optionalNumber(state.startedAt),
@@ -165,7 +171,8 @@ function normalizeState(value: LeanFlowState | undefined): LeanFlowState {
 		proposalBoundary: optionalNumber(state.proposalBoundary),
 		proposedPlanArtifact: typeof state.proposedPlanArtifact === "string" ? state.proposedPlanArtifact : undefined,
 		approvedPlanArtifact: typeof state.approvedPlanArtifact === "string" ? state.approvedPlanArtifact : undefined,
-		lspProbeCompleted: state.lspProbeCompleted === true,
+		runMarkerArtifact: typeof state.runMarkerArtifact === "string" ? state.runMarkerArtifact : undefined,
+		lspProbeStatus: normalizeLspProbeStatus(state),
 		lspProbeTarget: typeof state.lspProbeTarget === "string" ? state.lspProbeTarget : undefined,
 		writtenArtifacts: Array.isArray(state.writtenArtifacts) ? state.writtenArtifacts.filter((v) => typeof v === "string") : undefined,
 		stats: normalizeStats(state.stats),
@@ -226,6 +233,13 @@ function numberOr(value: unknown, fallback: number): number {
 
 function optionalNumber(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function normalizeLspProbeStatus(state: LeanFlowState): LspProbeStatus {
+	if (state.lspProbeStatus === "not_required" || state.lspProbeStatus === "pending" || state.lspProbeStatus === "completed") {
+		return state.lspProbeStatus;
+	}
+	return (state as LeanFlowState & { lspProbeCompleted?: boolean }).lspProbeCompleted === true ? "completed" : "pending";
 }
 
 function isPhase(value: unknown): value is LeanFlowPhase {

@@ -57,7 +57,7 @@ task({
 ```
 
 4. Planner owns completeness, runtime feasibility, acceptance coverage, and implementation feasibility. Convert Scout facts into decisions; do not call a reviewer or audit role.
-5. Write the decision-complete canonical plan in Simplified Chinese to `local://<slug>-plan.md`. Include exact paths/symbols, ordered implementation steps, edge cases, and executable verification. Preserve technical identifiers exactly as required by the USER LANGUAGE policy.
+5. Write the decision-complete canonical plan in Simplified Chinese to `local://<slug>-plan.md`. Include exact paths/symbols, ordered implementation steps, edge cases, executable verification, and exactly one metadata line: `LSP applicability: required` for source/code changes or `LSP applicability: not_required` only for documentation/static-resource work with no serviceable source path. Missing or invalid metadata fails safe as `required`. Preserve technical identifiers exactly as required by the USER LANGUAGE policy.
 6. Request approval only by writing `<slug>` to `xd://propose`.
 
 ## BUILD
@@ -65,7 +65,7 @@ task({
 After approval, native plan mode exits and the same Main Session becomes Builder (`@default`). Main is the only writer.
 
 1. Re-read the approved canonical plan.
-2. Before Baseline HEAD or any other build action, run `lsp` diagnostics for the first planned source path (or `*` when no source path is planned) and wait for its result. This runtime probe is the authoritative LSP configuration detector: it resolves active project, user/profile, plugin, marketplace, and auto-detected configuration. Record its target, responding server or `no server`, result, and fallback.
+2. Before Baseline HEAD or any other build action, when the approved plan declares `LSP applicability: required` (or omits/invalidates the declaration), run `lsp` diagnostics for the first planned source path (or `*` when no source path is planned) and wait for its result. The runtime probe is the authoritative LSP configuration detector: it resolves active project, user/profile, plugin, marketplace, and auto-detected configuration. Record its target, responding server or `no server`, result, and fallback. For `not_required`, record that the documentation/static-resource-only plan intentionally skipped the probe.
 3. Record Baseline HEAD and baseline status in `local://<slug>-build.md` before edits. Preserve existing user work.
 4. Implement the approved plan; do not create an implementer, developer, coder, or builder subagent.
 5. For every changed source path served by the probe or a later LSP call, attempt diagnostics before and after editing. For a new file, record that no pre-edit baseline exists and run diagnostics after creation. Before modifying an exported symbol, attempt LSP references. Treat diagnostics as a decision signal: repair all introduced errors and warnings; record unrelated pre-existing diagnostics exactly.

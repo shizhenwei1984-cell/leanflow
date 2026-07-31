@@ -27,9 +27,7 @@ for (const [role, aliases] of Object.entries(LEANFLOW_AGENTS)) {
 	}
 }
 
-/** Agent names/roles that are always forbidden in LeanFlow. */
-const FORBIDDEN_PATTERN =
-	/audit|review(?:er)?|reaudit|coverage|runtime.?audit|schema.?audit|approval.?audit|failure.?audit|final.?audit|implementer|developer|coder|builder|architect|validator|planner/i;
+/** Agent names/roles outside the two canonical aliases are never accepted. */
 
 /** Canonical roles allowed per phase. Empty = no task spawns allowed. */
 const ALLOWED_BY_PHASE: Record<LeanFlowPhase, readonly LeanFlowAgentRole[]> = {
@@ -51,27 +49,49 @@ export function resolveRole(name: string): LeanFlowAgentRole | undefined {
 	return role === "scout" || role === "gate" ? role : undefined;
 }
 
-/** Check a `task` tool call against the phase allow-list and forbidden pattern. */
+/** Check a `task` tool call against the phase allow-list, failing closed. */
 export function checkTaskGuard(phase: LeanFlowPhase, input: Record<string, unknown>): GuardResult {
-	const names = extractAgentNames(input);
+	const spawns = extractRequestedSpawns(input);
 	const allowed = ALLOWED_BY_PHASE[phase];
 
-	for (const name of names) {
-		if (FORBIDDEN_PATTERN.test(name)) {
-			return {
-				block: true,
-				reason: `LeanFlow guard: "${name}" matches a forbidden role. No reviewer, audit, validator, or implementer agents exist in LeanFlow.`,
-			};
+	if (spawns.length > 0 && allowed.length === 0) {
+		return { block: true, reason: `LeanFlow guard: no subagents are allowed during ${phase} phase.` };
+	}
+	for (const spawn of spawns) {
+		if (!spawn.agentName) {
+			return { block: true, reason: "LeanFlow guard: every task item must explicitly select an agent." };
 		}
-		const role = resolveRole(name);
-		if (role && !allowed.includes(role)) {
+		const role = resolveRole(spawn.agentName);
+		if (!role) {
+			return { block: true, reason: `LeanFlow guard: unknown LeanFlow agent "${spawn.agentName}".` };
+		}
+		if (!allowed.includes(role)) {
 			return {
 				block: true,
-				reason: `LeanFlow guard: agent "${name}" (${role}) is not allowed in ${phase} phase. Allowed: ${allowed.join(", ") || "none"}.`,
+				reason: `LeanFlow guard: agent "${spawn.agentName}" (${role}) is not allowed in ${phase} phase. Allowed: ${allowed.join(", ") || "none"}.`,
 			};
 		}
 	}
 	return { block: false };
+}
+
+interface RequestedSpawn {
+	agentName?: string;
+	taskLabel?: string;
+}
+
+function extractRequestedSpawns(input: Record<string, unknown>): RequestedSpawn[] {
+	if (Array.isArray(input.tasks)) {
+		return input.tasks.map((item) => {
+			if (!item || typeof item !== "object") return {};
+			const task = item as Record<string, unknown>;
+			return {
+				agentName: typeof task.agent === "string" && task.agent.trim() ? task.agent : undefined,
+				taskLabel: typeof task.name === "string" ? task.name : undefined,
+			};
+		});
+	}
+	return [{ agentName: typeof input.agent === "string" && input.agent.trim() ? input.agent : undefined }];
 }
 
 /** Extract actual requested known roles; task labels do not consume budgets. */
@@ -110,18 +130,7 @@ export function checkAgentBudget(
 	return { block: false };
 }
 
-/** Extract agent names and task names from a `task` tool input. */
+/** Extract only agent selectors; display labels never participate in policy. */
 export function extractAgentNames(input: Record<string, unknown>): string[] {
-	const names: string[] = [];
-	if (typeof input.agent === "string") names.push(input.agent);
-	if (Array.isArray(input.tasks)) {
-		for (const t of input.tasks) {
-			if (t && typeof t === "object") {
-				const task = t as Record<string, unknown>;
-				if (typeof task.agent === "string") names.push(task.agent);
-				if (typeof task.name === "string") names.push(task.name);
-			}
-		}
-	}
-	return names;
+	return extractRequestedSpawns(input).flatMap((spawn) => (spawn.agentName ? [spawn.agentName] : []));
 }

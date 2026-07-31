@@ -21,6 +21,9 @@
  * surviving compaction and session switches.
  */
 
+import { randomUUID } from "node:crypto";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolCallEvent } from "@oh-my-pi/pi-coding-agent";
 import { approvedPlanArtifact, filterForBuilder } from "./context";
 import { CUSTOM_TYPE, defaultState, defaultStats, hasPersistedState, restoreState } from "./state";
@@ -45,6 +48,22 @@ const BUILD_ACTION_TOOLS: Readonly<Record<string, true>> = { edit: true, bash: t
 
 type WriteToolInput = { content: string; path: string };
 
+interface RunMarker {
+	version: 1;
+	runId: string;
+	planSlug: string;
+	planArtifact: string;
+	phase: "awaiting_approval";
+	scoutCalls: number;
+	startedAt: number;
+	handoffStatus?: LeanFlowState["handoffStatus"];
+	handoffWarnings?: string[];
+	stats: NonNullable<LeanFlowState["stats"]>;
+	lspProbeStatus: LeanFlowState["lspProbeStatus"];
+}
+
+const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
 function isTaskToolCall(event: ToolCallEvent): event is ToolCallEvent & { input: Record<string, unknown>; toolName: "task" } {
 	return event.toolName === "task" && typeof event.input === "object" && event.input !== null && !Array.isArray(event.input);
 }
@@ -64,20 +83,27 @@ function lspDiagnosticsTarget(event: ToolCallEvent): string | undefined {
 	try {
 		const input: unknown = JSON.parse(event.input.content);
 		if (
-			typeof input === "object" &&
-			input !== null &&
-			!Array.isArray(input) &&
-			"action" in input &&
-			input.action === "diagnostics" &&
-			"file" in input &&
-			typeof input.file === "string"
+			typeof input !== "object" ||
+			input === null ||
+			Array.isArray(input) ||
+			!("action" in input) ||
+			input.action !== "diagnostics" ||
+			!("file" in input) ||
+			typeof input.file !== "string"
 		) {
-			return input.file;
+			return undefined;
 		}
+		const target = input.file.trim();
+		if (!target) return undefined;
+		if (target === "*") return target;
+		if (target.includes("\0") || path.isAbsolute(target)) return undefined;
+		const normalized = path.posix.normalize(target.replaceAll("\\", "/"));
+		if (normalized === ".." || normalized.startsWith("../") || normalized.startsWith("/")) return undefined;
+		return normalized;
 	} catch {
 		// Malformed device input is neither a diagnostics probe nor a mutation.
+		return undefined;
 	}
-	return undefined;
 }
 
 function isProposalWrite(event: ToolCallEvent): event is ToolCallEvent & { input: WriteToolInput; toolName: "write" } {
@@ -131,6 +157,46 @@ function planSlugFromArtifact(artifact: string): string {
 	return artifact.slice("local://".length, -"-plan.md".length);
 }
 
+function runMarkerArtifact(planSlug: string): string {
+	return `local://${planSlug}-leanflow-run.json`;
+}
+
+function lspStatusFromPlan(content: string): LeanFlowState["lspProbeStatus"] {
+	const declared = /^LSP applicability:\s*(required|not_required)\s*$/im.exec(content)?.[1];
+	return declared === "not_required" ? "not_required" : "pending";
+}
+
+function markerFilePath(ctx: ExtensionContext, artifact: string): string | undefined {
+	const artifactsDir = ctx.localProtocolOptions?.getArtifactsDir?.();
+	if (!artifactsDir || !artifact.startsWith("local://")) return undefined;
+	const root = path.resolve(artifactsDir, "local");
+	const target = path.resolve(root, artifact.slice("local://".length));
+	if (target !== root && !target.startsWith(`${root}${path.sep}`)) return undefined;
+	return target;
+}
+
+function isRunMarker(value: unknown, approvedArtifact: string): value is RunMarker {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const marker = value as Partial<RunMarker>;
+	return (
+		marker.version === 1 &&
+		typeof marker.runId === "string" &&
+		RUN_ID_PATTERN.test(marker.runId) &&
+		typeof marker.planSlug === "string" &&
+		marker.planSlug.length > 0 &&
+		marker.planArtifact === approvedArtifact &&
+		marker.phase === "awaiting_approval" &&
+		typeof marker.scoutCalls === "number" &&
+		Number.isInteger(marker.scoutCalls) &&
+		marker.scoutCalls >= 0 &&
+		marker.scoutCalls <= 3 &&
+		typeof marker.startedAt === "number" &&
+		Number.isFinite(marker.startedAt) &&
+		!!marker.stats &&
+		(marker.lspProbeStatus === "not_required" || marker.lspProbeStatus === "pending")
+	);
+}
+
 export default function leanflow(pi: ExtensionAPI): void {
 	let state: LeanFlowState = defaultState();
 	let hasPersistedLeanFlowState = false;
@@ -139,7 +205,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 	const pendingLspProbes = new Map<string, string>(); // toolCallId → diagnostics target
 	const pendingApprovalWrites = new Map<string, string>(); // toolCallId → exact plan artifact
 	const pendingGateCalls = new Set<string>(); // toolCallIds
-	const pendingArtifactWrites = new Map<string, string>(); // toolCallId → artifact kind
+	const pendingArtifactUpdates = new Map<string, string[]>(); // toolCallId → artifact kinds
 
 	function persist(): void {
 		pi.appendEntry(CUSTOM_TYPE, state);
@@ -162,6 +228,46 @@ export default function leanflow(pi: ExtensionAPI): void {
 		}
 	}
 
+	async function writeRunMarker(ctx: ExtensionContext): Promise<boolean> {
+		if (!state.runId || !state.planSlug || !state.planArtifact || !state.startedAt || !state.stats) return false;
+		const artifact = runMarkerArtifact(state.planSlug);
+		const filePath = markerFilePath(ctx, artifact);
+		if (!filePath) return false;
+		const marker: RunMarker = {
+			version: 1,
+			runId: state.runId,
+			planSlug: state.planSlug,
+			planArtifact: state.planArtifact,
+			phase: "awaiting_approval",
+			scoutCalls: state.scoutCalls,
+			startedAt: state.startedAt,
+			handoffStatus: state.handoffStatus,
+			handoffWarnings: state.handoffWarnings,
+			stats: state.stats,
+			lspProbeStatus: state.lspProbeStatus,
+		};
+		try {
+			await fs.mkdir(path.dirname(filePath), { recursive: true });
+			await fs.writeFile(filePath, JSON.stringify(marker), "utf8");
+			state.runMarkerArtifact = artifact;
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	async function readRunMarker(ctx: ExtensionContext, approvedArtifact: string): Promise<RunMarker | undefined> {
+		const slug = planSlugFromArtifact(approvedArtifact);
+		const filePath = markerFilePath(ctx, runMarkerArtifact(slug));
+		if (!filePath) return undefined;
+		try {
+			const marker: unknown = JSON.parse(await fs.readFile(filePath, "utf8"));
+			return isRunMarker(marker, approvedArtifact) && marker.planSlug === slug ? marker : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
 	/**
 	 * Native mode exit alone is ambiguous: the operator can leave plan mode
 	 * without approving. Require its post-proposal synthetic developer prompt to
@@ -171,45 +277,59 @@ export default function leanflow(pi: ExtensionAPI): void {
 		if (state.phase === "building") return true;
 		const artifact = state.proposedPlanArtifact;
 		if (state.phase !== "awaiting_approval" || !artifact) return false;
-		if (state.approvedPlanArtifact === artifact) return true;
-		if (state.proposalBoundary === undefined) return false;
-
-		const branch = ctx.sessionManager.getBranch();
-		if (!hasPlanModeExitAfter(branch, state.proposalBoundary)) return false;
-		const promptArtifact =
-			messages?.reduceRight<string | undefined>((match, message) => match ?? approvedPlanArtifact(message), undefined) ??
-			approvedArtifactAfter(branch, state.proposalBoundary);
-		if (promptArtifact !== artifact) return false;
-
-		state.approvedPlanArtifact = artifact;
+		if (state.approvedPlanArtifact !== artifact) {
+			if (state.proposalBoundary === undefined) return false;
+			const branch = ctx.sessionManager.getBranch();
+			if (!hasPlanModeExitAfter(branch, state.proposalBoundary)) return false;
+			const promptArtifact =
+				messages?.reduceRight<string | undefined>((match, message) => match ?? approvedPlanArtifact(message), undefined) ??
+				approvedArtifactAfter(branch, state.proposalBoundary);
+			if (promptArtifact !== artifact) return false;
+			state.approvedPlanArtifact = artifact;
+		}
+		transitionPhase(state, "building");
+		state.writtenArtifacts = [];
 		persist();
 		return true;
 	}
 
-	/** Recover after OMP's "Approve and execute" creates a fresh session branch. */
-	function recoverFreshApprovedPlan(messages: readonly unknown[]): boolean {
+	/** Recover only a marked LeanFlow run after Approve-and-execute creates a fresh session. */
+	async function recoverFreshApprovedPlan(ctx: ExtensionContext, messages: readonly unknown[]): Promise<boolean> {
 		if (hasPersistedLeanFlowState || state.phase !== "idle") return false;
 		const artifact = messages.reduceRight<string | undefined>(
 			(match, message) => match ?? approvedPlanArtifact(message),
 			undefined,
 		);
 		if (!artifact) return false;
+		const marker = await readRunMarker(ctx, artifact);
+		if (!marker) return false;
 
 		const now = Date.now();
-		state = {
-			phase: "awaiting_approval",
-			phaseStartedAt: now,
-			scoutCalls: 0,
-			gateCalls: 0,
-			gateAttempt: 0,
-			planSlug: planSlugFromArtifact(artifact),
-			planArtifact: artifact,
-			proposedPlanArtifact: artifact,
-			approvedPlanArtifact: artifact,
-			lspProbeCompleted: false,
-			startedAt: now,
-			stats: defaultStats(),
-		};
+		state = restoreState([
+			{
+				type: "custom",
+				customType: CUSTOM_TYPE,
+				data: {
+					phase: "building",
+					phaseStartedAt: now,
+					runId: marker.runId,
+					scoutCalls: marker.scoutCalls,
+					gateCalls: 0,
+					gateAttempt: 0,
+					planSlug: marker.planSlug,
+					planArtifact: marker.planArtifact,
+					proposedPlanArtifact: marker.planArtifact,
+					approvedPlanArtifact: marker.planArtifact,
+					runMarkerArtifact: runMarkerArtifact(marker.planSlug),
+					lspProbeStatus: marker.lspProbeStatus,
+					startedAt: marker.startedAt,
+					handoffStatus: marker.handoffStatus,
+					handoffWarnings: marker.handoffWarnings,
+					stats: marker.stats,
+					writtenArtifacts: [],
+				},
+			},
+		]);
 		persist();
 		return true;
 	}
@@ -278,7 +398,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 		pendingLspProbes.clear();
 		pendingApprovalWrites.clear();
 		pendingGateCalls.clear();
-		pendingArtifactWrites.clear();
+		pendingArtifactUpdates.clear();
 		resumePhaseTiming(state);
 		updateStatus(ctx);
 	};
@@ -325,9 +445,10 @@ export default function leanflow(pi: ExtensionAPI): void {
 				phase: "planning",
 				phaseStartedAt: now,
 				scoutCalls: 0,
+				runId: randomUUID(),
 				gateCalls: 0,
 				gateAttempt: 0,
-				lspProbeCompleted: false,
+				lspProbeStatus: "pending",
 				planSlug: slug,
 				startedAt: now,
 				stats: defaultStats(),
@@ -387,8 +508,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 			}
 		}
 
-		const approvalConfirmed =
-			state.phase === "awaiting_approval" && nativeApprovalConfirmed(ctx);
+		const approvalConfirmed = state.phase === "building" || (state.phase === "awaiting_approval" && nativeApprovalConfirmed(ctx));
 		const canonicalPlanArtifact = expectedPlanArtifact(state);
 		// Refine keeps native plan mode active, so revised canonical plans remain assessable.
 		if (
@@ -401,51 +521,43 @@ export default function leanflow(pi: ExtensionAPI): void {
 		}
 
 		const diagnosticsTarget = lspDiagnosticsTarget(event);
-		if (state.phase === "awaiting_approval" && approvalConfirmed && diagnosticsTarget !== undefined) {
+		if (state.phase === "building" && state.lspProbeStatus === "pending" && diagnosticsTarget !== undefined) {
 			pendingLspProbes.set(event.toolCallId, diagnosticsTarget);
 		}
 
 		if (state.phase === "awaiting_approval" && !approvalConfirmed && isProposalWrite(event)) {
 			const expected = state.planArtifact ?? canonicalPlanArtifact;
-			if (!expected || event.input.content.trim() !== state.planSlug) {
+			if (
+				!expected ||
+				event.input.content.trim() !== state.planSlug ||
+				!state.runId ||
+				state.runMarkerArtifact !== (state.planSlug ? runMarkerArtifact(state.planSlug) : undefined)
+			) {
 				return {
 					block: true,
-					reason: "LeanFlow: propose the exact canonical plan slug after its local://<slug>-plan.md artifact is written.",
+					reason: "LeanFlow: write the canonical plan and durable run marker before proposing its exact slug.",
 				};
 			}
 			pendingApprovalWrites.set(event.toolCallId, expected);
 		}
 
-		// Later evidence writes are tracked in the usual way.
-		if (isWriteToolCall(event) && state.phase === "building") {
-			const kind = artifactKind(event.input.path, state);
-			if (kind) pendingArtifactWrites.set(event.toolCallId, kind);
+		if (state.phase === "awaiting_approval" && isBuildAction(event)) {
+			return {
+				block: true,
+				reason: "LeanFlow: the plan is still awaiting exact native approval; approve its proposed artifact before starting BUILD.",
+			};
+		}
+		if (state.phase === "building" && state.lspProbeStatus === "pending" && isBuildAction(event)) {
+			return {
+				block: true,
+				reason:
+					"LeanFlow: before the first build action, write a valid diagnostics request for a planned source path (or `*`) to xd://lsp and wait for its result. Record an unavailable or no-server result as fallback.",
+			};
 		}
 
-		// A mutation is a build action only after exact native approval.
-		if (state.phase === "awaiting_approval" && isBuildAction(event)) {
-			if (!approvalConfirmed) {
-				return {
-					block: true,
-					reason: "LeanFlow: the plan is still awaiting exact native approval; approve its proposed artifact before starting BUILD.",
-				};
-			}
-			if (!state.lspProbeCompleted) {
-				return {
-					block: true,
-					reason:
-						"LeanFlow: before the first build action, write a diagnostics request for a planned source path (or `*`) to xd://lsp and wait for its result. Record an unavailable or no-server result as fallback.",
-				};
-			}
-			transitionPhase(state, "building");
-			state.writtenArtifacts = [];
-			if (isWriteToolCall(event)) {
-				const kind = artifactKind(event.input.path, state);
-				if (kind) pendingArtifactWrites.set(event.toolCallId, kind);
-			}
-			persist();
-			updateStatus(ctx);
-			ctx.ui.notify("LeanFlow: plan approved — entering BUILD.", "info");
+		if (state.phase === "building") {
+			const kinds = artifactKindsForEvent(event, state);
+			if (kinds.length > 0) pendingArtifactUpdates.set(event.toolCallId, kinds);
 		}
 	});
 
@@ -461,8 +573,8 @@ export default function leanflow(pi: ExtensionAPI): void {
 			state.proposalBoundary = ctx.sessionManager.getBranch().length;
 			state.proposedPlanArtifact = artifact;
 			state.approvedPlanArtifact = undefined;
-			state.lspProbeCompleted = false;
 			state.lspProbeTarget = undefined;
+			await writeRunMarker(ctx);
 			persist();
 			updateStatus(ctx);
 			return;
@@ -471,7 +583,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 		if (event.toolName === "write" && pendingLspProbes.has(event.toolCallId)) {
 			const target = pendingLspProbes.get(event.toolCallId)!;
 			pendingLspProbes.delete(event.toolCallId);
-			state.lspProbeCompleted = true;
+			state.lspProbeStatus = "completed";
 			state.lspProbeTarget = target;
 			persist();
 			updateStatus(ctx);
@@ -492,8 +604,9 @@ export default function leanflow(pi: ExtensionAPI): void {
 			state.proposalBoundary = undefined;
 			state.proposedPlanArtifact = undefined;
 			state.approvedPlanArtifact = undefined;
-			state.lspProbeCompleted = false;
+			state.lspProbeStatus = lspStatusFromPlan(plan.content);
 			state.lspProbeTarget = undefined;
+			state.runMarkerArtifact = undefined;
 
 			if (result.status === "NEEDS_UPDATE") {
 				// Critically incomplete — stay in planning, advise revision.
@@ -502,8 +615,15 @@ export default function leanflow(pi: ExtensionAPI): void {
 				updateStatus(ctx);
 				ctx.ui.notify(formatHandoffNotification(result), "warning");
 			} else {
-				// Plan artifact ready — wait for native approval, do NOT build yet.
+				// Plan artifact ready — persist the minimal cross-session marker, then await approval.
 				transitionPhase(state, "awaiting_approval");
+				if (!(await writeRunMarker(ctx))) {
+					transitionPhase(state, "planning");
+					persist();
+					updateStatus(ctx);
+					ctx.ui.notify("LeanFlow: could not persist the fresh-session run marker; approval remains blocked.", "error");
+					return;
+				}
 				persist();
 				updateStatus(ctx);
 				ctx.ui.notify(
@@ -514,15 +634,14 @@ export default function leanflow(pi: ExtensionAPI): void {
 			return;
 		}
 
-		if (event.toolName === "write" && pendingArtifactWrites.has(event.toolCallId)) {
-			const kind = pendingArtifactWrites.get(event.toolCallId)!;
-			pendingArtifactWrites.delete(event.toolCallId);
+		if (pendingArtifactUpdates.has(event.toolCallId)) {
+			const kinds = pendingArtifactUpdates.get(event.toolCallId)!;
+			pendingArtifactUpdates.delete(event.toolCallId);
 			if (event.isError) return;
-			const written = state.writtenArtifacts ?? [];
-			if (!written.includes(kind)) {
-				state.writtenArtifacts = [...written, kind];
-				persist();
-			}
+			const written = new Set(state.writtenArtifacts ?? []);
+			for (const kind of kinds) written.add(kind);
+			state.writtenArtifacts = [...written];
+			persist();
 			return;
 		}
 
@@ -539,7 +658,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 
 	pi.on("context", async (event, ctx) => {
 		const messages = event.messages;
-		const recovered = recoverFreshApprovedPlan(messages);
+		const recovered = await recoverFreshApprovedPlan(ctx, messages);
 		if (recovered) updateStatus(ctx);
 		if (state.phase === "awaiting_approval" && !recovered && !nativeApprovalConfirmed(ctx, messages)) return;
 		const filtered = filterForBuilder(messages, state);
@@ -595,6 +714,24 @@ function isBuildAction(event: ToolCallEvent): boolean {
 /** The three evidence artifacts Gate requires, keyed by path suffix. */
 const REQUIRED_ARTIFACTS = ["build", "diff", "evidence"] as const;
 
+
+/** Canonical evidence artifacts targeted by a successful write or edit. */
+function artifactKindsForEvent(event: ToolCallEvent, state: LeanFlowState): string[] {
+	if (event.toolName !== "write" && event.toolName !== "edit") return [];
+	const candidates: string[] = [];
+	if ("path" in event.input && typeof event.input.path === "string") candidates.push(event.input.path);
+	if ("paths" in event.input && Array.isArray(event.input.paths)) {
+		for (const candidate of event.input.paths) {
+			if (typeof candidate === "string") candidates.push(candidate);
+		}
+	}
+	const kinds = new Set<string>();
+	for (const candidate of candidates) {
+		const kind = artifactKind(candidate, state);
+		if (kind) kinds.add(kind);
+	}
+	return [...kinds];
+}
 /** Classify only this run's canonical evidence artifacts. */
 function artifactKind(path: string, state: LeanFlowState): string | undefined {
 	if (!state.planSlug) return undefined;
@@ -629,6 +766,7 @@ function buildPlanningPrompt(task: string, slug: string): string {
 		`Write to local://${slug}-plan.md. It is a decision document covering:`,
 		"what changes, which files/symbols, how it will be verified, and key assumptions.",
 		"The Builder needs no planning reasoning — only the decisions.",
+		"Include exactly one metadata line: `LSP applicability: required` for source/code changes, or `LSP applicability: not_required` only for documentation, static resources, or other changes with no serviceable source path. Missing/invalid metadata fails safe as required.",
 		"",
 		"## Scout (optional, max 3)",
 		"```text",

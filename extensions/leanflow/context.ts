@@ -10,7 +10,7 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { CustomMessage } from "@oh-my-pi/pi-coding-agent";
 import type { LeanFlowState } from "./state";
 
-const APPROVED_PLAN_PROMPT = /^Plan approved\.\s*[\s\S]*?\bMUST read (local:\/\/[A-Za-z0-9_-]+-plan\.md) before executing\./m;
+const APPROVED_PLAN_PROMPT = /^Plan approved\.\s*[\s\S]*?You MUST read `([^`]+)` before executing\./m;
 
 /**
  * Return the exact canonical artifact from OMP's native approved-plan prompt.
@@ -28,7 +28,8 @@ export function approvedPlanArtifact(message: unknown): string | undefined {
 						.map((block) => block.text)
 						.join("\n")
 				: "";
-	return APPROVED_PLAN_PROMPT.exec(text)?.[1];
+	const artifact = APPROVED_PLAN_PROMPT.exec(text)?.[1];
+	return artifact?.startsWith("local://") && artifact.endsWith("-plan.md") ? artifact : undefined;
 }
 
 /** Locate a matching native approval prompt in model context. */
@@ -97,8 +98,16 @@ function buildBuilderPreamble(state: LeanFlowState): string {
 		"",
 		"Read the approved plan, implement it, run verification, and write:",
 		`  local://${slug}-build.md, local://${slug}-diff.md, local://${slug}-evidence.md`,
-		"Before Baseline HEAD or any other build action, run LSP diagnostics for the first planned source path (or `*` when none is planned) and wait for its result. This runtime probe is the authoritative LSP configuration detector for project, user/profile, plugin, marketplace, and auto-detected servers. Record the target, responding server or no server, result, and fallback.",
-		"For each changed source path served by LSP, attempt diagnostics before and after edits; a new file has no pre-edit baseline and is checked after creation. Attempt references before exported-symbol edits. Record every probe/request/result in build.md and evidence.md. Repair all introduced errors and warnings; a completed no-server/error probe is a fallback, never a substitute for compiler checks, executable tests, or runtime smoke validation.",
+	);
+	if (state.lspProbeStatus === "not_required") {
+		lines.push("The approved plan declares LSP not required for this documentation/resource-only change.");
+	} else {
+		lines.push(
+			"Before Baseline HEAD or any other build action, run LSP diagnostics for the first planned source path (or `*` when none is planned) and wait for its result. This runtime probe is the authoritative LSP configuration detector for project, user/profile, plugin, marketplace, and auto-detected servers. Record the target, responding server or no server, result, and fallback.",
+			"For each changed source path served by LSP, attempt diagnostics before and after edits; a new file has no pre-edit baseline and is checked after creation. Attempt references before exported-symbol edits. Record every probe/request/result in build.md and evidence.md. Repair all introduced errors and warnings; a completed no-server/error probe is a fallback, never a substitute for compiler checks, executable tests, or runtime smoke validation.",
+		);
+	}
+	lines.push(
 		"Then call Gate:",
 		"```text",
 		`task({ agent: "gate", task: "Review plan local://${slug}-plan.md, diff local://${slug}-diff.md,`,

@@ -49,7 +49,7 @@ class WorkflowPromptTest(unittest.TestCase):
         self.assertIn("appendEntry", index)
         self.assertNotIn("repo-reviewer", index)
         guard = (ext_dir / "guard.ts").read_text(encoding="utf-8")
-        self.assertIn("FORBIDDEN_PATTERN", guard)
+        self.assertIn('unknown LeanFlow agent', guard)
         self.assertIn("checkTaskGuard", guard)
         state = (ext_dir / "state.ts").read_text(encoding="utf-8")
         self.assertIn("LeanFlowPhase", state)
