@@ -1,39 +1,57 @@
 /**
- * LeanFlow builder context filter.
+ * LeanFlow builder context.
  *
- * During the building phase, filters the LLM context to remove verbose
- * planning-phase messages (Scout results, reasoning) and inject a compact
- * builder preamble. This is the primary token optimization: the builder
- * reads the approved plan artifact instead of carrying planning history.
- *
- * Uses `state.approvalBoundary`, which the lifecycle sets only after a native
- * plan-mode exit. Message filtering locates the proposal call itself because
- * branch-entry indexes and model-context indexes are different coordinate spaces.
+ * A native approval is identified by OMP's synthetic developer prompt, which
+ * names the exact approved local:// plan artifact. This survives "Approve and
+ * execute" creating a fresh session; positional branch boundaries alone do not.
  */
 
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { CustomMessage } from "@oh-my-pi/pi-coding-agent";
 import type { LeanFlowState } from "./state";
 
+const APPROVED_PLAN_PROMPT = /^Plan approved\.\s*[\s\S]*?\bMUST read (local:\/\/[A-Za-z0-9_-]+-plan\.md) before executing\./m;
+
 /**
- * Filter context only after native approval, then preserve that compact Builder
- * context through building.
+ * Return the exact canonical artifact from OMP's native approved-plan prompt.
+ * Only OMP creates this prompt as a synthetic developer message.
  */
-export function filterForBuilder(
-	messages: AgentMessage[],
-	state: LeanFlowState,
-): AgentMessage[] | undefined {
-	if (state.phase !== "building" && (state.phase !== "awaiting_approval" || state.approvalBoundary === undefined)) return undefined;
+export function approvedPlanArtifact(message: unknown): string | undefined {
+	if (!isDeveloperMessage(message)) return undefined;
+	const content = message.content;
+	const text =
+		typeof content === "string"
+			? content
+			: Array.isArray(content)
+				? content
+						.filter((block): block is { type: "text"; text: string } => isTextBlock(block))
+						.map((block) => block.text)
+						.join("\n")
+				: "";
+	return APPROVED_PLAN_PROMPT.exec(text)?.[1];
+}
 
-	// Prefer the proposal call in model context; persisted boundaries are branch
-	// positions and only serve as a compatibility fallback for older sessions.
-	let boundaryIndex = findProposeBoundary(messages);
-	if (boundaryIndex < 0) {
-		boundaryIndex = state.approvalBoundary ?? -1;
+/** Locate a matching native approval prompt in model context. */
+export function findApprovedPlanBoundary(messages: AgentMessage[], artifact: string): number {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		if (approvedPlanArtifact(messages[i]) === artifact) return i;
 	}
-	if (boundaryIndex < 0) return undefined; // can't find boundary, pass through
+	return -1;
+}
 
-	// Keep the first user message (the task) + everything after the boundary.
+/**
+ * Filter context only after an exact native approval, then preserve the compact
+ * Builder context through building.
+ */
+export function filterForBuilder(messages: AgentMessage[], state: LeanFlowState): AgentMessage[] | undefined {
+	if (state.phase !== "building" && state.phase !== "awaiting_approval") return undefined;
+	const artifact = state.approvedPlanArtifact;
+	if (!artifact) return undefined;
+
+	const boundaryIndex = findApprovedPlanBoundary(messages, artifact);
+	if (boundaryIndex < 0) return undefined;
+
+	// Keep the first user message (the task) + everything after native approval.
 	const firstUser = messages.find((m) => m.role === "user");
 	const postBoundary = messages.slice(boundaryIndex + 1);
 
@@ -42,7 +60,6 @@ export function filterForBuilder(
 		filtered.push(firstUser);
 	}
 
-	// Inject compact builder preamble.
 	const preamble: CustomMessage = {
 		role: "custom",
 		customType: "leanflow-builder-context",
@@ -55,26 +72,12 @@ export function filterForBuilder(
 	return filtered;
 }
 
-/** Find the xd://propose write in message history. */
-function findProposeBoundary(messages: AgentMessage[]): number {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		if (isProposeMessage(messages[i])) return i;
-	}
-	return -1;
+function isDeveloperMessage(message: unknown): message is { role: "developer"; content: unknown } {
+	return typeof message === "object" && message !== null && "role" in message && message.role === "developer" && "content" in message;
 }
 
-function isProposeMessage(message: AgentMessage): boolean {
-	if (!("content" in message) || !Array.isArray(message.content)) return false;
-	for (const block of message.content) {
-		if (block.type === "toolCall" && block.name === "write") {
-			const path = String(block.arguments.path ?? "");
-			if (path.includes("xd://propose")) return true;
-		}
-		if (block.type === "text" && block.text.includes("xd://propose")) {
-			return true;
-		}
-	}
-	return false;
+function isTextBlock(block: unknown): block is { type: "text"; text: string } {
+	return typeof block === "object" && block !== null && "type" in block && block.type === "text" && "text" in block && typeof block.text === "string";
 }
 
 function buildBuilderPreamble(state: LeanFlowState): string {

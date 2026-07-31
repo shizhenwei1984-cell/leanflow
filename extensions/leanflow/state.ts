@@ -9,10 +9,9 @@
  *   idle → planning → awaiting_approval → building → gating → idle
  *
  * Transitions:
- *   /flow command         → planning
- *   write *-plan.md       → awaiting_approval (plan exists, not yet approved)
- *   native mode exit + completed LSP diagnostics + first repository mutation → building
- *   task(gate)            → gating
+ *   write canonical plan artifact → awaiting_approval (plan exists; not yet approved)
+ *   native approved-plan prompt + completed LSP diagnostics + first build action → building
+ *   task(gate)                     → gating
  *   Gate PASS / 2nd FAIL  → idle
  *   Gate 1st FAIL         → building (repair)
  */
@@ -76,14 +75,19 @@ export interface LeanFlowState {
 	gateCalls: number;
 	/** Which gate round: 0 = not yet gated, 1 = first gate, 2 = repair gate. */
 	gateAttempt: number;
+	/** Stable slug naming all canonical workflow artifacts. */
 	planSlug?: string;
+	/** Canonical local:// plan artifact written for this run. */
+	planArtifact?: string;
 	startedAt?: number;
 	handoffStatus?: HandoffStatus;
 	handoffWarnings?: string[];
-	/** Branch length immediately after the latest successful xd://propose dispatch. */
+	/** Branch index immediately after the exact proposal request was dispatched. */
 	proposalBoundary?: number;
-	/** Proposal boundary confirmed by a later native plan-mode exit, for context filtering. */
-	approvalBoundary?: number;
+	/** Canonical artifact named by the successful xd://propose request. */
+	proposedPlanArtifact?: string;
+	/** Canonical artifact named by OMP's native approved-plan execution prompt. */
+	approvedPlanArtifact?: string;
 	/** A completed diagnostics probe is required before the first build action. */
 	lspProbeCompleted: boolean;
 	/** Path (or `*`) passed to the completed diagnostics probe. */
@@ -126,6 +130,14 @@ interface BranchEntry {
 	data?: unknown;
 }
 
+/** Whether this branch contains any LeanFlow state entry. */
+export function hasPersistedState(branch: Iterable<BranchEntry>): boolean {
+	for (const entry of branch) {
+		if (entry.type === "custom" && entry.customType === CUSTOM_TYPE) return true;
+	}
+	return false;
+}
+
 /** Walk the session branch and restore the latest persisted state. */
 export function restoreState(branch: Iterable<BranchEntry>): LeanFlowState {
 	let latest: LeanFlowState | undefined;
@@ -146,11 +158,13 @@ function normalizeState(value: LeanFlowState | undefined): LeanFlowState {
 		gateCalls: numberOr(state.gateCalls, 0),
 		gateAttempt: numberOr(state.gateAttempt, 0),
 		planSlug: typeof state.planSlug === "string" ? state.planSlug : undefined,
+		planArtifact: typeof state.planArtifact === "string" ? state.planArtifact : undefined,
 		startedAt: optionalNumber(state.startedAt),
 		handoffStatus: isHandoffStatus(state.handoffStatus) ? state.handoffStatus : undefined,
 		handoffWarnings: Array.isArray(state.handoffWarnings) ? state.handoffWarnings.filter((v) => typeof v === "string") : undefined,
 		proposalBoundary: optionalNumber(state.proposalBoundary),
-		approvalBoundary: optionalNumber(state.approvalBoundary),
+		proposedPlanArtifact: typeof state.proposedPlanArtifact === "string" ? state.proposedPlanArtifact : undefined,
+		approvedPlanArtifact: typeof state.approvedPlanArtifact === "string" ? state.approvedPlanArtifact : undefined,
 		lspProbeCompleted: state.lspProbeCompleted === true,
 		lspProbeTarget: typeof state.lspProbeTarget === "string" ? state.lspProbeTarget : undefined,
 		writtenArtifacts: Array.isArray(state.writtenArtifacts) ? state.writtenArtifacts.filter((v) => typeof v === "string") : undefined,

@@ -19,10 +19,13 @@ type ToolHandler = (event: Record<string, unknown>, ctx: TestContext) => Promise
 type PersistedState = {
 	phase: string;
 	handoffStatus?: string;
+	planArtifact?: string;
 	proposalBoundary?: number;
-	approvalBoundary?: number;
+	proposedPlanArtifact?: string;
+	approvedPlanArtifact?: string;
 	lspProbeCompleted: boolean;
 	lspProbeTarget?: string;
+	writtenArtifacts?: string[];
 };
 
 type Harness = {
@@ -64,7 +67,7 @@ function createHarness(): Harness {
 }
 
 async function writeInitialPlan(harness: Harness): Promise<void> {
-	await harness.commands.get("flow")!.handler("update src/example.ts and run tests", harness.ctx);
+	await harness.commands.get("flow")!.handler("example", harness.ctx);
 	await harness.handlers.get("tool_call")!(
 		{
 			toolName: "write",
@@ -96,6 +99,12 @@ const approvalMessages = [
 		],
 		timestamp: 2,
 	},
+	{
+		role: "developer",
+		content:
+			"Plan approved.\n\n<instruction>\nYou MUST read local://example-plan.md before executing.\n</instruction>",
+		timestamp: 3,
+	},
 ];
 
 test("proposal dispatch and Refine remain in Planner context and revised plans are assessed", async () => {
@@ -115,7 +124,8 @@ test("proposal dispatch and Refine remain in Planner context and revised plans a
 	expect(harness.states.at(-1)).toMatchObject({
 		phase: "awaiting_approval",
 		proposalBoundary: expect.any(Number),
-		approvalBoundary: undefined,
+		proposedPlanArtifact: "local://example-plan.md",
+		approvedPlanArtifact: undefined,
 		lspProbeCompleted: false,
 	});
 	expect(await context({ messages: approvalMessages }, harness.ctx)).toBeUndefined();
@@ -136,7 +146,8 @@ test("proposal dispatch and Refine remain in Planner context and revised plans a
 		phase: "planning",
 		handoffStatus: "NEEDS_UPDATE",
 		proposalBoundary: undefined,
-		approvalBoundary: undefined,
+		proposedPlanArtifact: undefined,
+		approvedPlanArtifact: undefined,
 	});
 });
 
@@ -161,6 +172,12 @@ test("native approval requires a real write-device diagnostics result before the
 	expect(harness.states.at(-1)!.phase).toBe("awaiting_approval");
 
 	harness.branch.push({ type: "mode_change", mode: "none" });
+	const afterModeExit = await call(
+		{ toolName: "edit", toolCallId: "edit-after-mode-exit", input: {} },
+		harness.ctx,
+	);
+	expect(afterModeExit).toMatchObject({ block: true, reason: expect.stringContaining("exact native approval") });
+
 	const contextResult = await context({ messages: approvalMessages }, harness.ctx);
 	expect(contextResult).toMatchObject({
 		messages: [{ role: "user" }, { customType: "leanflow-builder-context" }],
@@ -211,7 +228,60 @@ test("native approval requires a real write-device diagnostics result before the
 	});
 
 	expect(
+		await call(
+			{ toolName: "write", toolCallId: "first-build-artifact", input: { path: "local://example-build.md", content: "build" } },
+			harness.ctx,
+		),
+	).toBeUndefined();
+	expect(harness.states.at(-1)!.phase).toBe("building");
+	await result({ toolName: "write", toolCallId: "first-build-artifact", isError: false }, harness.ctx);
+	expect(harness.states.at(-1)!.writtenArtifacts).toEqual(["build"]);
+
+	expect(
 		await call({ toolName: "edit", toolCallId: "edit-after-probe", input: {} }, harness.ctx),
 	).toBeUndefined();
+	expect(harness.states.at(-1)!.phase).toBe("building");
+});
+
+test("fresh approval session recovers the native plan identity before enforcing diagnostics", async () => {
+	const harness = createHarness();
+	const call = harness.handlers.get("tool_call")!;
+	const result = harness.handlers.get("tool_result")!;
+	const context = harness.handlers.get("context")!;
+	const messages = [
+		{ role: "user", content: "update src/example.ts", timestamp: 1 },
+		{
+			role: "developer",
+			content:
+				"Plan approved.\n\n<instruction>\nYou MUST read local://example-plan.md before executing.\n</instruction>",
+			timestamp: 2,
+		},
+	];
+
+	expect(await context({ messages }, harness.ctx)).toMatchObject({
+		messages: [{ role: "user" }, { customType: "leanflow-builder-context" }],
+	});
+	expect(harness.states.at(-1)).toMatchObject({
+		phase: "awaiting_approval",
+		planArtifact: "local://example-plan.md",
+		proposedPlanArtifact: "local://example-plan.md",
+		approvedPlanArtifact: "local://example-plan.md",
+		lspProbeCompleted: false,
+	});
+
+	expect(await call({ toolName: "edit", toolCallId: "fresh-edit-before-probe", input: {} }, harness.ctx)).toMatchObject({
+		block: true,
+		reason: expect.stringContaining("xd://lsp"),
+	});
+	await call(
+		{
+			toolName: "write",
+			toolCallId: "fresh-probe",
+			input: { path: "xd://lsp", content: JSON.stringify({ action: "diagnostics", file: "src/example.ts" }) },
+		},
+		harness.ctx,
+	);
+	await result({ toolName: "write", toolCallId: "fresh-probe", isError: false }, harness.ctx);
+	expect(await call({ toolName: "edit", toolCallId: "fresh-edit-after-probe", input: {} }, harness.ctx)).toBeUndefined();
 	expect(harness.states.at(-1)!.phase).toBe("building");
 });

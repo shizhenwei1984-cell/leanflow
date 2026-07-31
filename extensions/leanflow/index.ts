@@ -5,28 +5,28 @@
  * state machine, tool guard, handoff advisor, and builder context filter.
  *
  * Phase lifecycle:
- *   /flow            → planning
- *   write *-plan.md  → awaiting_approval  (plan exists; NOT yet approved)
- *   completed LSP diagnostics + first build action after approval → building
- *   task(gate)       → gating
- *   Gate PASS / 2nd FAIL → idle
- *   Gate 1st FAIL    → building (repair)
+ *   /flow                          → planning
+ *   write canonical *-plan.md      → awaiting_approval
+ *   exact native approved-plan prompt + completed LSP diagnostics + first build action → building
+ *   task(gate)                     → gating
+ *   Gate PASS / 2nd FAIL           → idle
+ *   Gate 1st FAIL                  → building (repair)
  *
- * The critical correctness property: writing the plan artifact does NOT
- * advance to building. The Builder receives its protocol after approval, must
- * complete diagnostics before the first repository mutation, and enters
- * building only on that subsequent implementation action.
+ * The critical correctness property: a successful proposal is not approval.
+ * BUILD begins only when OMP's synthetic approval prompt names the exact plan
+ * artifact that LeanFlow proposed. The Builder must then complete diagnostics
+ * before its first repository mutation.
  *
  * State persists via appendEntry and restores from the session branch,
  * surviving compaction and session switches.
  */
 
 import type { ExtensionAPI, ExtensionContext, ToolCallEvent } from "@oh-my-pi/pi-coding-agent";
-import { CUSTOM_TYPE, defaultState, defaultStats, restoreState } from "./state";
+import { approvedPlanArtifact, filterForBuilder } from "./context";
+import { CUSTOM_TYPE, defaultState, defaultStats, hasPersistedState, restoreState } from "./state";
 import type { LeanFlowState } from "./state";
 import { checkAgentBudget, checkTaskGuard, extractAgentRoles } from "./guard";
 import { assessHandoff, formatHandoffNotification } from "./handoff";
-import { filterForBuilder } from "./context";
 import {
 	addUsage,
 	formatStats,
@@ -84,6 +84,10 @@ function isProposalWrite(event: ToolCallEvent): event is ToolCallEvent & { input
 	return isWriteToolCall(event) && event.input.path === "xd://propose";
 }
 
+function expectedPlanArtifact(state: LeanFlowState): string | undefined {
+	return state.planSlug ? `local://${state.planSlug}-plan.md` : undefined;
+}
+
 function hasPlanModeExitAfter(branch: Iterable<unknown>, boundary: number): boolean {
 	let index = 0;
 	for (const entry of branch) {
@@ -103,17 +107,43 @@ function hasPlanModeExitAfter(branch: Iterable<unknown>, boundary: number): bool
 	return false;
 }
 
+/** Native approval prompts are persisted developer messages on the branch. */
+function approvedArtifactAfter(branch: Iterable<unknown>, boundary = 0): string | undefined {
+	let index = 0;
+	let artifact: string | undefined;
+	for (const entry of branch) {
+		if (
+			index >= boundary &&
+			typeof entry === "object" &&
+			entry !== null &&
+			"type" in entry &&
+			entry.type === "message" &&
+			"message" in entry
+		) {
+			artifact = approvedPlanArtifact(entry.message) ?? artifact;
+		}
+		index++;
+	}
+	return artifact;
+}
+
+function planSlugFromArtifact(artifact: string): string {
+	return artifact.slice("local://".length, -"-plan.md".length);
+}
+
 export default function leanflow(pi: ExtensionAPI): void {
 	let state: LeanFlowState = defaultState();
+	let hasPersistedLeanFlowState = false;
 	// Correlate tool_call → tool_result for plan writes, LSP probes, and gate calls.
-	const pendingPlanWrites = new Map<string, string>(); // toolCallId → plan content
+	const pendingPlanWrites = new Map<string, { content: string; path: string }>();
 	const pendingLspProbes = new Map<string, string>(); // toolCallId → diagnostics target
-	const pendingApprovalWrites = new Set<string>(); // toolCallIds
+	const pendingApprovalWrites = new Map<string, string>(); // toolCallId → exact plan artifact
 	const pendingGateCalls = new Set<string>(); // toolCallIds
 	const pendingArtifactWrites = new Map<string, string>(); // toolCallId → artifact kind
 
 	function persist(): void {
 		pi.appendEntry(CUSTOM_TYPE, state);
+		hasPersistedLeanFlowState = true;
 	}
 
 	/** Statistics observation and its standalone persistence are non-blocking. */
@@ -132,13 +162,54 @@ export default function leanflow(pi: ExtensionAPI): void {
 		}
 	}
 
-	function nativeApprovalConfirmed(ctx: ExtensionContext): boolean {
+	/**
+	 * Native mode exit alone is ambiguous: the operator can leave plan mode
+	 * without approving. Require its post-proposal synthetic developer prompt to
+	 * name the exact artifact proposed by this workflow.
+	 */
+	function nativeApprovalConfirmed(ctx: ExtensionContext, messages?: readonly unknown[]): boolean {
 		if (state.phase === "building") return true;
-		if (state.phase !== "awaiting_approval" || state.proposalBoundary === undefined) return false;
-		if (state.approvalBoundary === state.proposalBoundary) return true;
-		if (!hasPlanModeExitAfter(ctx.sessionManager.getBranch(), state.proposalBoundary)) return false;
+		const artifact = state.proposedPlanArtifact;
+		if (state.phase !== "awaiting_approval" || !artifact) return false;
+		if (state.approvedPlanArtifact === artifact) return true;
+		if (state.proposalBoundary === undefined) return false;
 
-		state.approvalBoundary = state.proposalBoundary;
+		const branch = ctx.sessionManager.getBranch();
+		if (!hasPlanModeExitAfter(branch, state.proposalBoundary)) return false;
+		const promptArtifact =
+			messages?.reduceRight<string | undefined>((match, message) => match ?? approvedPlanArtifact(message), undefined) ??
+			approvedArtifactAfter(branch, state.proposalBoundary);
+		if (promptArtifact !== artifact) return false;
+
+		state.approvedPlanArtifact = artifact;
+		persist();
+		return true;
+	}
+
+	/** Recover after OMP's "Approve and execute" creates a fresh session branch. */
+	function recoverFreshApprovedPlan(messages: readonly unknown[]): boolean {
+		if (hasPersistedLeanFlowState || state.phase !== "idle") return false;
+		const artifact = messages.reduceRight<string | undefined>(
+			(match, message) => match ?? approvedPlanArtifact(message),
+			undefined,
+		);
+		if (!artifact) return false;
+
+		const now = Date.now();
+		state = {
+			phase: "awaiting_approval",
+			phaseStartedAt: now,
+			scoutCalls: 0,
+			gateCalls: 0,
+			gateAttempt: 0,
+			planSlug: planSlugFromArtifact(artifact),
+			planArtifact: artifact,
+			proposedPlanArtifact: artifact,
+			approvedPlanArtifact: artifact,
+			lspProbeCompleted: false,
+			startedAt: now,
+			stats: defaultStats(),
+		};
 		persist();
 		return true;
 	}
@@ -200,7 +271,14 @@ export default function leanflow(pi: ExtensionAPI): void {
 	// -----------------------------------------------------------------------
 
 	const restoreSessionState = async (_event: unknown, ctx: ExtensionContext): Promise<void> => {
-		state = restoreState(ctx.sessionManager.getBranch());
+		const branch = ctx.sessionManager.getBranch();
+		hasPersistedLeanFlowState = hasPersistedState(branch);
+		state = restoreState(branch);
+		pendingPlanWrites.clear();
+		pendingLspProbes.clear();
+		pendingApprovalWrites.clear();
+		pendingGateCalls.clear();
+		pendingArtifactWrites.clear();
 		resumePhaseTiming(state);
 		updateStatus(ctx);
 	};
@@ -311,13 +389,15 @@ export default function leanflow(pi: ExtensionAPI): void {
 
 		const approvalConfirmed =
 			state.phase === "awaiting_approval" && nativeApprovalConfirmed(ctx);
-		// Refine keeps native plan mode active, so revised plans remain assessable.
+		const canonicalPlanArtifact = expectedPlanArtifact(state);
+		// Refine keeps native plan mode active, so revised canonical plans remain assessable.
 		if (
 			isWriteToolCall(event) &&
+			canonicalPlanArtifact !== undefined &&
 			(state.phase === "planning" || (state.phase === "awaiting_approval" && !approvalConfirmed)) &&
-			event.input.path.includes("-plan.md")
+			event.input.path === canonicalPlanArtifact
 		) {
-			pendingPlanWrites.set(event.toolCallId, event.input.content);
+			pendingPlanWrites.set(event.toolCallId, { content: event.input.content, path: canonicalPlanArtifact });
 		}
 
 		const diagnosticsTarget = lspDiagnosticsTarget(event);
@@ -326,21 +406,28 @@ export default function leanflow(pi: ExtensionAPI): void {
 		}
 
 		if (state.phase === "awaiting_approval" && !approvalConfirmed && isProposalWrite(event)) {
-			pendingApprovalWrites.add(event.toolCallId);
+			const expected = state.planArtifact ?? canonicalPlanArtifact;
+			if (!expected || event.input.content.trim() !== state.planSlug) {
+				return {
+					block: true,
+					reason: "LeanFlow: propose the exact canonical plan slug after its local://<slug>-plan.md artifact is written.",
+				};
+			}
+			pendingApprovalWrites.set(event.toolCallId, expected);
 		}
 
-		// Track build-evidence artifact writes (build/diff/evidence) for gate readiness.
+		// Later evidence writes are tracked in the usual way.
 		if (isWriteToolCall(event) && state.phase === "building") {
-			const kind = artifactKind(event.input.path);
+			const kind = artifactKind(event.input.path, state);
 			if (kind) pendingArtifactWrites.set(event.toolCallId, kind);
 		}
 
-		// A mutation is a build action only after native plan mode actually exits.
+		// A mutation is a build action only after exact native approval.
 		if (state.phase === "awaiting_approval" && isBuildAction(event)) {
 			if (!approvalConfirmed) {
 				return {
 					block: true,
-					reason: "LeanFlow: the plan is still awaiting native approval; approve it before starting BUILD.",
+					reason: "LeanFlow: the plan is still awaiting exact native approval; approve its proposed artifact before starting BUILD.",
 				};
 			}
 			if (!state.lspProbeCompleted) {
@@ -352,6 +439,10 @@ export default function leanflow(pi: ExtensionAPI): void {
 			}
 			transitionPhase(state, "building");
 			state.writtenArtifacts = [];
+			if (isWriteToolCall(event)) {
+				const kind = artifactKind(event.input.path, state);
+				if (kind) pendingArtifactWrites.set(event.toolCallId, kind);
+			}
 			persist();
 			updateStatus(ctx);
 			ctx.ui.notify("LeanFlow: plan approved — entering BUILD.", "info");
@@ -364,10 +455,12 @@ export default function leanflow(pi: ExtensionAPI): void {
 
 	pi.on("tool_result", async (event, ctx) => {
 		if (event.toolName === "write" && pendingApprovalWrites.has(event.toolCallId)) {
+			const artifact = pendingApprovalWrites.get(event.toolCallId)!;
 			pendingApprovalWrites.delete(event.toolCallId);
 			if (event.isError) return;
 			state.proposalBoundary = ctx.sessionManager.getBranch().length;
-			state.approvalBoundary = undefined;
+			state.proposedPlanArtifact = artifact;
+			state.approvedPlanArtifact = undefined;
 			state.lspProbeCompleted = false;
 			state.lspProbeTarget = undefined;
 			persist();
@@ -387,16 +480,18 @@ export default function leanflow(pi: ExtensionAPI): void {
 
 		// Failed plan/artifact writes must not leave stale pending bookkeeping.
 		if (event.toolName === "write" && pendingPlanWrites.has(event.toolCallId)) {
-			const content = pendingPlanWrites.get(event.toolCallId)!;
+			const plan = pendingPlanWrites.get(event.toolCallId)!;
 			pendingPlanWrites.delete(event.toolCallId);
 			if (event.isError) return;
 
 			// Handoff: plan was written successfully → assess, then await approval.
-			const result = assessHandoff(content);
+			const result = assessHandoff(plan.content);
+			state.planArtifact = plan.path;
 			state.handoffStatus = result.status;
 			state.handoffWarnings = result.warnings;
 			state.proposalBoundary = undefined;
-			state.approvalBoundary = undefined;
+			state.proposedPlanArtifact = undefined;
+			state.approvedPlanArtifact = undefined;
 			state.lspProbeCompleted = false;
 			state.lspProbeTarget = undefined;
 
@@ -412,7 +507,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 				persist();
 				updateStatus(ctx);
 				ctx.ui.notify(
-					`${formatHandoffNotification(result)}\nRequest approval via xd://propose.`,
+					`${formatHandoffNotification(result)}\nRequest approval by writing \`${state.planSlug}\` to xd://propose.`,
 					"info",
 				);
 			}
@@ -444,7 +539,9 @@ export default function leanflow(pi: ExtensionAPI): void {
 
 	pi.on("context", async (event, ctx) => {
 		const messages = event.messages;
-		if (state.phase === "awaiting_approval" && !nativeApprovalConfirmed(ctx)) return;
+		const recovered = recoverFreshApprovedPlan(messages);
+		if (recovered) updateStatus(ctx);
+		if (state.phase === "awaiting_approval" && !recovered && !nativeApprovalConfirmed(ctx, messages)) return;
 		const filtered = filterForBuilder(messages, state);
 		if (!filtered) return;
 
@@ -498,10 +595,11 @@ function isBuildAction(event: ToolCallEvent): boolean {
 /** The three evidence artifacts Gate requires, keyed by path suffix. */
 const REQUIRED_ARTIFACTS = ["build", "diff", "evidence"] as const;
 
-/** Classify a written path as a build-evidence artifact kind, or undefined. */
-function artifactKind(path: string): string | undefined {
+/** Classify only this run's canonical evidence artifacts. */
+function artifactKind(path: string, state: LeanFlowState): string | undefined {
+	if (!state.planSlug) return undefined;
 	for (const kind of REQUIRED_ARTIFACTS) {
-		if (path.includes(`-${kind}.md`)) return kind;
+		if (path === `local://${state.planSlug}-${kind}.md`) return kind;
 	}
 	return undefined;
 }

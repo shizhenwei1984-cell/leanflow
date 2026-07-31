@@ -99,12 +99,13 @@ class WorkflowPromptTest(unittest.TestCase):
         index = (ROOT / "extensions" / "leanflow" / "index.ts").read_text(encoding="utf-8")
         self.assertIn("state.gateAttempt++", index)
 
-    def test_context_filter_uses_stored_boundary(self) -> None:
-        """Issue 5: context filter uses state.approvalBoundary, not message scan."""
+    def test_context_filter_uses_native_approval_identity(self) -> None:
+        """The Builder context starts only after OMP names the approved artifact."""
         state = (ROOT / "extensions" / "leanflow" / "state.ts").read_text(encoding="utf-8")
-        self.assertIn("approvalBoundary", state)
+        self.assertIn("approvedPlanArtifact", state)
         context = (ROOT / "extensions" / "leanflow" / "context.ts").read_text(encoding="utf-8")
-        self.assertIn("state.approvalBoundary", context)
+        self.assertIn("approvedPlanArtifact", context)
+        self.assertIn("Plan approved", context)
 
     def test_gate_requires_build_evidence(self) -> None:
         """P1: Gate is blocked until build/diff/evidence artifacts are written."""

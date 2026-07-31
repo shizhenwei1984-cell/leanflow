@@ -168,37 +168,34 @@ test("filtering survives an unavailable byte observation and preserves builder e
 	const state = defaultState();
 	state.phase = "building";
 	state.planSlug = "metrics";
-	state.approvalBoundary = 1;
+	state.approvedPlanArtifact = "local://metrics-plan.md";
 	const firstUser: AgentMessage = { role: "user", content: "implement metrics", timestamp: 1 };
 	const planningHistory: AgentMessage = { role: "user", content: "planning history", timestamp: 2 };
-	const approval: AgentMessage = { role: "user", content: "approved", timestamp: 3 };
-	const filtered = filterForBuilder([firstUser, planningHistory, approval], state);
+	const approval = {
+		role: "developer",
+		content: "Plan approved.\n\n<instruction>\nYou MUST read local://metrics-plan.md before executing.\n</instruction>",
+		timestamp: 3,
+	} as unknown as AgentMessage;
+	const postApproval: AgentMessage = { role: "user", content: "implement", timestamp: 4 };
+	const filtered = filterForBuilder([firstUser, planningHistory, approval, postApproval], state);
 
 	expect(filtered?.[0]).toBe(firstUser);
 	expect(filtered?.[1]).toMatchObject({ customType: "leanflow-builder-context" });
-	expect(filtered?.[2]).toBe(approval);
+	expect(filtered?.[2]).toBe(postApproval);
 	expect(() => recordContextFilter(state, [{ content: BigInt(1) }], filtered ?? [])).not.toThrow();
 	expect(state.stats?.beforeBytes).toBeUndefined();
 	expect(formatStats(state)).toContain("Byte-count reduction: unavailable");
 });
 
-test("filtering starts at approval so Builder protocol precedes the first mutation", () => {
+test("filtering starts at the exact native approval identity", () => {
 	const state = defaultState();
 	state.phase = "awaiting_approval";
-	state.approvalBoundary = 1;
+	state.approvedPlanArtifact = "local://fallback-plan.md";
 	state.planSlug = "fallback";
 	const firstUser: AgentMessage = { role: "user", content: "implement fallback", timestamp: 1 };
-	// The filter reads only role/content; transport fields are irrelevant to this context fixture.
 	const approval = {
-		role: "assistant",
-		content: [
-			{
-				type: "toolCall",
-				id: "propose",
-				name: "write",
-				arguments: { path: "xd://propose", content: "fallback" },
-			},
-		],
+		role: "developer",
+		content: "Plan approved.\n\n<instruction>\nYou MUST read local://fallback-plan.md before executing.\n</instruction>",
 	} as unknown as AgentMessage;
 	const postApproval: AgentMessage = { role: "user", content: "approved", timestamp: 2 };
 
