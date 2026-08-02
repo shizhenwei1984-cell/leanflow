@@ -66,54 +66,26 @@ task({
 After approval, native plan mode exits and the same Main Session becomes Builder (`@default`). Main is the only writer.
 
 1. Re-read the approved canonical plan.
-2. Before Baseline HEAD or any other build action, when the approved plan declares `LSP applicability: required` (or omits/invalidates the declaration), run `lsp` diagnostics for the first planned source path (or `*` when no source path is planned) and wait for its result. The runtime probe is the authoritative LSP configuration detector: it resolves active project, user/profile, plugin, marketplace, and auto-detected configuration. Record its target, responding server or `no server`, result, and fallback. For `not_required`, record that the documentation/static-resource-only plan intentionally skipped the probe.
-3. Record Baseline HEAD and baseline status in `local://<slug>-build.md` before edits. Preserve existing user work.
-4. Implement the approved plan; do not create an implementer, developer, coder, or builder subagent.
-5. For every changed source path served by the probe or a later LSP call, attempt diagnostics before and after editing. For a new file, record that no pre-edit baseline exists and run diagnostics after creation. Before modifying an exported symbol, attempt LSP references. Treat diagnostics as a decision signal: repair all introduced errors and warnings; record unrelated pre-existing diagnostics exactly.
-6. Record the initial probe and every later configuration/server, target path, diagnostics/references request, and result in both `build.md` and `evidence.md`. If a server is unavailable, times out, fails to initialize, or has no matching file type, record the exact outcome and fallback used.
-7. A completed LSP probe with `no server` or an error is a recorded fallback, not a flow blocker. LSP diagnostics never replace the required `read`/`grep`, compiler checks, executable tests, and runtime smoke test; do not inject runtime statistics into the Builder context.
-8. Run every planned validation command. Record command, exit code, complete output reference, and result in `build.md`.
-9. Write the complete final diff to `local://<slug>-diff.md`; record final status, changed paths, and final HEAD in `build.md`.
-10. Collect runtime evidence for Gate. Write `local://<slug>-evidence.md` with one `## <command>` heading per command. At minimum include:
-   - Every command from the plan's Verification section, with full output
-   - `git diff <base> -- <changed-paths>` for each changed file
-   - `git status --short` final state
-   - Test suite summary line (runs/assertions/failures/errors)
-   Gate has no shell access; this file is its only runtime evidence source.
+2. Before the baseline or any other build action, when the plan declares `LSP applicability: required` (or omits/invalidates the declaration), run `lsp` diagnostics for the first planned source path (or `*`) and wait for its result. The runtime probe is the authoritative LSP configuration detector. For `not_required`, intentionally skip only this probe.
+3. Call `leanflow_capture_baseline({})`. The extension runs `git rev-parse HEAD` and `git status --short --untracked-files=all`, persists them in its versioned internal record, and keeps repository mutations locked unless both commands succeed. Preserve all baseline user work. A repair round reuses this baseline and must not capture it again.
+4. For every changed source path served by LSP, attempt diagnostics before and after editing; a new file has no pre-edit baseline and receives post-creation diagnostics. Attempt references before exported-symbol edits. Repair introduced errors and warnings. A no-server/error result is a recorded fallback, never a substitute for compiler checks, executable tests, or runtime smoke validation.
+5. Implement the approved plan in Main; do not create an implementer, developer, coder, or builder subagent. The extension records every allowed bash/LSP call with its pre-scheduled input and actual result; blocked or skipped calls never become evidence.
+6. Run every planned validation as a synchronous `bash` call. Async/running, failed, timed-out, unrecorded, duplicate-selected, or nonzero-exit commands cannot finalize evidence.
+7. Call `leanflow_finalize_artifacts({ validationCommands: ["<exact command already run>", ...] })`, selecting each command exactly once. The extension revalidates plan identity, baseline/final HEAD, final status, tracked binary diff, sorted untracked binary patches, empty untracked files, and the 1 MiB per-artifact limit.
+8. The finalizer mechanically writes and verifies `local://<slug>-build.md`, `local://<slug>-diff.md`, and `local://<slug>-evidence.md`. Main must never write or edit those files directly. Gate has no shell access; the generated evidence artifact is its only runtime evidence source.
 
 ## GATE
 
-Spawn one independent Gate after evidence is complete. Gate reads references; do not paste artifacts.
+Spawn one independent Gate after extension-generated evidence is complete. Gate reads references; do not paste artifacts. Gate's strict output schema is owned by `agents/gate.md`; callers never provide a schema override.
 
 ```text
 task({
-  agent: "gate",
-  task: "Review the LeanFlow run whose plan is local://<slug>-plan.md, diff is local://<slug>-diff.md, build record is local://<slug>-build.md, and runtime evidence is local://<slug>-evidence.md. Read all four artifacts and return the verdict object.",
-  outputSchema: {
-    type: "object",
-    properties: {
-      verdict: { type: "string", enum: ["PASS", "FAIL"] },
-      findings: {
-        type: "array",
-        items: {
-          type: "object",
-          properties: {
-            category: { type: "string", enum: ["correctness", "validation_failure", "plan_deviation", "missing_change", "regression_risk", "style", "naming"] },
-            severity: { type: "string", enum: ["blocking", "nonblocking"] },
-            file: { type: "string" },
-            location: { type: "string" },
-            issue: { type: "string" },
-            required_fix: { type: "string" }
-          },
-          required: ["category", "severity", "file", "location", "issue", "required_fix"],
-          additionalProperties: false
-        }
-      }
-    },
-    required: ["verdict", "findings"],
-    additionalProperties: false
-  },
-  schemaMode: "strict"
+  context: "LeanFlow Gate",
+  tasks: [{
+    agent: "gate",
+    task: "Review the LeanFlow run whose plan is local://<slug>-plan.md, diff is local://<slug>-diff.md, build record is local://<slug>-build.md, and runtime evidence is local://<slug>-evidence.md. Read all four artifacts and return the verdict object.",
+    schemaMode: "strict"
+  }]
 })
 ```
 

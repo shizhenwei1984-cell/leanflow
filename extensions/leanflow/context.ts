@@ -8,6 +8,7 @@
 
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { CustomMessage } from "@oh-my-pi/pi-coding-agent";
+import { canonicalGateTask } from "./guard";
 import type { LeanFlowState } from "./state";
 
 const APPROVED_PLAN_PROMPT = /^Plan approved\.\s*[\s\S]*?You MUST read `([^`]+)` before executing\./m;
@@ -83,6 +84,13 @@ function isTextBlock(block: unknown): block is { type: "text"; text: string } {
 
 function buildBuilderPreamble(state: LeanFlowState): string {
 	const slug = state.planSlug ?? "<slug>";
+	const prefix = `local://${slug}`;
+	const gateTask = canonicalGateTask({
+		plan: `${prefix}-plan.md`,
+		build: `${prefix}-build.md`,
+		diff: `${prefix}-diff.md`,
+		evidence: `${prefix}-evidence.md`,
+	});
 	if (state.phase === "finalizing") {
 		return [
 			"LeanFlow terminal response:",
@@ -93,7 +101,8 @@ function buildBuilderPreamble(state: LeanFlowState): string {
 					? "Gate did not complete within the bounded retry budget."
 					: "Gate returned FAIL after the bounded repair retry.",
 			"",
-			"Do not call tools, modify files, or invoke Gate again.",
+			'If a completed task remains open in the todo list, you may call exactly one todo tool with input {"op":"done","task":"existing task content"}.',
+			"Do not call any other tools, modify files, invoke Gate again, or use todo with any other operation, phase, or extra fields.",
 			"Briefly report the terminal outcome and relevant findings to the user, then stop.",
 		].join("\n");
 	}
@@ -111,33 +120,39 @@ function buildBuilderPreamble(state: LeanFlowState): string {
 		lines.push(`Handoff warnings: ${state.handoffWarnings.join("; ")}`);
 	}
 	if (state.gateRetryMode !== "operational") {
-		lines.push(
-			"",
-			"Read the approved plan, implement it, run verification, and write:",
-			`  local://${slug}-build.md, local://${slug}-diff.md, local://${slug}-evidence.md`,
-		);
-		if (state.lspProbeStatus === "not_required") {
-			lines.push("The approved plan declares LSP not required for this documentation/resource-only change.");
+		lines.push("", "Read the approved plan and implement it as the sole source writer.");
+		if (state.gateRetryMode === "repair") {
+			lines.push(
+				"The immutable baseline is retained from the first BUILD round. Do not call leanflow_capture_baseline again.",
+			);
+		} else if (state.lspProbeStatus === "not_required") {
+			lines.push(
+				"The approved plan declares LSP not required for this documentation/resource-only change.",
+				"Call leanflow_capture_baseline({}) before any repository mutation.",
+			);
 		} else {
 			lines.push(
-				"Before Baseline HEAD or any other build action, run LSP diagnostics for the first planned source path (or `*` when none is planned) and wait for its result. This runtime probe is the authoritative LSP configuration detector for project, user/profile, plugin, marketplace, and auto-detected servers. Record the target, responding server or no server, result, and fallback.",
-				"For each changed source path served by LSP, attempt diagnostics before and after edits; a new file has no pre-edit baseline and is checked after creation. Attempt references before exported-symbol edits. Record every probe/request/result in build.md and evidence.md. Repair all introduced errors and warnings; a completed no-server/error probe is a fallback, never a substitute for compiler checks, executable tests, or runtime smoke validation.",
+				"Before the baseline or any other build action, run LSP diagnostics for the first planned source path (or `*` when none is planned) and wait for its result. This runtime probe is the authoritative LSP configuration detector for project, user/profile, plugin, marketplace, and auto-detected servers.",
+				"Then call leanflow_capture_baseline({}) before any repository mutation.",
 			);
 		}
+		lines.push(
+			"For each changed source path served by LSP, attempt diagnostics before and after edits; a new file has no pre-edit baseline and is checked after creation. Attempt references before exported-symbol edits. Repair all introduced errors and warnings; a completed no-server/error probe is a fallback, never a substitute for compiler checks, executable tests, or runtime smoke validation.",
+			"Run every planned validation synchronously with bash. Then call leanflow_finalize_artifacts({ validationCommands: [\"<exact command already run>\"] }); list every selected command exactly once.",
+			`Do not write or edit ${prefix}-build.md, ${prefix}-diff.md, or ${prefix}-evidence.md directly. The extension records results and generates all three artifacts mechanically.`,
+		);
 	}
 	lines.push(
 		"Then call Gate:",
 		"```text",
-		`task({ agent: "gate", task: "Review plan local://${slug}-plan.md, diff local://${slug}-diff.md,`,
-		`  build local://${slug}-build.md, evidence local://${slug}-evidence.md.",`,
-		'  outputSchema: { type: "object", properties: { verdict: { type: "string", enum: ["PASS","FAIL"] },',
-		'    findings: { type: "array", items: { type: "object", properties: {',
-		'      category: { type: "string" }, severity: { type: "string", enum: ["blocking","nonblocking"] },',
-		'      file: { type: "string" }, location: { type: "string" },',
-		'      issue: { type: "string" }, required_fix: { type: "string" } },',
-		'      required: ["category","severity","file","location","issue","required_fix"],',
-		'      additionalProperties: false } } }, required: ["verdict","findings"], additionalProperties: false },',
-		'  schemaMode: "strict" })',
+		"task({",
+		'  context: "LeanFlow Gate",',
+		"  tasks: [{",
+		'    agent: "gate",',
+		`    task: ${JSON.stringify(gateTask)},`,
+		'    schemaMode: "strict"',
+		"  }]",
+		"})",
 		"```",
 		"Gate PASS → done. First FAIL → repair + re-gate (max 2 Gate calls).",
 		"Do not spawn implementer, reviewer, or audit agents. You are the sole writer.",

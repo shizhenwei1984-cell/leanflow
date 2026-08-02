@@ -112,10 +112,22 @@ export interface LeanFlowState {
 	runMarkerStatus?: RunMarkerStatus;
 	/** Marker/pointer persistence failed; current in-memory control remains authoritative. */
 	persistenceDegraded?: boolean;
+	/** Last failed persistence step, retained for actionable diagnostics. */
+	persistenceFailureStage?: "precondition" | "marker" | "pointer";
+	/** Filesystem path, or unresolved local:// target, for the failed step. */
+	persistenceFailurePath?: string;
+	/** Node filesystem error code when available. */
+	persistenceFailureCode?: string;
+	/** Original filesystem error message when available. */
+	persistenceFailureMessage?: string;
 	/** Whether a valid diagnostics probe is required, pending, or completed. */
 	lspProbeStatus: LspProbeStatus;
 	/** Path (or `*`) passed to the completed diagnostics probe. */
 	lspProbeTarget?: string;
+	/** Whether the immutable BUILD HEAD/status has been captured for this run. */
+	baselineCaptured?: boolean;
+	/** Whether any repository mutation was conservatively allowed after baseline capture. */
+	buildMutationObserved?: boolean;
 	/** Build evidence artifacts written this round: build / diff / evidence. */
 	writtenArtifacts?: string[];
 	/** Runtime token/context statistics for the current run. */
@@ -195,11 +207,25 @@ function normalizeState(value: LeanFlowState | undefined): LeanFlowState {
 		runMarkerArtifact: typeof state.runMarkerArtifact === "string" ? state.runMarkerArtifact : undefined,
 		runMarkerStatus: isRunMarkerStatus(state.runMarkerStatus) ? state.runMarkerStatus : undefined,
 		persistenceDegraded: state.persistenceDegraded === true,
+		persistenceFailureStage:
+			state.persistenceFailureStage === "precondition" ||
+			state.persistenceFailureStage === "marker" ||
+			state.persistenceFailureStage === "pointer"
+				? state.persistenceFailureStage
+				: undefined,
+		persistenceFailurePath:
+			typeof state.persistenceFailurePath === "string" ? state.persistenceFailurePath : undefined,
+		persistenceFailureCode:
+			typeof state.persistenceFailureCode === "string" ? state.persistenceFailureCode : undefined,
+		persistenceFailureMessage:
+			typeof state.persistenceFailureMessage === "string" ? state.persistenceFailureMessage : undefined,
 		lspProbeStatus: normalizeLspProbeStatus(state),
 		proposedPlanDigest: typeof state.proposedPlanDigest === "string" ? state.proposedPlanDigest : undefined,
 		approvalInvalidated: state.approvalInvalidated === true,
 		approvalRepairBoundary: optionalNumber(state.approvalRepairBoundary),
 		lspProbeTarget: typeof state.lspProbeTarget === "string" ? state.lspProbeTarget : undefined,
+		baselineCaptured: state.baselineCaptured === true,
+		buildMutationObserved: state.buildMutationObserved === true,
 		writtenArtifacts: Array.isArray(state.writtenArtifacts) ? state.writtenArtifacts.filter((v) => typeof v === "string") : undefined,
 		terminalOutcome:
 			state.terminalOutcome === "pass" ||

@@ -81,9 +81,13 @@ class WorkflowPromptTest(unittest.TestCase):
         self.assertNotIn("outputSchema", planner)
         self.assertNotIn('"verdict"', planner)
         self.assertNotIn('agent: "gate"', planner)
-        # The Gate schema lives in the builder preamble instead.
         context = (ROOT / "extensions" / "leanflow" / "context.ts").read_text(encoding="utf-8")
-        self.assertIn("outputSchema", context)
+        flow = (ROOT / "commands" / "flow.md").read_text(encoding="utf-8")
+        gate = (ROOT / "agents" / "gate.md").read_text(encoding="utf-8")
+        self.assertNotIn("outputSchema", context)
+        self.assertNotIn("outputSchema", flow)
+        self.assertIn("\noutput:\n", gate)
+        self.assertIn("agent-owned strict schema", gate)
 
     def test_guard_uses_agent_alias_table(self) -> None:
         """Issue 2: agent names resolve through an alias table, not hardcoding."""
@@ -114,16 +118,19 @@ class WorkflowPromptTest(unittest.TestCase):
         self.assertIn("final diff contains no LSP-serviceable source changes", gate)
         self.assertIn("Missing, invalid, duplicated, or diff-contradicted metadata", gate)
 
-    def test_gate_requires_build_evidence(self) -> None:
-        """P1: Gate is blocked until build/diff/evidence artifacts are written."""
+    def test_gate_requires_extension_generated_build_evidence(self) -> None:
+        """P1: Gate is blocked until extension-generated artifacts verify."""
         state = (ROOT / "extensions" / "leanflow" / "state.ts").read_text(encoding="utf-8")
         self.assertIn("writtenArtifacts", state)
+        self.assertIn("baselineCaptured", state)
         index = (ROOT / "extensions" / "leanflow" / "index.ts").read_text(encoding="utf-8")
+        self.assertIn("leanflow_capture_baseline", index)
+        self.assertIn("leanflow_finalize_artifacts", index)
         self.assertIn("missingArtifacts", index)
         self.assertIn("Gate unavailable", index)
         self.assertIn("REQUIRED_ARTIFACTS", index)
-        # Repair round resets evidence so it must be refreshed before re-gating.
         self.assertIn("state.writtenArtifacts = []", index)
+        self.assertNotIn("pendingArtifactUpdates", index)
 
     def test_lsp_is_not_a_build_action(self) -> None:
         """P2: LSP reads must not trigger the building phase."""
@@ -193,11 +200,13 @@ class WorkflowPromptTest(unittest.TestCase):
         self.assertIn("recordGateFailure(state", index)
         self.assertIn("recordGateError(state", index)
 
-    def test_gate_readiness_precedes_attempt_increment(self) -> None:
-        """Missing artifacts block before an attempt is counted."""
+    def test_gate_shape_and_readiness_precede_attempt_increment(self) -> None:
+        """Malformed calls and missing artifacts block before an attempt is counted."""
         index = (ROOT / "extensions" / "leanflow" / "index.ts").read_text(encoding="utf-8")
-        readiness = index.index("const missing = missingArtifacts(state)")
+        shape = index.index("const shape = validateGateTaskCall")
+        readiness = index.index("const missing = missingArtifacts(state)", shape)
         increment = index.index("state.gateCalls++", readiness)
+        self.assertLess(shape, readiness)
         self.assertLess(readiness, increment)
 
     def test_task_role_budgets_preflight_before_mutation(self) -> None:
@@ -234,9 +243,10 @@ class WorkflowPromptTest(unittest.TestCase):
         context = (ROOT / "extensions" / "leanflow" / "context.ts").read_text(encoding="utf-8")
         docs = (ROOT / "docs" / "leanflow.md").read_text(encoding="utf-8")
         self.assertIn("runtime probe is the authoritative LSP configuration detector", flow)
-        self.assertIn("Before Baseline HEAD", flow)
-        self.assertIn("A completed probe with `no server`", docs)
-        self.assertIn("Before Baseline HEAD", context)
+        self.assertIn("Before the baseline or any other build action", flow)
+        self.assertIn("A no-server/error result is a recorded fallback", flow)
+        self.assertIn("Before the baseline or any other build action", context)
+        self.assertIn("leanflow_capture_baseline", docs)
         gate = (ROOT / "agents" / "gate.md").read_text(encoding="utf-8")
         self.assertIn("initial LSP diagnostics probe result", gate)
         self.assertIn("blocking `validation_failure`", gate)

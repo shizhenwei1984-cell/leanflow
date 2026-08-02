@@ -44,6 +44,71 @@ export interface GuardResult {
 	reason?: string;
 }
 
+export interface GateArtifacts {
+	plan: string;
+	build: string;
+	diff: string;
+	evidence: string;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	try {
+		const prototype = Object.getPrototypeOf(value);
+		return prototype === Object.prototype || prototype === null;
+	} catch {
+		return false;
+	}
+}
+
+function hasExactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+	const keys = Object.keys(value);
+	return keys.length === expected.length && expected.every((key) => keys.includes(key));
+}
+
+export function canonicalGateTask(artifacts: GateArtifacts): string {
+	return `Review the LeanFlow run whose plan is ${artifacts.plan}, diff is ${artifacts.diff}, build record is ${artifacts.build}, and runtime evidence is ${artifacts.evidence}. Read all four artifacts and return the verdict object.`;
+}
+
+/** Validate the complete Gate wire shape before readiness checks or budget mutation. */
+export function validateGateTaskCall(input: Record<string, unknown>, artifacts: GateArtifacts): GuardResult {
+	const invalid = (detail: string): GuardResult => ({
+		block: true,
+		reason: `LeanFlow guard: invalid Gate call — ${detail}`,
+	});
+	if (!isPlainRecord(input)) return invalid("the task input must be a plain object.");
+
+	const validateItem = (value: unknown): GuardResult => {
+		if (!isPlainRecord(value)) return invalid("the Gate task item must be a plain object.");
+		if (!hasExactKeys(value, ["agent", "task", "schemaMode"])) {
+			return invalid("use only agent, task, and schemaMode; caller outputSchema, name, isolated, and extra fields are forbidden.");
+		}
+		if (typeof value.agent !== "string" || resolveRole(value.agent.trim()) !== "gate") {
+			return invalid("the item must select a Gate alias.");
+		}
+		if (value.schemaMode !== "strict") return invalid('schemaMode must be exactly "strict".');
+		if (typeof value.task !== "string" || value.task.trim() !== canonicalGateTask(artifacts)) {
+			return invalid("the task text must exactly reference this run's four canonical artifacts.");
+		}
+		return { block: false };
+	};
+
+	if (Object.prototype.hasOwnProperty.call(input, "tasks")) {
+		if (!hasExactKeys(input, ["context", "tasks"])) {
+			return invalid("batch form allows only a non-empty context and one tasks array.");
+		}
+		if (typeof input.context !== "string" || input.context.trim().length === 0) {
+			return invalid("batch context must be a non-empty string.");
+		}
+		if (!Array.isArray(input.tasks) || input.tasks.length !== 1) {
+			return invalid("batch form must contain exactly one Gate task item.");
+		}
+		return validateItem(input.tasks[0]);
+	}
+
+	return validateItem(input);
+}
+
 /** Resolve a raw agent name to its canonical LeanFlow role, or undefined. */
 export function resolveRole(name: string): LeanFlowAgentRole | undefined {
 	const role = ALIAS_TO_ROLE[name];

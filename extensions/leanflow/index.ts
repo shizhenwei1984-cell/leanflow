@@ -28,10 +28,25 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolCallEvent } from "@oh-my-pi/pi-coding-agent";
 import { approvedPlanArtifact, filterForBuilder } from "./context";
+import {
+	composeCompleteDiff,
+	createBuildEvidenceRecord,
+	parseBuildEvidenceRecord,
+	renderBuildArtifacts,
+	selectValidationObservations,
+} from "./evidence";
+import type {
+	BuildEvidenceObservationV1,
+	BuildEvidenceRecordV1,
+	BuildRecordIdentity,
+	GitCommandEvidence,
+	ParsedLspRequest,
+	UntrackedPatch,
+} from "./evidence";
 import { CUSTOM_TYPE, defaultState, defaultStats, hasPersistedState, restoreState } from "./state";
 import type { LeanFlowState } from "./state";
-import { checkAgentBudget, checkTaskGuard, extractAgentRoles } from "./guard";
-import type { LeanFlowAgentRole } from "./guard";
+import { checkAgentBudget, checkTaskGuard, extractAgentRoles, validateGateTaskCall } from "./guard";
+import type { GateArtifacts, LeanFlowAgentRole } from "./guard";
 import { assessHandoff, formatHandoffNotification } from "./handoff";
 import {
 	addUsage,
@@ -104,8 +119,33 @@ const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const ACTIVE_MARKER_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	try {
+		const prototype = Object.getPrototypeOf(value);
+		return prototype === Object.prototype || prototype === null;
+	} catch {
+		return false;
+	}
+}
+
 function isTaskToolCall(event: ToolCallEvent): event is ToolCallEvent & { input: Record<string, unknown>; toolName: "task" } {
-	return event.toolName === "task" && typeof event.input === "object" && event.input !== null && !Array.isArray(event.input);
+	return event.toolName === "task" && isPlainRecord(event.input);
+}
+
+function isFinalizingTodoCompletion(event: ToolCallEvent): boolean {
+	if (event.toolName !== "todo" || !isPlainRecord(event.input)) return false;
+	const keys = Object.keys(event.input);
+	return (
+		keys.length === 2 &&
+		keys.includes("op") &&
+		keys.includes("task") &&
+		"op" in event.input &&
+		event.input.op === "done" &&
+		"task" in event.input &&
+		typeof event.input.task === "string" &&
+		event.input.task.trim().length > 0
+	);
 }
 
 function isWriteToolCall(event: ToolCallEvent): event is ToolCallEvent & { input: WriteToolInput; toolName: "write" } {
@@ -116,6 +156,50 @@ function isWriteToolCall(event: ToolCallEvent): event is ToolCallEvent & { input
 		typeof event.input.path === "string" &&
 		typeof event.input.content === "string"
 	);
+}
+
+function parseLspObservationRequest(event: ToolCallEvent): ParsedLspRequest | undefined {
+	if (!isWriteToolCall(event) || event.input.path !== "xd://lsp") return undefined;
+	try {
+		const input: unknown = JSON.parse(event.input.content);
+		if (!isPlainRecord(input) || typeof input.action !== "string" || input.action.length === 0) return undefined;
+		const request: ParsedLspRequest = { action: input.action };
+		if ("file" in input) {
+			if (typeof input.file !== "string") return undefined;
+			request.file = input.file;
+		}
+		if ("line" in input) {
+			if (typeof input.line !== "number" || !Number.isFinite(input.line) || !Number.isInteger(input.line)) return undefined;
+			request.line = input.line;
+		}
+		if ("symbol" in input) {
+			if (typeof input.symbol !== "string") return undefined;
+			request.symbol = input.symbol;
+		}
+		if ("query" in input) {
+			if (typeof input.query !== "string") return undefined;
+			request.query = input.query;
+		}
+		if ("new_name" in input) {
+			if (typeof input.new_name !== "string") return undefined;
+			request.new_name = input.new_name;
+		}
+		if ("apply" in input) {
+			if (typeof input.apply !== "boolean") return undefined;
+			request.apply = input.apply;
+		}
+		if ("timeout" in input) {
+			if (typeof input.timeout !== "number" || !Number.isFinite(input.timeout)) return undefined;
+			request.timeout = input.timeout;
+		}
+		if ("payload" in input) {
+			if (typeof input.payload !== "string") return undefined;
+			request.payload = input.payload;
+		}
+		return request;
+	} catch {
+		return undefined;
+	}
 }
 
 function lspDiagnosticsTarget(event: ToolCallEvent): string | undefined {
@@ -163,6 +247,17 @@ function isProposalWrite(event: ToolCallEvent): event is ToolCallEvent & { input
 
 function expectedPlanArtifact(state: LeanFlowState): string | undefined {
 	return state.planSlug ? `local://${state.planSlug}-plan.md` : undefined;
+}
+
+function expectedGateArtifacts(state: LeanFlowState): GateArtifacts | undefined {
+	if (!state.planSlug) return undefined;
+	const prefix = `local://${state.planSlug}`;
+	return {
+		plan: `${prefix}-plan.md`,
+		build: `${prefix}-build.md`,
+		diff: `${prefix}-diff.md`,
+		evidence: `${prefix}-evidence.md`,
+	};
 }
 
 
@@ -361,8 +456,32 @@ function runMarkerArtifact(_planSlug: string, runId: string): string {
 	return `local://.leanflow/runs/${runId}.json`;
 }
 
+function buildRecordArtifact(runId: string): string {
+	return `local://.leanflow/runs/${runId}-build-record.json`;
+}
+
+function sha256Hex(value: string): string {
+	return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
 function activePointerArtifact(planSlug: string): string {
+	return `local://.leanflow/active/${sha256Hex(planSlug)}.json`;
+}
+
+function legacyActivePointerArtifact(planSlug: string): string {
 	return `local://.leanflow/active/${encodeURIComponent(planSlug)}.json`;
+}
+
+function taskSlug(task: string): string {
+	const stem =
+		task
+			.normalize("NFKD")
+			.toLowerCase()
+			.replace(/[^a-z0-9]+/g, "-")
+			.replace(/^-+|-+$/g, "")
+			.slice(0, 30)
+			.replace(/-+$/g, "") || "task";
+	return `${stem}-${sha256Hex(task).slice(0, 8)}`;
 }
 
 function targetsReservedLeanFlowState(ctx: ExtensionContext, event: ToolCallEvent): boolean {
@@ -418,7 +537,7 @@ function runIdFromPlan(content: string): string | undefined {
 }
 
 function planDigest(content: string): string {
-	return createHash("sha256").update(content, "utf8").digest("hex");
+	return sha256Hex(content);
 }
 
 export function resolveRunMarkerPath(
@@ -469,17 +588,17 @@ function isRunMarker(value: unknown, approvedArtifact: string): value is RunMark
 		(marker.lspProbeStatus === "not_required" || marker.lspProbeStatus === "pending")
 	);
 }
-async function writeJsonAtomically(filePath: string, value: unknown): Promise<void> {
+async function writeTextAtomically(filePath: string, content: string): Promise<void> {
 	await fs.mkdir(path.dirname(filePath), { recursive: true });
 	const temporary = `${filePath}.tmp-${process.pid}-${randomUUID()}`;
-	const handle = await fs.open(temporary, "wx");
 	try {
-		await handle.writeFile(JSON.stringify(value), "utf8");
-		await handle.sync();
-	} finally {
-		await handle.close();
-	}
-	try {
+		const handle = await fs.open(temporary, "wx");
+		try {
+			await handle.writeFile(content, "utf8");
+			await handle.sync();
+		} finally {
+			await handle.close();
+		}
 		await fs.rename(temporary, filePath);
 	} catch (error) {
 		await fs.rm(temporary, { force: true });
@@ -487,15 +606,22 @@ async function writeJsonAtomically(filePath: string, value: unknown): Promise<vo
 	}
 }
 
+async function writeJsonAtomically(filePath: string, value: unknown): Promise<void> {
+	await writeTextAtomically(filePath, JSON.stringify(value));
+}
+
 export default function leanflow(pi: ExtensionAPI): void {
 	let state: LeanFlowState = defaultState();
 	let hasPersistedLeanFlowState = false;
-	// Correlate tool_call → tool_result for plan writes, LSP probes, and gate calls.
+	// Correlate pre-scheduled calls with their eventual results without trusting result-hook inputs.
 	const pendingPlanRefreshes = new Set<string>(); // successful canonical write/edit → reread and reassess
 	const pendingLspProbes = new Map<string, string>(); // toolCallId → diagnostics target
 	const pendingApprovalWrites = new Map<string, string>(); // toolCallId → exact plan artifact
 	const pendingGateCalls = new Set<string>(); // toolCallIds
-	const pendingArtifactUpdates = new Map<string, string[]>(); // toolCallId → artifact kinds
+	type PendingEvidenceObservation =
+		| { toolName: "bash"; command: string }
+		| { toolName: "lsp"; lspRequest: ParsedLspRequest };
+	const pendingEvidenceObservations = new Map<string, PendingEvidenceObservation>();
 
 	function persist(): void {
 		pi.appendEntry(CUSTOM_TYPE, state);
@@ -518,20 +644,257 @@ export default function leanflow(pi: ExtensionAPI): void {
 		}
 	}
 
+	function setPersistenceFailure(
+		ctx: ExtensionContext,
+		stage: NonNullable<LeanFlowState["persistenceFailureStage"]>,
+		targetPath: string,
+		error: unknown,
+		codeOverride?: string,
+	): void {
+		const errorCode =
+			typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
+				? error.code
+				: undefined;
+		const code = codeOverride ?? errorCode ?? "UNKNOWN";
+		const message = error instanceof Error ? error.message : String(error);
+		state.persistenceDegraded = true;
+		state.persistenceFailureStage = stage;
+		state.persistenceFailurePath = targetPath;
+		state.persistenceFailureCode = code;
+		state.persistenceFailureMessage = message;
+		if (ctx.hasUI) {
+			ctx.ui.notify(
+				`LeanFlow: workflow state persistence failed during ${stage} write (code: ${code}, path: ${targetPath}): ${message}`,
+				"warning",
+			);
+		}
+	}
+
+	function clearPersistenceFailure(): void {
+		state.persistenceDegraded = false;
+		delete state.persistenceFailureStage;
+		delete state.persistenceFailurePath;
+		delete state.persistenceFailureCode;
+		delete state.persistenceFailureMessage;
+	}
+
+	function evidenceFailureMessage(error: unknown): string {
+		return error instanceof Error ? error.message : String(error);
+	}
+
+	function activeBuildIdentity(round: number): BuildRecordIdentity {
+		if (!state.runId || !state.planSlug || !state.planDigest) {
+			throw new Error("active LeanFlow run identity is incomplete");
+		}
+		return {
+			runId: state.runId,
+			planSlug: state.planSlug,
+			planDigest: state.planDigest,
+			round,
+		};
+	}
+
+	function activeBuildRecordPath(ctx: ExtensionContext): string {
+		if (!ctx.localProtocolOptions || !state.runId) {
+			throw new Error("local protocol options or run ID are unavailable");
+		}
+		const artifact = buildRecordArtifact(state.runId);
+		const recordPath = resolveRunMarkerPath(ctx.localProtocolOptions, artifact);
+		if (!recordPath) throw new Error(`internal build record path cannot be resolved: ${artifact}`);
+		return recordPath;
+	}
+
+	async function loadBuildRecord(ctx: ExtensionContext, round: number): Promise<BuildEvidenceRecordV1> {
+		const recordPath = activeBuildRecordPath(ctx);
+		let value: unknown;
+		try {
+			value = JSON.parse(await fs.readFile(recordPath, "utf8"));
+		} catch (error) {
+			throw new Error(`internal build record is missing or unreadable: ${evidenceFailureMessage(error)}`);
+		}
+		return parseBuildEvidenceRecord(value, activeBuildIdentity(round));
+	}
+
+	async function initializeBuildRecord(ctx: ExtensionContext): Promise<boolean> {
+		state.baselineCaptured = false;
+		state.buildMutationObserved = false;
+		state.writtenArtifacts = [];
+		try {
+			const record = createBuildEvidenceRecord(activeBuildIdentity(1));
+			await writeJsonAtomically(activeBuildRecordPath(ctx), record);
+			return true;
+		} catch (error) {
+			if (ctx.hasUI) {
+				ctx.ui.notify(
+					`LeanFlow: failed to initialize the extension-owned BUILD record: ${evidenceFailureMessage(error)}`,
+					"warning",
+				);
+			}
+			return false;
+		}
+	}
+
+	async function beginRepairBuildRound(ctx: ExtensionContext): Promise<void> {
+		try {
+			const currentRound = state.gateAttempt;
+			const record = await loadBuildRecord(ctx, currentRound);
+			const nextRecord: BuildEvidenceRecordV1 = {
+				...record,
+				round: currentRound + 1,
+				observations: [],
+			};
+			await writeJsonAtomically(activeBuildRecordPath(ctx), nextRecord);
+		} catch (error) {
+			if (ctx.hasUI) {
+				ctx.ui.notify(
+					`LeanFlow: failed to start the repair evidence round: ${evidenceFailureMessage(error)}`,
+					"warning",
+				);
+			}
+		}
+	}
+
+	async function appendBuildObservation(
+		ctx: ExtensionContext,
+		observation: BuildEvidenceObservationV1,
+	): Promise<void> {
+		const record = await loadBuildRecord(ctx, state.gateAttempt + 1);
+		record.observations.push(observation);
+		await writeJsonAtomically(activeBuildRecordPath(ctx), record);
+	}
+
+	function flattenTextContent(content: unknown): string {
+		if (typeof content === "string") return content;
+		if (!Array.isArray(content)) return "";
+		return content
+			.flatMap((block) =>
+				isPlainRecord(block) && block.type === "text" && typeof block.text === "string" ? [block.text] : [],
+			)
+			.join("\n");
+	}
+
+
+	function shellQuote(value: string): string {
+		return /^[A-Za-z0-9_./:=+-]+$/.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`;
+	}
+
+	function gitCommand(args: readonly string[]): string {
+		return `git ${args.map(shellQuote).join(" ")}`;
+	}
+
+	function combinedExecOutput(stdout: string, stderr: string): string {
+		if (!stderr) return stdout;
+		const separator = stdout.length === 0 || stdout.endsWith("\n") ? "" : "\n";
+		return `${stdout}${separator}[stderr]\n${stderr}`;
+	}
+
+	async function runGit(
+		ctx: ExtensionContext,
+		args: string[],
+		signal: AbortSignal | undefined,
+		acceptedCodes: readonly number[] = [0],
+		label?: string,
+	): Promise<{ stdout: string; stderr: string; code: number; evidence: GitCommandEvidence }> {
+		const result = await pi.exec("git", args, { cwd: ctx.cwd, signal });
+		if (result.killed || !acceptedCodes.includes(result.code)) {
+			throw new Error(
+				`${gitCommand(args)} failed with code ${result.code}${result.killed ? " (killed)" : ""}: ${combinedExecOutput(result.stdout, result.stderr)}`,
+			);
+		}
+		return {
+			stdout: result.stdout,
+			stderr: result.stderr,
+			code: result.code,
+			evidence: {
+				command: gitCommand(args),
+				exitCode: result.code,
+				output: combinedExecOutput(result.stdout, result.stderr),
+				...(label ? { label } : {}),
+			},
+		};
+	}
+
+	function parseNulList(output: string, command: string): string[] {
+		if (output.length === 0) return [];
+		if (!output.endsWith("\0")) throw new Error(`${command} returned a malformed NUL-delimited path list.`);
+		const values = output.slice(0, -1).split("\0");
+		if (values.some((value) => value.length === 0)) {
+			throw new Error(`${command} returned an empty path entry.`);
+		}
+		return values;
+	}
+
+	async function validateUntrackedPath(
+		ctx: ExtensionContext,
+		relative: string,
+	): Promise<{ absolute: string; size: number }> {
+		if (
+			relative.includes("\0") ||
+			path.isAbsolute(relative) ||
+			path.posix.normalize(relative) !== relative ||
+			relative === "." ||
+			relative === ".." ||
+			relative.startsWith("../")
+		) {
+			throw new Error(`untracked path escapes or is not canonical: ${JSON.stringify(relative)}`);
+		}
+		const root = path.resolve(ctx.cwd);
+		const absolute = path.resolve(root, relative);
+		if (absolute === root || !absolute.startsWith(`${root}${path.sep}`)) {
+			throw new Error(`untracked path escapes the repository: ${JSON.stringify(relative)}`);
+		}
+		const real = await fs.realpath(absolute);
+		if (real !== root && !real.startsWith(`${root}${path.sep}`)) {
+			throw new Error(`untracked path resolves outside the repository: ${JSON.stringify(relative)}`);
+		}
+		const stat = await fs.lstat(absolute);
+		if (!stat.isFile() && !stat.isSymbolicLink()) {
+			throw new Error(`untracked path is not a file: ${JSON.stringify(relative)}`);
+		}
+		return { absolute, size: stat.size };
+	}
 	async function writeRunMarker(ctx: ExtensionContext, status: NonNullable<LeanFlowState["runMarkerStatus"]>): Promise<boolean> {
 		if (!state.runId || !state.planSlug || !state.planArtifact || !state.planDigest || !state.startedAt || !state.stats) {
-			state.persistenceDegraded = true;
+			setPersistenceFailure(
+				ctx,
+				"precondition",
+				state.planArtifact ?? "local://.leanflow",
+				new Error("run marker state is incomplete"),
+				"INVALID_STATE",
+			);
 			return false;
 		}
 		const options = ctx.localProtocolOptions;
 		if (!options) {
-			state.persistenceDegraded = true;
+			setPersistenceFailure(
+				ctx,
+				"precondition",
+				"local://.leanflow",
+				new Error("local protocol options are unavailable"),
+				"NO_LOCAL_PROTOCOL",
+			);
 			return false;
 		}
 		const artifact = runMarkerArtifact(state.planSlug, state.runId);
+		const pointerArtifact = activePointerArtifact(state.planSlug);
+		state.runMarkerArtifact = artifact;
+		state.runMarkerStatus = status;
 		const markerPath = resolveRunMarkerPath(options, artifact);
-		const pointerPath = resolveRunMarkerPath(options, activePointerArtifact(state.planSlug));
-		if (!markerPath || !pointerPath) return false;
+		if (!markerPath) {
+			setPersistenceFailure(ctx, "marker", artifact, new Error("run marker path cannot be resolved"), "INVALID_PATH");
+			return false;
+		}
+		const pointerPath = resolveRunMarkerPath(options, pointerArtifact);
+		if (!pointerPath) {
+			setPersistenceFailure(
+				ctx,
+				"pointer",
+				pointerArtifact,
+				new Error("active pointer path cannot be resolved"),
+				"INVALID_PATH",
+			);
+			return false;
+		}
 		const now = Date.now();
 		const marker: RunMarker = {
 			version: 2,
@@ -557,25 +920,25 @@ export default function leanflow(pi: ExtensionAPI): void {
 			status,
 			updatedAt: now,
 		};
-		state.runMarkerArtifact = artifact;
-		state.runMarkerStatus = status;
+		let failureStage: NonNullable<LeanFlowState["persistenceFailureStage"]> =
+			status === "awaiting_approval" ? "marker" : "pointer";
+		let failurePath = status === "awaiting_approval" ? markerPath : pointerPath;
 		try {
 			if (status === "awaiting_approval") {
 				await writeJsonAtomically(markerPath, marker);
+				failureStage = "pointer";
+				failurePath = pointerPath;
 				await writeJsonAtomically(pointerPath, pointer);
 			} else {
 				await writeJsonAtomically(pointerPath, pointer);
+				failureStage = "marker";
+				failurePath = markerPath;
 				await writeJsonAtomically(markerPath, marker);
 			}
+			clearPersistenceFailure();
 			return true;
-		} catch {
-			state.persistenceDegraded = true;
-			if (ctx.hasUI) {
-				ctx.ui.notify(
-					"LeanFlow: workflow state persistence degraded; this approved session may continue, but future fresh-session recovery is unavailable.",
-					"warning",
-				);
-			}
+		} catch (error) {
+			setPersistenceFailure(ctx, failureStage, failurePath, error);
 			return false;
 		}
 	}
@@ -585,38 +948,34 @@ export default function leanflow(pi: ExtensionAPI): void {
 		const options = ctx.localProtocolOptions;
 		if (!options) return { kind: "none" };
 		const slug = planSlugFromArtifact(approvedArtifact);
-		const pointerPath = resolveRunMarkerPath(options, activePointerArtifact(slug));
-		if (!pointerPath) return { kind: "none" };
 		let rawPointer: unknown;
-		try {
-			rawPointer = JSON.parse(await fs.readFile(pointerPath, "utf8"));
-		} catch (error) {
-			const missing = typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
-			if (!missing) return { kind: "invalid", reason: "corrupt active pointer" };
-			const runsPath = resolveRunMarkerPath(options, "local://.leanflow/runs");
-			if (!runsPath) return { kind: "invalid", reason: "invalid active marker directory" };
+		let pointerFound = false;
+		let legacyPathTooLong = false;
+		const pointerArtifacts = [activePointerArtifact(slug), legacyActivePointerArtifact(slug)];
+		for (let index = 0; index < pointerArtifacts.length; index++) {
+			const pointerPath = resolveRunMarkerPath(options, pointerArtifacts[index]!);
+			if (!pointerPath) return { kind: "invalid", reason: "invalid active pointer path" };
 			try {
-				const names = await fs.readdir(runsPath);
-				let activeMatches = 0;
-				for (const name of names.filter((candidate) => candidate.endsWith(".json"))) {
-					try {
-						const candidate: unknown = JSON.parse(await fs.readFile(path.join(runsPath, name), "utf8"));
-						if (
-							isRunMarker(candidate, approvedArtifact) &&
-							candidate.planSlug === slug &&
-							name === `${candidate.runId}.json`
-						) {
-							activeMatches++;
-						}
-					} catch {
-						// Corrupt and expired orphan markers cannot claim an ordinary approval.
-					}
-				}
-				if (activeMatches === 0) return { kind: "none" };
-				return {
-					kind: "invalid",
-					reason: activeMatches > 1 ? "multiple active marker candidates" : "orphan active marker",
-				};
+				rawPointer = JSON.parse(await fs.readFile(pointerPath, "utf8"));
+				pointerFound = true;
+				break;
+			} catch (error) {
+				const code =
+					typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
+						? error.code
+						: undefined;
+				if (index === 1 && code === "ENAMETOOLONG") legacyPathTooLong = true;
+				const absent = code === "ENOENT" || (index === 1 && code === "ENAMETOOLONG");
+				if (!absent) return { kind: "invalid", reason: "corrupt active pointer" };
+			}
+		}
+		if (!pointerFound) {
+			const runsPath = resolveRunMarkerPath(options, "local://.leanflow/runs");
+			const planPath = resolveRunMarkerPath(options, approvedArtifact);
+			if (!runsPath || !planPath) return { kind: "invalid", reason: "invalid orphan recovery path" };
+			let names: string[];
+			try {
+				names = await fs.readdir(runsPath);
 			} catch (scanError) {
 				const noRuns =
 					typeof scanError === "object" &&
@@ -626,6 +985,40 @@ export default function leanflow(pi: ExtensionAPI): void {
 				return noRuns
 					? { kind: "none" }
 					: { kind: "invalid", reason: "unreadable active marker directory" };
+			}
+			const activeMarkers: RunMarker[] = [];
+			for (const name of names.filter((candidate) => candidate.endsWith(".json"))) {
+				try {
+					const candidate: unknown = JSON.parse(await fs.readFile(path.join(runsPath, name), "utf8"));
+					if (
+						isRunMarker(candidate, approvedArtifact) &&
+						candidate.planSlug === slug &&
+						name === `${candidate.runId}.json`
+					) {
+						activeMarkers.push(candidate);
+					}
+				} catch {
+					// Corrupt and expired orphan markers cannot claim an ordinary approval.
+				}
+			}
+			if (activeMarkers.length === 0) return { kind: "none" };
+			if (!legacyPathTooLong || activeMarkers.length > 1) {
+				return {
+					kind: "invalid",
+					reason:
+						activeMarkers.length > 1
+							? "multiple active marker candidates"
+							: "orphan active marker mismatch",
+				};
+			}
+			try {
+				const content = await fs.readFile(planPath, "utf8");
+				const marker = activeMarkers[0]!;
+				return marker.runId === runIdFromPlan(content) && marker.planDigest === planDigest(content)
+					? { kind: "valid", marker }
+					: { kind: "invalid", reason: "orphan active marker mismatch" };
+			} catch {
+				return { kind: "invalid", reason: "unreadable orphan recovery plan" };
 			}
 		}
 		if (!rawPointer || typeof rawPointer !== "object" || Array.isArray(rawPointer)) {
@@ -766,7 +1159,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 		state.approvedPlanArtifact = artifact;
 		state.proposedPlanDigest = state.planDigest;
 		transitionPhase(state, "building");
-		state.writtenArtifacts = [];
+		await initializeBuildRecord(ctx);
 		await writeRunMarker(ctx, "building");
 		persist();
 		return true;
@@ -867,6 +1260,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 		state.approvedPlanArtifact = marker.planArtifact;
 		state.proposedPlanDigest = state.planDigest;
 		transitionPhase(state, "building", now);
+		await initializeBuildRecord(ctx);
 		await writeRunMarker(ctx, "building");
 		persist();
 		return true;
@@ -922,6 +1316,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 			state.gateRetryMode = "repair";
 			transitionPhase(state, "building");
 			state.writtenArtifacts = [];
+			await beginRepairBuildRound(ctx);
 			persist();
 			updateStatus(ctx);
 			ctx.ui.notify("LeanFlow: Gate returned FAIL. Repair, refresh evidence, and re-gate (1 retry left).", "warning");
@@ -961,22 +1356,50 @@ export default function leanflow(pi: ExtensionAPI): void {
 		pendingLspProbes.clear();
 		pendingApprovalWrites.clear();
 		pendingGateCalls.clear();
-		pendingArtifactUpdates.clear();
+		pendingEvidenceObservations.clear();
 		resumePhaseTiming(state);
 		updateStatus(ctx);
 	};
-	pi.on("agent_end", async (event, ctx) => {
-		if (
-			(state.phase === "planning" || state.phase === "awaiting_approval") &&
-			pendingPlanRefreshes.size > 0
-		) {
-			pendingPlanRefreshes.clear();
-			await refreshCanonicalPlanState(ctx, "mutation");
+	async function refreshSettledPlanMutations(toolCallIds: Iterable<string>, ctx: ExtensionContext): Promise<void> {
+		let settled = false;
+		for (const toolCallId of toolCallIds) {
+			if (pendingPlanRefreshes.delete(toolCallId)) settled = true;
 		}
 		if (
-			state.phase === "finalizing" &&
-			(typeof event !== "object" || event === null || !("willContinue" in event) || event.willContinue !== true)
+			settled &&
+			(state.phase === "planning" || state.phase === "awaiting_approval")
 		) {
+			await refreshCanonicalPlanState(ctx, "mutation");
+		}
+	}
+
+	pi.on("turn_end", async (event, ctx) => {
+		await refreshSettledPlanMutations(
+			event.toolResults.map((result) => result.toolCallId),
+			ctx,
+		);
+	});
+
+	pi.on("agent_end", async (event, ctx) => {
+		const willContinue =
+			typeof event === "object" && event !== null && "willContinue" in event && event.willContinue === true;
+		const settledToolCallIds =
+			typeof event === "object" && event !== null && "messages" in event && Array.isArray(event.messages)
+				? event.messages.flatMap((message) =>
+						typeof message === "object" &&
+						message !== null &&
+						"toolCallId" in message &&
+						typeof message.toolCallId === "string"
+							? [message.toolCallId]
+							: [],
+					)
+				: [];
+		await refreshSettledPlanMutations(settledToolCallIds, ctx);
+		if (!willContinue && pendingPlanRefreshes.size > 0) {
+			await refreshSettledPlanMutations([...pendingPlanRefreshes], ctx);
+		}
+		pendingEvidenceObservations.clear();
+		if (state.phase === "finalizing" && !willContinue) {
 			transitionPhase(state, "idle");
 			persist();
 			updateStatus(ctx);
@@ -986,6 +1409,9 @@ export default function leanflow(pi: ExtensionAPI): void {
 	pi.on("session_switch", restoreSessionState);
 	pi.on("session_branch", restoreSessionState);
 	pi.on("session_tree", restoreSessionState);
+	pi.on("session_shutdown", async () => {
+		pendingEvidenceObservations.clear();
+	});
 
 	// -----------------------------------------------------------------------
 	// /flow command
@@ -1011,13 +1437,8 @@ export default function leanflow(pi: ExtensionAPI): void {
 				task = input.trim();
 			}
 
-			// Generate a slug from the task text.
-			const slug =
-				task
-					.toLowerCase()
-					.replace(/[^a-z0-9\u4e00-\u9fff]+/g, "-")
-					.replace(/^-+|-+$/g, "")
-					.slice(0, 40) || "task";
+			// Keep every artifact component ASCII-bounded while preserving task identity.
+			const slug = taskSlug(task);
 
 			if (
 				state.runMarkerArtifact &&
@@ -1025,6 +1446,8 @@ export default function leanflow(pi: ExtensionAPI): void {
 			) {
 				await writeRunMarker(ctx, "abandoned");
 			}
+
+			pendingEvidenceObservations.clear();
 
 			// Initialize state machine and the first observable phase.
 			const now = Date.now();
@@ -1049,15 +1472,257 @@ export default function leanflow(pi: ExtensionAPI): void {
 		},
 	});
 
+	const { z } = pi.zod;
+	const captureBaselineParameters = z.object({}).strict();
+	const finalizeArtifactsParameters = z
+		.object({
+			validationCommands: z.array(z.string().min(1)).min(1),
+		})
+		.strict();
+	pi.registerTool<typeof captureBaselineParameters>({
+		name: "leanflow_capture_baseline",
+		label: "Capture LeanFlow Baseline",
+		description: "Capture the immutable BUILD HEAD and status after the required initial LSP probe and before repository mutations.",
+		parameters: captureBaselineParameters,
+		strict: true,
+		async execute(_toolCallId, _params, signal, _onUpdate, ctx) {
+			const fail = (message: string) => ({
+				content: [{ type: "text" as const, text: `LeanFlow baseline capture failed: ${message}` }],
+				isError: true,
+			});
+			if (state.phase !== "building") return fail("the workflow is not in BUILD.");
+			if (state.lspProbeStatus === "pending") return fail("complete the required initial LSP diagnostics probe first.");
+			if (pendingEvidenceObservations.size > 0) {
+				return fail("a BUILD observation is still unpersisted; run /flowcancel and start a new run.");
+			}
+			if (state.baselineCaptured === true) return fail("the immutable BUILD baseline is already captured.");
+			if (state.buildMutationObserved === true) {
+				return fail("a repository mutation was already authorized; run /flowcancel and start a new run.");
+			}
+			try {
+				const record = await loadBuildRecord(ctx, 1);
+				if (record.baseline) return fail("the internal record already contains a baseline.");
+				const headResult = await runGit(ctx, ["rev-parse", "HEAD"], signal);
+				const statusResult = await runGit(ctx, ["status", "--short", "--untracked-files=all"], signal);
+				const head = headResult.stdout.trim();
+				if (!head || head.includes("\n")) throw new Error("git rev-parse HEAD returned an invalid commit identity");
+				record.baseline = {
+					head,
+					status: statusResult.stdout.trimEnd(),
+					capturedAt: Date.now(),
+				};
+				await writeJsonAtomically(activeBuildRecordPath(ctx), record);
+				state.baselineCaptured = true;
+				persist();
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: `LeanFlow immutable BUILD baseline captured at ${head}.`,
+						},
+					],
+				};
+			} catch (error) {
+				return fail(evidenceFailureMessage(error));
+			}
+		},
+	});
+
+	pi.registerTool<typeof finalizeArtifactsParameters>({
+		name: "leanflow_finalize_artifacts",
+		label: "Finalize LeanFlow Artifacts",
+		description: "Mechanically generate this run's build, complete diff, and runtime evidence artifacts from recorded observations.",
+		parameters: finalizeArtifactsParameters,
+		strict: true,
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const fail = (message: string) => ({
+				content: [{ type: "text" as const, text: `LeanFlow artifact finalization failed: ${message}` }],
+				isError: true,
+			});
+			if (state.phase !== "building") return fail("the workflow is not in BUILD.");
+			if (state.gateRetryMode === "operational") {
+				return fail("an operational Gate retry must reuse the existing artifacts unchanged.");
+			}
+			if (state.lspProbeStatus === "pending") return fail("the required initial LSP diagnostics probe is incomplete.");
+			if (state.baselineCaptured !== true) return fail("capture the immutable BUILD baseline first.");
+			if (pendingEvidenceObservations.size > 0) {
+				return fail("one or more BUILD observations are still unpersisted.");
+			}
+			try {
+				if (!state.planArtifact || !state.runId || !state.planDigest || !ctx.localProtocolOptions) {
+					throw new Error("active plan identity or local protocol options are incomplete");
+				}
+				const planPath = resolveRunMarkerPath(ctx.localProtocolOptions, state.planArtifact);
+				if (!planPath) throw new Error("canonical plan path cannot be resolved");
+				const planContent = await fs.readFile(planPath, "utf8");
+				if (runIdFromPlan(planContent) !== state.runId || planDigest(planContent) !== state.planDigest) {
+					throw new Error("canonical plan run ID or digest changed after approval");
+				}
+
+				const record = await loadBuildRecord(ctx, state.gateAttempt + 1);
+				if (!record.baseline) throw new Error("the internal build record has no immutable baseline");
+				const validations = selectValidationObservations(record, params.validationCommands);
+				const gitEvidence: GitCommandEvidence[] = [
+					{
+						command: "git rev-parse HEAD",
+						label: "Baseline HEAD captured by leanflow_capture_baseline",
+						exitCode: 0,
+						output: `${record.baseline.head}\n`,
+					},
+					{
+						command: "git status --short --untracked-files=all",
+						label: "Baseline status captured by leanflow_capture_baseline",
+						exitCode: 0,
+						output: record.baseline.status,
+					},
+				];
+
+				const finalHeadResult = await runGit(ctx, ["rev-parse", "HEAD"], signal, [0], "Final HEAD");
+				gitEvidence.push(finalHeadResult.evidence);
+				const finalHead = finalHeadResult.stdout.trim();
+				if (finalHead !== record.baseline.head) {
+					throw new Error(
+						`final HEAD ${finalHead || "(empty)"} differs from baseline HEAD ${record.baseline.head}`,
+					);
+				}
+				const finalStatusResult = await runGit(
+					ctx,
+					["status", "--short", "--untracked-files=all"],
+					signal,
+					[0],
+					"Final status",
+				);
+				gitEvidence.push(finalStatusResult.evidence);
+				const finalStatus = finalStatusResult.stdout.trimEnd();
+
+				const trackedDiffResult = await runGit(
+					ctx,
+					["diff", "--binary", record.baseline.head, "--"],
+					signal,
+					[0],
+					"Tracked complete binary diff",
+				);
+				gitEvidence.push(trackedDiffResult.evidence);
+				const trackedNamesResult = await runGit(
+					ctx,
+					["diff", "--name-only", "-z", record.baseline.head, "--"],
+					signal,
+					[0],
+					"Tracked changed paths",
+				);
+				const trackedPaths = parseNulList(trackedNamesResult.stdout, trackedNamesResult.evidence.command);
+				gitEvidence.push({
+					...trackedNamesResult.evidence,
+					output: trackedPaths.map((candidate) => JSON.stringify(candidate)).join("\n"),
+				});
+				const untrackedResult = await runGit(
+					ctx,
+					["ls-files", "--others", "--exclude-standard", "-z"],
+					signal,
+					[0],
+					"Sorted untracked paths",
+				);
+				const untrackedPaths = parseNulList(untrackedResult.stdout, untrackedResult.evidence.command).sort((left, right) =>
+					Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8")),
+				);
+				gitEvidence.push({
+					...untrackedResult.evidence,
+					output: untrackedPaths.map((candidate) => JSON.stringify(candidate)).join("\n"),
+				});
+
+				const untrackedPatches: UntrackedPatch[] = [];
+				const emptyUntrackedFiles: string[] = [];
+				for (const relative of untrackedPaths) {
+					const { size } = await validateUntrackedPath(ctx, relative);
+					if (size === 0) {
+						emptyUntrackedFiles.push(relative);
+						continue;
+					}
+					const patchResult = await runGit(
+						ctx,
+						["diff", "--no-index", "--binary", "--", os.devNull, relative],
+						signal,
+						[1],
+						`Untracked binary diff: ${relative}`,
+					);
+					untrackedPatches.push({ path: relative, patch: patchResult.stdout });
+					gitEvidence.push(patchResult.evidence);
+				}
+
+				const completeDiff = composeCompleteDiff(
+					trackedDiffResult.stdout,
+					untrackedPatches,
+					emptyUntrackedFiles,
+				);
+				const changedPaths = [...new Set([...trackedPaths, ...untrackedPaths])];
+				const rendered = renderBuildArtifacts({
+					planArtifact: state.planArtifact,
+					record,
+					finalHead,
+					finalStatus,
+					changedPaths,
+					validations,
+					gitCommands: gitEvidence,
+					completeDiff,
+				});
+				const artifacts = expectedGateArtifacts(state);
+				if (!artifacts) throw new Error("canonical Gate artifact identity is unavailable");
+				const outputs = [
+					{ kind: "build", artifact: artifacts.build, content: rendered.build },
+					{ kind: "diff", artifact: artifacts.diff, content: rendered.diff },
+					{ kind: "evidence", artifact: artifacts.evidence, content: rendered.evidence },
+				] as const;
+
+				state.writtenArtifacts = [];
+				persist();
+				const verified: string[] = [];
+				for (const output of outputs) {
+					const filePath = resolveRunMarkerPath(ctx.localProtocolOptions, output.artifact);
+					if (!filePath) throw new Error(`canonical ${output.kind} artifact path cannot be resolved`);
+					await writeTextAtomically(filePath, output.content);
+					const persisted = await fs.readFile(filePath, "utf8");
+					const expectedBytes = Buffer.byteLength(output.content, "utf8");
+					const actualBytes = Buffer.byteLength(persisted, "utf8");
+					const expectedDigest = sha256Hex(output.content);
+					const actualDigest = sha256Hex(persisted);
+					if (expectedBytes !== actualBytes || expectedDigest !== actualDigest) {
+						throw new Error(`canonical ${output.kind} artifact failed byte/hash verification`);
+					}
+					verified.push(`${output.kind}.md ${actualBytes} bytes sha256:${actualDigest}`);
+				}
+				state.writtenArtifacts = [...REQUIRED_ARTIFACTS];
+				persist();
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: `LeanFlow Gate artifacts finalized and verified:\n${verified.join("\n")}`,
+						},
+					],
+				};
+			} catch (error) {
+				return fail(evidenceFailureMessage(error));
+			}
+		},
+	});
+
 	// -----------------------------------------------------------------------
 	// Tool guard + phase transitions (pre-execution)
 	// -----------------------------------------------------------------------
 	pi.on("tool_call", async (event, ctx) => {
 		if (state.phase === "idle") return;
 		if (state.phase === "finalizing") {
+			if (isFinalizingTodoCompletion(event)) return;
 			return {
 				block: true,
 				reason: "LeanFlow: no tools are allowed while producing the terminal response.",
+			};
+		}
+
+		if (event.toolName === "task" && !isTaskToolCall(event)) {
+			return {
+				block: true,
+				reason: "LeanFlow guard: task input must be a plain object.",
 			};
 		}
 
@@ -1069,6 +1734,13 @@ export default function leanflow(pi: ExtensionAPI): void {
 			return {
 				block: true,
 				reason: "LeanFlow: internal workflow state artifacts are extension-owned.",
+			};
+		}
+
+		if (state.phase === "building" && targetsCanonicalGateArtifact(ctx, event, state)) {
+			return {
+				block: true,
+				reason: "LeanFlow: Gate artifacts are extension-generated; use leanflow_finalize_artifacts.",
 			};
 		}
 
@@ -1094,25 +1766,40 @@ export default function leanflow(pi: ExtensionAPI): void {
 		}
 
 		const effect = classifyToolEffect(ctx, event, canonicalPlanArtifact);
+		const lspProbePending = state.phase === "building" && state.lspProbeStatus === "pending";
+		const baselinePending =
+			state.phase === "building" && state.lspProbeStatus !== "pending" && state.baselineCaptured !== true;
 		const locked =
 			state.phase === "planning" ||
 			(state.phase === "awaiting_approval" && !approvalConfirmed) ||
-			(state.phase === "building" && state.lspProbeStatus === "pending");
+			lspProbePending ||
+			baselinePending;
 		const planningScout =
 			state.phase === "planning" && isTaskToolCall(event) && roles.length > 0 && roles.every((role) => role === "scout");
+		const baselineCapture =
+			baselinePending && event.toolName === "leanflow_capture_baseline";
 		const allowedWhileLocked =
 			effect === "read_only" ||
 			((state.phase === "planning" || state.phase === "awaiting_approval") &&
 				effect === "canonical_plan_mutation") ||
 			(state.phase === "awaiting_approval" && isProposalWrite(event)) ||
+			baselineCapture ||
 			planningScout;
 		if (locked && !allowedWhileLocked) {
 			return {
 				block: true,
 				reason:
-					state.phase === "building"
-						? "LeanFlow: only read-only tools and a valid LSP diagnostics probe are allowed before the first BUILD mutation."
-						: "LeanFlow: this tool or operation is not explicitly read-only before native plan approval.",
+					state.phase !== "building"
+						? "LeanFlow: this tool or operation is not explicitly read-only before native plan approval."
+						: lspProbePending
+							? "LeanFlow: only read-only tools and a valid LSP diagnostics probe are allowed before the first BUILD mutation."
+							: "LeanFlow: capture the immutable BUILD baseline before repository mutations.",
+			};
+		}
+		if (state.phase === "building" && state.gateRetryMode === "operational" && effect === "repository_mutation") {
+			return {
+				block: true,
+				reason: "LeanFlow: an operational Gate retry must reuse the implementation and evidence unchanged.",
 			};
 		}
 
@@ -1121,6 +1808,12 @@ export default function leanflow(pi: ExtensionAPI): void {
 			const scoutCount = roles.filter((role) => role === "scout").length;
 			const gateCount = roles.filter((role) => role === "gate").length;
 			if (gateCount > 0) {
+				const artifacts = expectedGateArtifacts(state);
+				if (!artifacts) {
+					return { block: true, reason: "LeanFlow guard: Gate call has no active canonical artifact identity." };
+				}
+				const shape = validateGateTaskCall(event.input, artifacts);
+				if (shape.block) return { block: true, reason: shape.reason };
 				const missing = missingArtifacts(state);
 				if (missing.length > 0) {
 					recordStats(() => recordGateReadinessBlock(state));
@@ -1204,9 +1897,23 @@ export default function leanflow(pi: ExtensionAPI): void {
 			pendingApprovalWrites.set(event.toolCallId, expected);
 		}
 
-		if (state.phase === "building") {
-			const kinds = artifactKindsForEvent(ctx, event, state);
-			if (kinds.length > 0) pendingArtifactUpdates.set(event.toolCallId, kinds);
+		if (state.phase === "building" && effect === "repository_mutation") {
+			state.buildMutationObserved = true;
+			if ((state.writtenArtifacts?.length ?? 0) > 0) state.writtenArtifacts = [];
+			persist();
+		}
+		if (state.phase === "building" && state.gateRetryMode !== "operational") {
+			if (event.toolName === "bash" && typeof event.input.command === "string" && event.input.command.trim()) {
+				pendingEvidenceObservations.set(event.toolCallId, {
+					toolName: "bash",
+					command: event.input.command,
+				});
+			} else if (effect === "read_only") {
+				const lspRequest = parseLspObservationRequest(event);
+				if (lspRequest) {
+					pendingEvidenceObservations.set(event.toolCallId, { toolName: "lsp", lspRequest });
+				}
+			}
 		}
 	});
 
@@ -1215,6 +1922,55 @@ export default function leanflow(pi: ExtensionAPI): void {
 	// -----------------------------------------------------------------------
 
 	pi.on("tool_result", async (event, ctx) => {
+		const pendingObservation = pendingEvidenceObservations.get(event.toolCallId);
+		if (pendingObservation) {
+			const details = isPlainRecord(event.details) ? event.details : undefined;
+			const timedOut = typeof details?.timedOut === "boolean" ? details.timedOut : undefined;
+			const asyncDetails = details && isPlainRecord(details.async) ? details.async : undefined;
+			const asyncRunning = asyncDetails?.state === "running";
+			const explicitExitCode =
+				typeof details?.exitCode === "number" && Number.isInteger(details.exitCode)
+					? details.exitCode
+					: undefined;
+			const exitCode =
+				pendingObservation.toolName === "bash" &&
+				explicitExitCode === undefined &&
+				!event.isError &&
+				timedOut !== true &&
+				!asyncRunning
+					? 0
+					: explicitExitCode;
+			const observation: BuildEvidenceObservationV1 = {
+				toolCallId: event.toolCallId,
+				toolName: pendingObservation.toolName,
+				...(pendingObservation.toolName === "bash"
+					? { command: pendingObservation.command }
+					: { lspRequest: pendingObservation.lspRequest }),
+				isError: event.isError,
+				...(exitCode !== undefined ? { exitCode } : {}),
+				...(timedOut !== undefined ? { timedOut } : {}),
+				text: flattenTextContent(event.content),
+			};
+			try {
+				await appendBuildObservation(ctx, observation);
+				pendingEvidenceObservations.delete(event.toolCallId);
+			} catch (error) {
+				state.baselineCaptured = false;
+				state.buildMutationObserved = true;
+				state.writtenArtifacts = [];
+				try {
+					persist();
+				} catch {
+					// In-memory invalidation still prevents capture/finalization in this session.
+				}
+				if (ctx.hasUI) {
+					ctx.ui.notify(
+						`LeanFlow: failed to persist BUILD observation: ${evidenceFailureMessage(error)}`,
+						"warning",
+					);
+				}
+			}
+		}
 		if (event.toolName === "write" && pendingApprovalWrites.has(event.toolCallId)) {
 			const artifact = pendingApprovalWrites.get(event.toolCallId)!;
 			pendingApprovalWrites.delete(event.toolCallId);
@@ -1248,16 +2004,6 @@ export default function leanflow(pi: ExtensionAPI): void {
 			return;
 		}
 
-		if (pendingArtifactUpdates.has(event.toolCallId)) {
-			const kinds = pendingArtifactUpdates.get(event.toolCallId)!;
-			pendingArtifactUpdates.delete(event.toolCallId);
-			if (event.isError) return;
-			const written = new Set(state.writtenArtifacts ?? []);
-			for (const kind of kinds) written.add(kind);
-			state.writtenArtifacts = [...written];
-			persist();
-			return;
-		}
 
 		if (event.toolName === "task" && pendingGateCalls.has(event.toolCallId)) {
 			pendingGateCalls.delete(event.toolCallId);
@@ -1306,6 +2052,9 @@ export default function leanflow(pi: ExtensionAPI): void {
 			if (state.runMarkerStatus === "awaiting_approval" || state.runMarkerStatus === "building") {
 				await writeRunMarker(ctx, "abandoned");
 			}
+			pendingEvidenceObservations.clear();
+			state.baselineCaptured = false;
+			state.buildMutationObserved = false;
 			transitionPhase(state, "idle");
 			persist();
 			updateStatus(ctx);
@@ -1334,15 +2083,10 @@ export default function leanflow(pi: ExtensionAPI): void {
 const REQUIRED_ARTIFACTS = ["build", "diff", "evidence"] as const;
 
 
-/** Canonical evidence artifacts targeted by a successful write or edit. */
-function artifactKindsForEvent(ctx: ExtensionContext, event: ToolCallEvent, state: LeanFlowState): string[] {
-	if (event.toolName !== "write" && event.toolName !== "edit") return [];
-	const kinds = new Set<string>();
-	for (const candidate of toolTargets(event)) {
-		const kind = artifactKind(ctx, candidate, state);
-		if (kind) kinds.add(kind);
-	}
-	return [...kinds];
+/** Whether a write/edit targets any extension-generated canonical Gate artifact. */
+function targetsCanonicalGateArtifact(ctx: ExtensionContext, event: ToolCallEvent, state: LeanFlowState): boolean {
+	if (event.toolName !== "write" && event.toolName !== "edit") return false;
+	return toolTargets(event).some((candidate) => artifactKind(ctx, candidate, state) !== undefined);
 }
 
 /** Classify only this run's canonical evidence artifacts. */

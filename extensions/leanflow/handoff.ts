@@ -23,13 +23,17 @@ export interface HandoffResult {
 
 export function assessHandoff(planContent: string): HandoffResult {
 	const warnings: string[] = [];
+	const semanticContent = planContent
+		.split(/\r?\n/)
+		.filter((line) => !/^\s*(?:LeanFlow run ID|LSP applicability):/i.test(line))
+		.join("\n");
 
 	// Critical: no modification target AND no file references → cannot execute.
 	const hasTarget =
-		/修改|change|modify|implement|add|remove|update|fix|create|delete|refactor|replace|rewrite/i.test(
-			planContent,
+		/(?:修改)|\b(?:change|modify|implement|add|remove|update|fix|create|delete|refactor|replace|rewrite)\b/i.test(
+			semanticContent,
 		);
-	const hasFileEntry = /[\w./-]+\.\w{1,6}/.test(planContent);
+	const hasFileEntry = /[\w./-]+\.\w{1,6}/.test(semanticContent);
 
 	if (!hasTarget && !hasFileEntry) {
 		return {
@@ -39,7 +43,7 @@ export function assessHandoff(planContent: string): HandoffResult {
 	}
 
 	// Semantic: does the plan describe what to verify?
-	if (!/test|验证|check|assert|expect|run|command|命令|smoke|spec|unittest|pytest|cargo|npm|bun/i.test(planContent)) {
+	if (!/test|验证|check|assert|expect|run|command|命令|smoke|spec|unittest|pytest|cargo|npm|bun/i.test(semanticContent)) {
 		warnings.push("No verification signals found — plan may lack test/validation detail.");
 	}
 
@@ -49,7 +53,7 @@ export function assessHandoff(planContent: string): HandoffResult {
 	}
 
 	// Size sanity (very short plans are suspicious).
-	if (planContent.length < 100) {
+	if (semanticContent.length < 100) {
 		warnings.push("Plan is very short — may lack implementation detail.");
 	}
 

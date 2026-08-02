@@ -27,10 +27,10 @@ There are no reviewer, audit, validator, planner, implementer, developer, coder,
 The LeanFlow extension (`extensions/leanflow/`) provides:
 
 - **State machine** — tracks `idle → planning → awaiting_approval → building → gating → finalizing → idle`, persists it via session entries, and measures Main Session provider usage, response count, and elapsed time
-- **Durable approval identity** — binds the approved plan's opaque run ID and SHA-256 content digest to extension-owned `local://.leanflow/runs/<runId>.json` state plus `local://.leanflow/active/<slug>.json`; model tool calls cannot modify that namespace, while terminal, cancelled, invalidated, expired, or malformed markers cannot recover
-- **Tool guard** — fails closed before approval and while the initial LSP probe is pending: only explicit read-only tools/LSP actions and exact workflow exceptions are allowed; Hashline, `local:/`, `local://`, and absolute sandbox targets resolve to filesystem identity; Main remains the sole writer
-- **Handoff advisor** — assesses plan completeness after write; a missing or mismatched run identity blocks approval
-- **Gate readiness** — Gate is blocked until build/diff/evidence artifacts are refreshed, preventing premature calls without consuming an attempt
+- **Durable approval identity** — binds the approved plan's opaque run ID and SHA-256 content digest to extension-owned `local://.leanflow/runs/<runId>.json` state plus the fixed-length `local://.leanflow/active/<sha256(slug)>.json` pointer; recovery checks that hash key first and falls back read-only to legacy percent-encoded pointer names, while terminal, cancelled, invalidated, expired, malformed, or ambiguously orphaned markers cannot recover
+- **Tool guard** — fails closed before approval, while the initial LSP probe is pending, and until `leanflow_capture_baseline` freezes HEAD/status; normalized Hashline, `local:/`, `local://`, and absolute sandbox targets resolve to filesystem identity; Main remains the sole source writer
+- **Mechanical evidence** — records only allowed bash/LSP inputs paired with real results in `local://.leanflow/runs/<runId>-build-record.json`; `leanflow_finalize_artifacts` validates selected synchronous commands, unchanged HEAD, full tracked/untracked binary diff, empty files, hashes, and size before atomically generating all Gate artifacts
+- **Gate readiness** — blocks direct artifact writes and malformed Gate wire shapes before budget accounting; Gate runs only after all three extension-generated artifacts verify successfully
 - **Context filter** — through BUILD, GATE, and finalization, removes planning history, injects a compact builder preamble, and records message-count and serialized-byte observations separately
 - **Budget enforcement** — max 3 Scout calls and max 2 Gate calls, checked before incrementing at the `tool_call` level
 - **Runtime stats** — `/flowstats` reports Main Session phase metrics, distinct Gate verdict/error counters, and context-filter reductions. Provider reduction plus Scout/Gate tokens are `not measured`
@@ -48,11 +48,11 @@ The LeanFlow extension (`extensions/leanflow/`) provides:
 
 ### BUILD
 
-After approval, the same Main Session becomes Builder. The extension filters planning history from context and injects a compact builder preamble. Builder records baseline state, implements the approved plan, runs the planned checks, collects runtime evidence, and writes `local://<slug>-build.md`, `local://<slug>-diff.md`, plus `local://<slug>-evidence.md`. No code-writing subagent exists.
+After approval, the same Main Session becomes Builder. For source plans it first runs the required LSP diagnostics probe, then calls `leanflow_capture_baseline({})`; documentation/resource-only plans skip only the probe. Main implements the approved plan and runs synchronous validation commands. It then calls `leanflow_finalize_artifacts({ validationCommands: [...] })` with the exact commands already observed. The extension generates and verifies `local://<slug>-build.md`, `local://<slug>-diff.md`, and `local://<slug>-evidence.md`; Main cannot write them directly. A repair keeps the original baseline, starts a new evidence round, and reruns validation. No code-writing subagent exists.
 
 ### GATE
 
-One independent Gate reads the canonical plan, final diff, build record, and runtime evidence by reference. Gate has no shell access; all runtime facts come from the evidence artifact written by Main.
+One independent Gate reads the canonical plan, final diff, build record, and runtime evidence by reference. Gate has no shell access; all runtime facts come from the extension-generated evidence artifact. Its strict verdict schema is owned by `agents/gate.md`, and callers send one canonical batch item without `outputSchema`.
 - PASS moves to `finalizing`; the compact context remains active through the terminal response, then the run becomes idle.
 - First valid FAIL is repaired by Main with refreshed validation/evidence, then one Gate retry is allowed.
 - A Gate operational error preserves evidence and permits a bounded review retry without counting an implementation repair.

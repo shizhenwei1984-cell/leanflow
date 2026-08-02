@@ -42,7 +42,7 @@ The `/flow` command initializes an extension state machine (`idle â†’ planning â
 
 ## Evidence
 
-Main writes `local://<slug>-plan.md`, `local://<slug>-build.md`, `local://<slug>-diff.md`, and `local://<slug>-evidence.md`. Gate reads all four by reference. Main records baseline/final state, each validation command, and complete runtime evidence output (git diff, docker/compose state, database queries, image versions, test results) before Gate. Gate has no shell access; `evidence.md` is its only runtime evidence source.
+Main writes only `local://<slug>-plan.md`. After the required initial LSP probe, `leanflow_capture_baseline({})` freezes HEAD/status in an extension-owned record. Main runs validations synchronously, then `leanflow_finalize_artifacts({ validationCommands: [...] })` mechanically generates and verifies `local://<slug>-build.md`, `local://<slug>-diff.md`, and `local://<slug>-evidence.md`; direct writes are blocked. Gate reads all four artifacts by reference and has no shell access. Repair rounds retain the original baseline, clear prior-round observations, rerun validations, and regenerate artifacts.
 
 ## Model roles
 
