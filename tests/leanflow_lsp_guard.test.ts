@@ -427,6 +427,21 @@ test("handoff ignores modification verbs embedded in LeanFlow metadata", () => {
 	expect(assessed).toMatchObject({ status: "NEEDS_UPDATE" });
 });
 
+test("runtime Planner prompt requires Simplified Chinese while preserving technical identifiers", async () => {
+	const harness = createHarness();
+	await harness.commands.get("flow")!.handler("修复工具路由", harness.ctx);
+
+	const prompt = harness.editorTexts.at(-1);
+	expect(prompt).toStartWith("/plan ");
+	expect(prompt).toContain("All communication addressed to the user MUST be in Simplified Chinese.");
+	expect(prompt).toContain("Write the decision-complete canonical plan in Simplified Chinese.");
+	expect(prompt).toContain(
+		"Keep source code, commands, file paths, symbol names, API names, structured artifact keys, and verbatim tool or error output unchanged unless translation is necessary for comprehension.",
+	);
+	expect(prompt).toContain("Task: 修复工具路由");
+});
+
+
 test("proposal is fail-closed until the canonical plan is valid and marked", async () => {
 	const planning = createHarness();
 	await planning.commands.get("flow")!.handler("example", planning.ctx);
@@ -716,6 +731,214 @@ test("native approval requires a real write-device diagnostics result before the
 		await call({ toolName: "edit", toolCallId: "edit-after-baseline", input: {} }, harness.ctx),
 	).toBeUndefined();
 });
+
+test("the observed xd LSP dispatch and issue report remain reachable before the baseline", async () => {
+	const harness = createHarness();
+	await writeInitialPlan(harness);
+	const call = harness.handlers.get("tool_call")!;
+	const result = harness.handlers.get("tool_result")!;
+	await call(
+		{ toolName: "write", toolCallId: "propose-native-lsp", input: { path: "xd://propose", content: EXAMPLE_SLUG } },
+		harness.ctx,
+	);
+	await result({ toolName: "write", toolCallId: "propose-native-lsp", isError: false }, harness.ctx);
+	harness.branch.push({ type: "mode_change", mode: "none" });
+	await harness.handlers.get("context")!({ messages: approvalMessages }, harness.ctx);
+	const diagnosticsFile = "lib/SS/Logic/Visitor/Attendance.pm";
+	mkdirSync(dirname(join(harness.ctx.cwd, diagnosticsFile)), { recursive: true });
+	writeFileSync(join(harness.ctx.cwd, diagnosticsFile), "package SS::Logic::Visitor::Attendance;\n");
+
+	const reportContent = "lsp: native diagnostics was blocked before the LeanFlow baseline";
+	const routedReportToolCallId = "routed-report-native-lsp";
+	expect(
+		await call(
+			{
+				toolName: "write",
+				toolCallId: routedReportToolCallId,
+				input: { path: "xd://report_issue", content: reportContent },
+			},
+			harness.ctx,
+		),
+	).toBeUndefined();
+	const nativeReportToolCallId = "native-report-native-lsp";
+	expect(
+		await call(
+			{
+				toolName: "report_issue",
+				toolCallId: nativeReportToolCallId,
+				input: { report: reportContent },
+			},
+			harness.ctx,
+		),
+	).toBeUndefined();
+	await result(
+		{
+			toolName: "report_issue",
+			toolCallId: nativeReportToolCallId,
+			isError: false,
+			content: [{ type: "text", text: "Noted, thanks!" }],
+		},
+		harness.ctx,
+	);
+	await result(
+		{
+			toolName: "write",
+			toolCallId: routedReportToolCallId,
+			isError: false,
+			details: { xdev: { tool: "report_issue", mode: "execute", args: { report: reportContent } } },
+			content: [{ type: "text", text: "Noted, thanks!" }],
+		},
+		harness.ctx,
+	);
+	expect(harness.states.at(-1)!.buildMutationObserved).not.toBe(true);
+
+	const diagnosticsInput = { action: "diagnostics", file: diagnosticsFile, timeout: 300 };
+	const routedToolCallId = "routed-lsp-diagnostics";
+	expect(
+		await call(
+			{
+				toolName: "write",
+				toolCallId: routedToolCallId,
+				input: { path: "xd://lsp", content: JSON.stringify(diagnosticsInput) },
+			},
+			harness.ctx,
+		),
+	).toBeUndefined();
+
+	const nativeToolCallId = "native-lsp-diagnostics";
+	expect(
+		await call(
+			{
+				toolName: "lsp",
+				toolCallId: nativeToolCallId,
+				input: diagnosticsInput,
+			},
+			harness.ctx,
+		),
+	).toBeUndefined();
+	await result(
+		{
+			toolName: "lsp",
+			toolCallId: nativeToolCallId,
+			isError: true,
+			content: [{ type: "text", text: "No LSP server accepted the target." }],
+		},
+		harness.ctx,
+	);
+	await result(
+		{
+			toolName: "write",
+			toolCallId: routedToolCallId,
+			isError: true,
+			details: { xdev: { tool: "lsp", mode: "execute", args: diagnosticsInput, tier: "read" } },
+			content: [{ type: "text", text: "No LSP server accepted the target." }],
+		},
+		harness.ctx,
+	);
+	expect(harness.states.at(-1)).toMatchObject({
+		lspProbeStatus: "completed",
+		lspProbeTarget: diagnosticsFile,
+	});
+
+	const captureToolCallId = "baseline-after-native-lsp";
+	expect(
+		await call(
+			{
+				toolName: "write",
+				toolCallId: captureToolCallId,
+				input: { path: "xd://leanflow_capture_baseline", content: "{}" },
+			},
+			harness.ctx,
+		),
+	).toBeUndefined();
+	const capture = await harness.tools
+		.get("leanflow_capture_baseline")!
+		.execute(captureToolCallId, {}, undefined, undefined, harness.ctx);
+	expect(capture.isError).not.toBe(true);
+});
+
+
+test("admits strict xd-routed extension tools without recording repository mutations", async () => {
+	const harness = createHarness();
+	await enterDocumentationBuild(harness);
+	const call = harness.handlers.get("tool_call")!;
+
+	for (const input of [
+		{ path: "xd://leanflow_capture_baseline", content: "not json" },
+		{ path: "xd://leanflow_capture_baseline", content: JSON.stringify({ unexpected: true }) },
+		{ path: "xd://leanflow_finalize_artifacts", content: JSON.stringify({ validationCommands: [] }) },
+		{
+			path: "xd://leanflow_finalize_artifacts",
+			content: JSON.stringify({ validationCommands: ["bun test"], unexpected: true }),
+		},
+	]) {
+		expect(
+			await call({ toolName: "write", toolCallId: `malformed-route-${input.content}`, input }, harness.ctx),
+		).toMatchObject({
+			block: true,
+			reason: expect.stringContaining("strict schema"),
+		});
+	}
+
+	const validationCommands = ["bun test tests/leanflow_lsp_guard.test.ts"];
+	expect(
+		await call(
+			{
+				toolName: "write",
+				toolCallId: "routed-finalize-before-baseline",
+				input: {
+					path: "xd://leanflow_finalize_artifacts",
+					content: JSON.stringify({ validationCommands }),
+				},
+			},
+			harness.ctx,
+		),
+	).toMatchObject({
+		block: true,
+		reason: expect.stringContaining("immutable BUILD baseline"),
+	});
+
+	const captureToolCallId = "routed-baseline";
+	expect(
+		await call(
+			{
+				toolName: "write",
+				toolCallId: captureToolCallId,
+				input: { path: "xd://leanflow_capture_baseline", content: "{}" },
+			},
+			harness.ctx,
+		),
+	).toBeUndefined();
+	expect(harness.states.at(-1)!.buildMutationObserved).not.toBe(true);
+	const capture = await harness.tools
+		.get("leanflow_capture_baseline")!
+		.execute(captureToolCallId, {}, undefined, undefined, harness.ctx);
+	expect(capture.isError).not.toBe(true);
+
+	await recordSuccessfulValidation(harness, validationCommands[0]!);
+	const finalizeToolCallId = "routed-finalize";
+	const finalizeParams = { validationCommands };
+	const stateCountBeforeFinalize = harness.states.length;
+	expect(
+		await call(
+			{
+				toolName: "write",
+				toolCallId: finalizeToolCallId,
+				input: {
+					path: "xd://leanflow_finalize_artifacts",
+					content: JSON.stringify(finalizeParams),
+				},
+			},
+			harness.ctx,
+		),
+	).toBeUndefined();
+	expect(harness.states).toHaveLength(stateCountBeforeFinalize);
+	const finalized = await harness.tools
+		.get("leanflow_finalize_artifacts")!
+		.execute(finalizeToolCallId, finalizeParams, undefined, undefined, harness.ctx);
+	expect(finalized.isError).not.toBe(true);
+});
+
 
 test("accepts documented diagnostics timeout before the BUILD baseline", async () => {
 	const harness = createHarness();

@@ -157,77 +157,97 @@ function isWriteToolCall(event: ToolCallEvent): event is ToolCallEvent & { input
 		typeof event.input.content === "string"
 	);
 }
+const CAPTURE_BASELINE_DEVICE_PATH = "xd://leanflow_capture_baseline";
+const FINALIZE_ARTIFACTS_DEVICE_PATH = "xd://leanflow_finalize_artifacts";
+type RoutedLeanFlowDeviceCall = "capture_baseline" | "finalize_artifacts" | "invalid";
 
-function parseLspObservationRequest(event: ToolCallEvent): ParsedLspRequest | undefined {
+function routedLeanFlowDeviceCall(event: ToolCallEvent): RoutedLeanFlowDeviceCall | undefined {
+	if (
+		!isWriteToolCall(event) ||
+		(event.input.path !== CAPTURE_BASELINE_DEVICE_PATH && event.input.path !== FINALIZE_ARTIFACTS_DEVICE_PATH)
+	) {
+		return undefined;
+	}
+	let payload: unknown;
+	try {
+		payload = JSON.parse(event.input.content);
+	} catch {
+		return "invalid";
+	}
+	if (!isPlainRecord(payload)) return "invalid";
+	if (event.input.path === CAPTURE_BASELINE_DEVICE_PATH) {
+		return Object.keys(payload).length === 0 ? "capture_baseline" : "invalid";
+	}
+	if (Object.keys(payload).length !== 1 || !("validationCommands" in payload)) return "invalid";
+	const commands = payload.validationCommands;
+	return Array.isArray(commands) &&
+		commands.length > 0 &&
+		commands.every((command) => typeof command === "string" && command.length > 0)
+		? "finalize_artifacts"
+		: "invalid";
+}
+
+
+function lspInput(event: ToolCallEvent): Record<string, unknown> | undefined {
+	if (event.toolName === "lsp") return isPlainRecord(event.input) ? event.input : undefined;
 	if (!isWriteToolCall(event) || event.input.path !== "xd://lsp") return undefined;
 	try {
 		const input: unknown = JSON.parse(event.input.content);
-		if (!isPlainRecord(input) || typeof input.action !== "string" || input.action.length === 0) return undefined;
-		const request: ParsedLspRequest = { action: input.action };
-		if ("file" in input) {
-			if (typeof input.file !== "string") return undefined;
-			request.file = input.file;
-		}
-		if ("line" in input) {
-			if (typeof input.line !== "number" || !Number.isFinite(input.line) || !Number.isInteger(input.line)) return undefined;
-			request.line = input.line;
-		}
-		if ("symbol" in input) {
-			if (typeof input.symbol !== "string") return undefined;
-			request.symbol = input.symbol;
-		}
-		if ("query" in input) {
-			if (typeof input.query !== "string") return undefined;
-			request.query = input.query;
-		}
-		if ("new_name" in input) {
-			if (typeof input.new_name !== "string") return undefined;
-			request.new_name = input.new_name;
-		}
-		if ("apply" in input) {
-			if (typeof input.apply !== "boolean") return undefined;
-			request.apply = input.apply;
-		}
-		if ("timeout" in input) {
-			if (typeof input.timeout !== "number" || !Number.isFinite(input.timeout)) return undefined;
-			request.timeout = input.timeout;
-		}
-		if ("payload" in input) {
-			if (typeof input.payload !== "string") return undefined;
-			request.payload = input.payload;
-		}
-		return request;
+		return isPlainRecord(input) ? input : undefined;
 	} catch {
 		return undefined;
 	}
 }
 
-function lspDiagnosticsTarget(event: ToolCallEvent): string | undefined {
-	if (!isWriteToolCall(event) || event.input.path !== "xd://lsp") return undefined;
-	try {
-		const input: unknown = JSON.parse(event.input.content);
-		if (
-			typeof input !== "object" ||
-			input === null ||
-			Array.isArray(input) ||
-			!("action" in input) ||
-			input.action !== "diagnostics" ||
-			!("file" in input) ||
-			typeof input.file !== "string"
-		) {
-			return undefined;
-		}
-		const target = input.file.trim();
-		if (!target) return undefined;
-		if (target === "*") return target;
-		if (target.includes("\0") || path.isAbsolute(target)) return undefined;
-		const normalized = path.posix.normalize(target.replaceAll("\\", "/"));
-		if (normalized === ".." || normalized.startsWith("../") || normalized.startsWith("/")) return undefined;
-		return normalized;
-	} catch {
-		// Malformed device input is neither a diagnostics probe nor a mutation.
-		return undefined;
+function parseLspObservationRequest(event: ToolCallEvent): ParsedLspRequest | undefined {
+	const input = lspInput(event);
+	if (input === undefined || typeof input.action !== "string" || input.action.length === 0) return undefined;
+	const request: ParsedLspRequest = { action: input.action };
+	if ("file" in input) {
+		if (typeof input.file !== "string") return undefined;
+		request.file = input.file;
 	}
+	if ("line" in input) {
+		if (typeof input.line !== "number" || !Number.isFinite(input.line) || !Number.isInteger(input.line)) return undefined;
+		request.line = input.line;
+	}
+	if ("symbol" in input) {
+		if (typeof input.symbol !== "string") return undefined;
+		request.symbol = input.symbol;
+	}
+	if ("query" in input) {
+		if (typeof input.query !== "string") return undefined;
+		request.query = input.query;
+	}
+	if ("new_name" in input) {
+		if (typeof input.new_name !== "string") return undefined;
+		request.new_name = input.new_name;
+	}
+	if ("apply" in input) {
+		if (typeof input.apply !== "boolean") return undefined;
+		request.apply = input.apply;
+	}
+	if ("timeout" in input) {
+		if (typeof input.timeout !== "number" || !Number.isFinite(input.timeout)) return undefined;
+		request.timeout = input.timeout;
+	}
+	if ("payload" in input) {
+		if (typeof input.payload !== "string") return undefined;
+		request.payload = input.payload;
+	}
+	return request;
+}
+
+function lspDiagnosticsTarget(event: ToolCallEvent): string | undefined {
+	const request = parseLspObservationRequest(event);
+	if (request?.action !== "diagnostics" || typeof request.file !== "string") return undefined;
+	const target = request.file.trim();
+	if (!target) return undefined;
+	if (target === "*") return target;
+	if (target.includes("\0") || path.isAbsolute(target)) return undefined;
+	const normalized = path.posix.normalize(target.replaceAll("\\", "/"));
+	if (normalized === ".." || normalized.startsWith("../") || normalized.startsWith("/")) return undefined;
+	return normalized;
 }
 
 async function isUsableLspTarget(ctx: ExtensionContext, target: string): Promise<boolean> {
@@ -243,6 +263,18 @@ async function isUsableLspTarget(ctx: ExtensionContext, target: string): Promise
 
 function isProposalWrite(event: ToolCallEvent): event is ToolCallEvent & { input: WriteToolInput; toolName: "write" } {
 	return isWriteToolCall(event) && event.input.path === "xd://propose";
+}
+
+function issueReportContent(event: ToolCallEvent): string | undefined {
+	let content: string;
+	if (event.toolName === "report_issue" && isPlainRecord(event.input) && typeof event.input.report === "string") {
+		content = event.input.report;
+	} else if (isWriteToolCall(event) && event.input.path === "xd://report_issue") {
+		content = event.input.content;
+	} else {
+		return undefined;
+	}
+	return content.trim().length > 0 ? content : undefined;
 }
 
 function expectedPlanArtifact(state: LeanFlowState): string | undefined {
@@ -338,17 +370,6 @@ function toolTargetsOnlyPath(ctx: ExtensionContext, event: ToolCallEvent, target
 	return expected !== undefined && targets.length > 0 && targets.every((candidate) => resolveLeanFlowTarget(ctx, candidate) === expected);
 }
 
-function lspAction(event: ToolCallEvent): string | undefined {
-	if (!isWriteToolCall(event) || event.input.path !== "xd://lsp") return undefined;
-	try {
-		const input: unknown = JSON.parse(event.input.content);
-		return input && typeof input === "object" && !Array.isArray(input) && "action" in input && typeof input.action === "string"
-			? input.action
-			: undefined;
-	} catch {
-		return undefined;
-	}
-}
 
 function targetsLocalSandbox(ctx: ExtensionContext, event: ToolCallEvent): boolean {
 	if (!ctx.localProtocolOptions) return false;
@@ -369,12 +390,23 @@ function classifyToolEffect(
 	ctx: ExtensionContext,
 	event: ToolCallEvent,
 	canonicalPlanArtifact: string | undefined,
+	routedDeviceCall: RoutedLeanFlowDeviceCall | undefined,
+	issueReport: boolean,
 ): ToolEffect {
 	if (READ_ONLY_TOOLS.has(event.toolName)) return "read_only";
-	if (isWriteToolCall(event) && event.input.path === "xd://lsp") {
-		const action = lspAction(event);
-		if (action === "diagnostics" && lspDiagnosticsTarget(event) === undefined) return "control_plane_mutation";
-		return action !== undefined && LSP_READ_ONLY_ACTIONS.has(action) ? "read_only" : "control_plane_mutation";
+	const lspInvocation = event.toolName === "lsp" || (isWriteToolCall(event) && event.input.path === "xd://lsp");
+	if (lspInvocation) {
+		const request = parseLspObservationRequest(event);
+		if (request?.action === "diagnostics" && lspDiagnosticsTarget(event) === undefined) {
+			return "control_plane_mutation";
+		}
+		return request !== undefined && LSP_READ_ONLY_ACTIONS.has(request.action)
+			? "read_only"
+			: "control_plane_mutation";
+	}
+	if (issueReport) return "control_plane_mutation";
+	if (routedDeviceCall === "capture_baseline" || routedDeviceCall === "finalize_artifacts") {
+		return "control_plane_mutation";
 	}
 	if (
 		canonicalPlanArtifact !== undefined &&
@@ -1725,6 +1757,15 @@ export default function leanflow(pi: ExtensionAPI): void {
 				reason: "LeanFlow guard: task input must be a plain object.",
 			};
 		}
+		const routedDeviceCall = routedLeanFlowDeviceCall(event);
+		if (routedDeviceCall === "invalid") {
+			return {
+				block: true,
+				reason: "LeanFlow guard: routed extension tool input does not match its strict schema.",
+			};
+		}
+		const issueReport = issueReportContent(event) !== undefined;
+
 
 		const canonicalPlanArtifact = expectedPlanArtifact(state);
 		const canonicalPlanMutation =
@@ -1765,7 +1806,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 			if (budget.block) return { block: true, reason: budget.reason };
 		}
 
-		const effect = classifyToolEffect(ctx, event, canonicalPlanArtifact);
+		const effect = classifyToolEffect(ctx, event, canonicalPlanArtifact, routedDeviceCall, issueReport);
 		const lspProbePending = state.phase === "building" && state.lspProbeStatus === "pending";
 		const baselinePending =
 			state.phase === "building" && state.lspProbeStatus !== "pending" && state.baselineCaptured !== true;
@@ -1777,13 +1818,15 @@ export default function leanflow(pi: ExtensionAPI): void {
 		const planningScout =
 			state.phase === "planning" && isTaskToolCall(event) && roles.length > 0 && roles.every((role) => role === "scout");
 		const baselineCapture =
-			baselinePending && event.toolName === "leanflow_capture_baseline";
+			baselinePending &&
+			(event.toolName === "leanflow_capture_baseline" || routedDeviceCall === "capture_baseline");
 		const allowedWhileLocked =
 			effect === "read_only" ||
 			((state.phase === "planning" || state.phase === "awaiting_approval") &&
 				effect === "canonical_plan_mutation") ||
 			(state.phase === "awaiting_approval" && isProposalWrite(event)) ||
 			baselineCapture ||
+			issueReport ||
 			planningScout;
 		if (locked && !allowedWhileLocked) {
 			return {
@@ -1987,7 +2030,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 			return;
 		}
 
-		if (event.toolName === "write" && pendingLspProbes.has(event.toolCallId)) {
+		if (pendingLspProbes.has(event.toolCallId)) {
 			const target = pendingLspProbes.get(event.toolCallId)!;
 			pendingLspProbes.delete(event.toolCallId);
 			state.lspProbeStatus = "completed";
@@ -2114,6 +2157,11 @@ function missingArtifacts(state: LeanFlowState): string[] {
 function buildPlanningPrompt(task: string, slug: string, runId: string): string {
 	return [
 		`You are LeanFlow Planner (@plan). Task: ${task}`,
+		"",
+		"## User language",
+		"All communication addressed to the user MUST be in Simplified Chinese.",
+		"Write the decision-complete canonical plan in Simplified Chinese.",
+		"Keep source code, commands, file paths, symbol names, API names, structured artifact keys, and verbatim tool or error output unchanged unless translation is necessary for comprehension.",
 		"",
 		"## Responsibilities",
 		"- Understand the request; investigate code directly or via Scout",
