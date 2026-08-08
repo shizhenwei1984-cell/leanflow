@@ -1653,7 +1653,7 @@ test("snapshot preflight rejects a mismatched BUILD record without dispatching G
 	expect(harness.states.at(-1)).toMatchObject({ phase: "building", gateCalls: 0, gateAttempt: 0 });
 });
 
-test("repair record setup failure leaves Gate recovery in BUILD", async () => {
+test("repair record setup failure pauses for human recovery", async () => {
 	const harness = createHarness();
 	await enterDocumentationBuild(harness);
 	await completeBuildEvidence(harness, "bun test repair-record-failure");
@@ -1674,8 +1674,8 @@ test("repair record setup failure leaves Gate recovery in BUILD", async () => {
 		harness.ctx,
 	);
 
-	expect(harness.states.at(-1)).toMatchObject({ phase: "building", gateCalls: 1, writtenArtifacts: [] });
-	expect(harness.notifications.some((message) => message.includes("Cannot start repair BUILD record:"))).toBe(true);
+	expect(harness.states.at(-1)).toMatchObject({ phase: "awaiting_human", gateCalls: 1, writtenArtifacts: [] });
+	expect(harness.notifications.some((message) => message.includes("Gate repair setup failed:"))).toBe(true);
 });
 
 test("plan drift during Gate becomes an operational recovery", async () => {
@@ -1704,9 +1704,9 @@ test("plan drift during Gate becomes an operational recovery", async () => {
 		gateRetryMode: "operational",
 		stats: { gateErrors: 1 },
 	});
-	expect(harness.notifications).toContain("LeanFlow: plan drifted during Gate; retry with unchanged evidence.");
+	expect(harness.notifications.some((m) => m.includes("retry with unchanged evidence."))).toBe(true);
 });
-test("session restoration reconciles an interrupted Gate and ignores its late result", async () => {
+test("session restoration reconciles an interrupted Gate as an interruption", async () => {
 	const harness = createHarness();
 	await enterDocumentationBuild(harness);
 	await completeBuildEvidence(harness, "bun test gate-lease");
@@ -1720,13 +1720,12 @@ test("session restoration reconciles an interrupted Gate and ignores its late re
 	});
 
 	await harness.handlers.get("session_switch")!({}, harness.ctx);
-	expect(harness.states.at(-1)).toMatchObject({
-		phase: "building",
-		gateCalls: 0,
-		gateLease: undefined,
-		gateRetryMode: "operational",
-		stats: { gateErrors: 1 },
-	});
+	const afterSwitch = harness.states.at(-1)!;
+	expect(afterSwitch.phase).toBe("building");
+	expect(afterSwitch.gateCalls).toBe(0);
+	expect(afterSwitch.gateLease).toBeUndefined();
+	expect(afterSwitch.gateRetryMode).toBe("operational");
+	expect(afterSwitch.stats!.gateErrors).toBe(0);
 	const stateCountAfterRestore = harness.states.length;
 
 	await result(
@@ -1744,7 +1743,6 @@ test("session restoration reconciles an interrupted Gate and ignores its late re
 		gateCalls: 0,
 		gateLease: undefined,
 		gateRetryMode: "operational",
-		stats: { gateErrors: 1 },
 	});
 });
 
@@ -2247,7 +2245,7 @@ test("NEEDS_UPDATE invalidates the prior active marker", async () => {
 	expect(marker.status).toBe("invalidated");
 });
 
-test("flowstatus is read-only in every phase and reports cheap Gate readiness", async () => {
+test("flowstatus is read-only in every phase and reports deep Gate readiness", async () => {
 	const harness = createHarness();
 	const idleSnapshots = harness.states.length;
 
@@ -2264,6 +2262,7 @@ test("flowstatus is read-only in every phase and reports cheap Gate readiness", 
 			"- Gate verdicts: 0/2",
 			"- Gate dispatches: 0",
 			"- Gate blocked: 0",
+			"- Consecutive errors: 0/4",
 			"- Pending evidence observations: 0",
 			"- Baseline captured: no",
 			"- Written artifacts: 0/3 (none / build, diff, evidence)",
@@ -2276,6 +2275,8 @@ test("flowstatus is read-only in every phase and reports cheap Gate readiness", 
 	await enterDocumentationBuild(harness);
 	await completeBuildEvidence(harness);
 	const state = harness.states.at(-1)!;
+	await harness.commands.get("flowstatus")!.handler("", harness.ctx);
+	expect(harness.notifications.at(-1)).toContain("- Gate readiness: READY (deep:");
 	const evidencePath = resolveRunMarkerPath(
 		harness.ctx.localProtocolOptions,
 		`local://${state.planSlug}-evidence.md`,
@@ -2286,24 +2287,7 @@ test("flowstatus is read-only in every phase and reports cheap Gate readiness", 
 	await harness.commands.get("flowstatus")!.handler("", harness.ctx);
 
 	expect(harness.states).toHaveLength(buildingSnapshots);
-	expect(harness.notifications.at(-1)).toBe(
-		[
-			"LeanFlow status:",
-			"- Phase: building",
-			`- Run ID: ${state.runId}`,
-			`- Plan digest: ${state.planDigest!.slice(0, 12)}`,
-			"- Repair round: 0",
-			"- Gate verdicts: 0/2",
-			"- Gate dispatches: 0",
-			"- Gate blocked: 0",
-			"- Pending evidence observations: 0",
-			"- Baseline captured: yes",
-			"- Written artifacts: 3/3 (build, diff, evidence / build, diff, evidence)",
-			"- LSP probe: not_required",
-			"- Human repair cycles: 0",
-			"- Gate readiness: READY",
-		].join("\n"),
-	);
+	expect(harness.notifications.at(-1)).toContain("- Gate readiness: BLOCKED:");
 });
 
 test("flowcancel abandons an active recovery marker", async () => {

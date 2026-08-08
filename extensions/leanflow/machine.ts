@@ -3,15 +3,20 @@ import {
 	recordGateBlocked,
 	recordGateError,
 	recordGateFailure,
+	recordGateInterruption,
 	recordGatePass,
 	recordTerminalFailure,
+	resetConsecutiveGateErrors,
 } from "./stats";
 
 export type GateEvent =
-	| { type: "gate_dispatch"; toolCallId: string; runId: string; snapshotDigest: string; now: number }
+	| { type: "gate_dispatch"; toolCallId: string; runId: string; snapshotDigest: string; planDigest: string; buildRecordRound: number; now: number }
 	| { type: "gate_settled"; outcome: GateOutcome; findingsJson?: string }
 	| { type: "gate_error" }
+	| { type: "gate_interrupted" }
 	| { type: "restore_reconcile"; now: number }
+	| { type: "repair_round_ready" }
+	| { type: "repair_round_failed"; reason: string }
 	| { type: "human_continue"; now: number }
 	| { type: "human_finish_failed"; now: number };
 
@@ -40,8 +45,14 @@ export function reduceGate(state: LeanFlowState, event: GateEvent): { effects: E
 			return reduceGateSettlement(state, event);
 		case "gate_error":
 			return reduceGateError(state);
+		case "gate_interrupted":
+			return reduceGateInterrupted(state);
 		case "restore_reconcile":
 			return reduceRestoreReconcile(state);
+		case "repair_round_ready":
+			return reduceRepairRoundReady(state);
+		case "repair_round_failed":
+			return reduceRepairRoundFailed(state, event);
 		case "human_continue":
 			return reduceHumanContinue(state);
 		case "human_finish_failed":
@@ -56,6 +67,10 @@ export function checkInvariants(state: LeanFlowState): string[] {
 	if (state.phase === "gating" && !state.gateLease) {
 		violations.push("gating phase requires a gate lease");
 	}
+	if (state.phase === "repair_preparing") {
+		if (state.gateRetryMode !== "repair") violations.push("repair_preparing phase requires gateRetryMode=repair");
+		if ((state.writtenArtifacts?.length ?? 0) !== 0) violations.push("repair_preparing phase requires no written artifacts");
+	}
 	if (state.phase === "awaiting_human" && state.terminalOutcome !== undefined) {
 		violations.push("awaiting_human phase must not have a terminal outcome");
 	}
@@ -67,6 +82,9 @@ export function checkInvariants(state: LeanFlowState): string[] {
 	}
 	if (state.baselineCaptured && state.phase !== "building" && state.phase !== "gating") {
 		violations.push("baselineCaptured is only valid during building or gating");
+	}
+	if ((state.consecutiveGateErrors ?? 0) < 0 || (state.consecutiveGateErrors ?? 0) > MAX_GATE_ERRORS) {
+		violations.push(`consecutiveGateErrors must be between 0 and ${MAX_GATE_ERRORS}`);
 	}
 
 	for (const counter of nonNegativeStats(state)) {
@@ -90,6 +108,8 @@ function reduceGateDispatch(
 		cycle: state.gateAttempt + 1,
 		startedAt: event.now,
 		snapshotDigest: event.snapshotDigest,
+		planDigest: event.planDigest,
+		buildRecordRound: event.buildRecordRound,
 	};
 	state.gateAttempt++;
 	state.phase = "gating";
@@ -111,6 +131,7 @@ function reduceGateSettlement(
 			state.gateRetryMode = undefined;
 			state.terminalOutcome = "pass";
 			recordGatePass(state, repaired);
+			resetConsecutiveGateErrors(state);
 			state.baselineCaptured = false;
 			state.phase = "finalizing";
 			return {
@@ -125,7 +146,9 @@ function reduceGateSettlement(
 			if (state.gateCalls < MAX_GATE_VERDICTS) {
 				state.gateRetryMode = "repair";
 				recordGateFailure(state, true);
-				state.phase = "building";
+				resetConsecutiveGateErrors(state);
+				state.phase = "repair_preparing";
+				state.writtenArtifacts = [];
 				return {
 					effects: [
 						{ kind: "clear_artifacts" },
@@ -136,6 +159,7 @@ function reduceGateSettlement(
 			}
 
 			recordGateFailure(state, false);
+			resetConsecutiveGateErrors(state);
 			state.baselineCaptured = false;
 			state.phase = "awaiting_human";
 			return {
@@ -151,6 +175,7 @@ function reduceGateSettlement(
 		case "BLOCKED":
 			state.gateRetryMode = "evidence";
 			recordGateBlocked(state);
+			resetConsecutiveGateErrors(state);
 			state.phase = "building";
 			return {
 				effects: [
@@ -171,7 +196,7 @@ function reduceGateError(state: LeanFlowState): { effects: Effect[] } {
 	state.gateLease = undefined;
 	recordGateError(state, false);
 	state.gateRetryMode = "operational";
-	if ((state.stats?.gateErrors ?? 0) >= MAX_GATE_ERRORS) {
+	if ((state.consecutiveGateErrors ?? 0) >= MAX_GATE_ERRORS) {
 		state.baselineCaptured = false;
 		state.phase = "awaiting_human";
 		return {
@@ -198,21 +223,54 @@ function reduceGateError(state: LeanFlowState): { effects: Effect[] } {
 	};
 }
 
+function reduceGateInterrupted(state: LeanFlowState): { effects: Effect[] } {
+	if (state.phase !== "gating") return { effects: [] };
+
+	state.gateLease = undefined;
+	recordGateInterruption(state);
+	state.gateRetryMode = "operational";
+	state.phase = "building";
+	return {
+		effects: [
+			{
+				kind: "notify",
+				level: "warning",
+				message: "Gate interrupted by session switch; retry Gate with unchanged evidence.",
+			},
+		],
+	};
+}
+
+function reduceRepairRoundReady(state: LeanFlowState): { effects: Effect[] } {
+	if (state.phase !== "repair_preparing") return { effects: [] };
+
+	state.phase = "building";
+	return { effects: [] };
+}
+
+function reduceRepairRoundFailed(
+	state: LeanFlowState,
+	event: Extract<GateEvent, { type: "repair_round_failed" }>,
+): { effects: Effect[] } {
+	if (state.phase !== "repair_preparing") return { effects: [] };
+
+	state.baselineCaptured = false;
+	state.phase = "awaiting_human";
+	return {
+		effects: [
+			{ kind: "write_marker", status: "paused" },
+			{
+				kind: "notify",
+				level: "warning",
+				message: `Gate repair setup failed: ${event.reason}. Use /flowcontinue to retry after resolving the issue.`,
+			},
+		],
+	};
+}
+
 function reduceRestoreReconcile(state: LeanFlowState): { effects: Effect[] } {
 	if (state.phase === "gating") {
-		state.gateLease = undefined;
-		recordGateError(state, false);
-		state.gateRetryMode = "operational";
-		state.phase = "building";
-		return {
-			effects: [
-				{
-					kind: "notify",
-					level: "warning",
-					message: "Gate interrupted by session restore; retry with unchanged evidence.",
-				},
-			],
-		};
+		return { effects: [] };
 	}
 	if (state.phase === "building" && state.lspProbeStatus === "pending") {
 		state.lspLease = undefined;
@@ -227,6 +285,7 @@ function reduceHumanContinue(state: LeanFlowState): { effects: Effect[] } {
 	state.gateCalls = 0;
 	state.gateRetryMode = "repair";
 	state.terminalOutcome = undefined;
+	resetConsecutiveGateErrors(state);
 	state.phase = "building";
 	return {
 		effects: [
@@ -262,6 +321,7 @@ function nonNegativeStats(state: LeanFlowState): Array<{ name: string; value: nu
 		{ name: "gateVerdictFailures", value: stats.gateVerdictFailures },
 		{ name: "gateBlocked", value: stats.gateBlocked },
 		{ name: "gateErrors", value: stats.gateErrors },
+		{ name: "gateInterruptions", value: stats.gateInterruptions ?? 0 },
 		{ name: "gateReadinessBlocks", value: stats.gateReadinessBlocks },
 		{ name: "repairRounds", value: stats.repairRounds },
 		{ name: "repairSuccesses", value: stats.repairSuccesses },

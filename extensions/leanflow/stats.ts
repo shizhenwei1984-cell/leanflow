@@ -109,11 +109,21 @@ export function recordGateFailure(state: LeanFlowState, repaired: boolean): void
 	if (repaired) stats.repairRounds++;
 }
 
-/** Record a failed or unparseable Gate execution and optional repair. */
+/** Record a failed or unparseable Gate execution; consecutive counter feeds the 4-error cap. */
 export function recordGateError(state: LeanFlowState, repaired: boolean): void {
 	const stats = (state.stats ??= defaultStats());
 	stats.gateErrors++;
+	state.consecutiveGateErrors = (state.consecutiveGateErrors ?? 0) + 1;
 	if (repaired) stats.repairRounds++;
+}
+
+export function recordGateInterruption(state: LeanFlowState): void {
+	const stats = (state.stats ??= defaultStats());
+	stats.gateInterruptions = (stats.gateInterruptions ?? 0) + 1;
+}
+
+export function resetConsecutiveGateErrors(state: LeanFlowState): void {
+	state.consecutiveGateErrors = 0;
 }
 
 /** Record a successful Gate verdict and whether it followed a repair. */
@@ -156,7 +166,7 @@ export function formatStats(state: LeanFlowState): string {
 		"",
 		"Workflow outcomes:",
 		`  verdict attempts: ${state.gateCalls}   passes: ${stats.gatePasses}   verdict failures: ${stats.gateVerdictFailures}`,
-		`  dispatches: ${state.gateDispatches ?? 0}   blocked: ${stats.gateBlocked}   execution/unparseable errors: ${stats.gateErrors}   readiness blocks: ${stats.gateReadinessBlocks}`,
+		`  dispatches: ${state.gateDispatches ?? 0}   blocked: ${stats.gateBlocked}   execution/unparseable errors: ${stats.gateErrors}   interruptions: ${stats.gateInterruptions ?? 0}   consecutive errors: ${state.consecutiveGateErrors ?? 0}   readiness blocks: ${stats.gateReadinessBlocks}`,
 		`  human repair cycles: ${state.humanRepairCycles ?? 0}`,
 		`  handoff: ${state.handoffStatus ?? "n/a"}   warnings: ${state.handoffWarnings?.length ?? 0}`,
 		"",

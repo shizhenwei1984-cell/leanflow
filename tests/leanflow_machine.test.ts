@@ -10,6 +10,7 @@ const LEGAL_PHASES: readonly LeanFlowPhase[] = [
 	"awaiting_approval",
 	"building",
 	"gating",
+	"repair_preparing",
 	"awaiting_human",
 	"finalizing",
 ];
@@ -20,12 +21,18 @@ function buildingState() {
 	return state;
 }
 
+function sha64(char: string): string {
+	return char.repeat(64);
+}
+
 function dispatch(state = buildingState(), toolCallId = "gate-1") {
 	const result = reduceGate(state, {
 		type: "gate_dispatch",
 		toolCallId,
 		runId: GATE_RUN_ID,
-		snapshotDigest: "snapshot",
+		snapshotDigest: sha64("a"),
+		planDigest: sha64("b"),
+		buildRecordRound: 1,
 		now: 10,
 	});
 	expect(result.effects).toEqual([]);
@@ -45,7 +52,9 @@ test("dispatch records a persisted lease without consuming a Gate verdict", () =
 		runId: GATE_RUN_ID,
 		cycle: 1,
 		startedAt: 10,
-		snapshotDigest: "snapshot",
+		snapshotDigest: sha64("a"),
+		planDigest: sha64("b"),
+		buildRecordRound: 1,
 	});
 	expect(checkInvariants(state)).toEqual([]);
 });
@@ -77,20 +86,32 @@ test("first FAIL starts a repair round with artifacts cleared before initializat
 	const { effects } = reduceGate(state, { type: "gate_settled", outcome: "FAIL", findingsJson: '{"id":"first"}' });
 
 	expect(state).toMatchObject({
-		phase: "building",
+		phase: "repair_preparing",
 		gateCalls: 1,
 		gateRetryMode: "repair",
 		gateLease: undefined,
 		lastGateFindings: '{"id":"first"}',
+		writtenArtifacts: [],
 	});
 	expect(state.stats).toMatchObject({ gateVerdictFailures: 1, repairRounds: 1 });
+	expect(state.consecutiveGateErrors).toBe(0);
 	expect(effects.map((effect) => effect.kind)).toEqual(["clear_artifacts", "begin_repair_round", "notify"]);
+	expect(checkInvariants(state)).toEqual([]);
+	const ready = reduceGate(state, { type: "repair_round_ready" });
+	expect(state.phase).toBe("building");
+	expect(ready.effects).toEqual([]);
+	const failed = dispatch();
+	reduceGate(failed, { type: "gate_settled", outcome: "FAIL" });
+	const failEffects = reduceGate(failed, { type: "repair_round_failed", reason: "disk full" });
+	expect(failed.phase).toBe("awaiting_human");
+	expect(failEffects.effects.map((e) => e.kind)).toEqual(["write_marker", "notify"]);
 });
 
 test("second FAIL pauses for a human without setting a terminal outcome", () => {
 	const state = dispatch();
 	state.baselineCaptured = true;
 	reduceGate(state, { type: "gate_settled", outcome: "FAIL" });
+	reduceGate(state, { type: "repair_round_ready" });
 	dispatch(state, "gate-2");
 
 	const { effects } = reduceGate(state, { type: "gate_settled", outcome: "FAIL", findingsJson: "x".repeat(4_001) });
@@ -140,12 +161,16 @@ test("operational errors return to BUILD until the fourth error pauses the run",
 	expect(effects[0]).toEqual({ kind: "write_marker", status: "paused" });
 });
 
-test("restore reconciliation folds an interrupted Gate and discards a pending LSP lease", () => {
+test("restore reconciliation preserves gating lease; interruption is explicit", () => {
 	const state = dispatch();
-	const interrupted = reduceGate(state, { type: "restore_reconcile", now: 30 });
+	const preserved = reduceGate(state, { type: "restore_reconcile", now: 30 });
+	expect(state.phase).toBe("gating");
+	expect(state.gateLease?.toolCallId).toBe("gate-1");
+	expect(preserved.effects).toEqual([]);
 
+	const interrupted = reduceGate(state, { type: "gate_interrupted" });
 	expect(state).toMatchObject({ phase: "building", gateCalls: 0, gateRetryMode: "operational", gateLease: undefined });
-	expect(state.stats).toMatchObject({ gateErrors: 1 });
+	expect(state.stats).toMatchObject({ gateInterruptions: 1, gateErrors: 0 });
 	expect(interrupted.effects.map((effect) => effect.kind)).toEqual(["notify"]);
 
 	state.lspProbeStatus = "pending";
@@ -156,21 +181,11 @@ test("restore reconciliation folds an interrupted Gate and discards a pending LS
 		cycle: 0,
 		startedAt: 20,
 	};
-	expect(reduceGate(state, { type: "restore_reconcile", now: 40 }).effects).toEqual([]);
-	expect(state.lspLease).toBeUndefined();
-
-	const withoutLease = buildingState();
-	withoutLease.phase = "gating";
-	expect(reduceGate(withoutLease, { type: "restore_reconcile", now: 50 }).effects.map((effect) => effect.kind)).toEqual([
-		"notify",
-	]);
-	expect(withoutLease).toMatchObject({
-		phase: "building",
-		gateCalls: 0,
-		gateRetryMode: "operational",
-		gateLease: undefined,
-	});
-	expect(withoutLease.stats).toMatchObject({ gateErrors: 1 });
+	const building = buildingState();
+	building.lspProbeStatus = "pending";
+	building.lspLease = state.lspLease;
+	expect(reduceGate(building, { type: "restore_reconcile", now: 40 }).effects).toEqual([]);
+	expect(building.lspLease).toBeUndefined();
 });
 
 test("human controls begin a fresh repair cycle or terminally fail after the complete two-FAIL chain", () => {
@@ -301,6 +316,7 @@ function mulberry32(seed: number): () => number {
 function pausedAfterTwoFailures(): LeanFlowState {
 	const state = dispatch();
 	reduceGate(state, { type: "gate_settled", outcome: "FAIL", findingsJson: '{"id":"first"}' });
+	reduceGate(state, { type: "repair_round_ready" });
 	dispatch(state, "gate-2");
 	reduceGate(state, { type: "gate_settled", outcome: "FAIL", findingsJson: '{"id":"second"}' });
 	expect(state.phase).toBe("awaiting_human");
@@ -320,13 +336,18 @@ function randomGateEvent(state: LeanFlowState, random: () => number, seed: numbe
 				type: "gate_dispatch",
 				toolCallId: `gate-${seed}-${index}`,
 				runId: GATE_RUN_ID,
-				snapshotDigest: `snapshot-${seed}-${index}`,
+				snapshotDigest: sha64("a"),
+				planDigest: sha64("b"),
+				buildRecordRound: 1,
 				now: index,
 			};
 		case "gating":
 			if (random() < 0.2) return { type: "gate_error" };
+			if (random() < 0.2) return { type: "gate_interrupted" };
 			if (random() < 0.4) return { type: "restore_reconcile", now: index };
 			return { type: "gate_settled", outcome: randomOutcome(random) };
+		case "repair_preparing":
+			return random() < 0.5 ? { type: "repair_round_ready" } : { type: "repair_round_failed", reason: "disk full" };
 		case "awaiting_human":
 			return random() < 0.5
 				? { type: "human_continue", now: index }
@@ -345,9 +366,13 @@ function invalidGateEvent(state: LeanFlowState, seed: number, index: number): Ga
 				type: "gate_dispatch",
 				toolCallId: `ignored-${seed}-${index}`,
 				runId: GATE_RUN_ID,
-				snapshotDigest: "ignored",
+				snapshotDigest: sha64("a"),
+				planDigest: sha64("b"),
+				buildRecordRound: 1,
 				now: index,
 			};
+		case "repair_preparing":
+			return { type: "gate_dispatch", toolCallId: `ignored-${seed}-${index}`, runId: GATE_RUN_ID, snapshotDigest: sha64("a"), planDigest: sha64("b"), buildRecordRound: 1, now: index };
 		case "awaiting_human":
 			return { type: "gate_error" };
 		case "finalizing":
@@ -363,14 +388,19 @@ function terminalInvalidEvents(seed: number, index: number): GateEvent[] {
 			type: "gate_dispatch",
 			toolCallId: `ignored-terminal-${seed}-${index}`,
 			runId: GATE_RUN_ID,
-			snapshotDigest: "ignored",
+			snapshotDigest: sha64("a"),
+			planDigest: sha64("b"),
+			buildRecordRound: 1,
 			now: index,
 		},
 		{ type: "gate_settled", outcome: "PASS" },
 		{ type: "gate_settled", outcome: "FAIL" },
 		{ type: "gate_settled", outcome: "BLOCKED" },
 		{ type: "gate_error" },
+		{ type: "gate_interrupted" },
 		{ type: "restore_reconcile", now: index },
+		{ type: "repair_round_ready" },
+		{ type: "repair_round_failed", reason: "x" },
 		{ type: "human_continue", now: index },
 		{ type: "human_finish_failed", now: index },
 	];

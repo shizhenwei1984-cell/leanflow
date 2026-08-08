@@ -351,6 +351,10 @@ export function sha256Text(value: string): string {
 	return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
+export function buildGateSnapshotDigest(input: { planDigest: string; build: string; diff: string; evidence: string }): string {
+	return sha256Text(`${input.planDigest}\n${input.build}\n${input.diff}\n${input.evidence}`);
+}
+
 export function renderBuildArtifacts(input: RenderBuildArtifactsInput): RenderedBuildArtifacts {
 	const record = parseBuildEvidenceRecord(input.record, {
 		runId: input.record.runId,

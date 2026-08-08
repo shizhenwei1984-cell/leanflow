@@ -8,13 +8,17 @@
  * Phase lifecycle:
  *   idle → planning → awaiting_approval → building → gating → finalizing → idle
  *
- * Transitions:
- *   write canonical plan artifact → awaiting_approval (plan exists; not yet approved)
- *   native approved-plan prompt    → building
- *   task(gate)                     → gating
- *   Gate PASS / 2nd FAIL           → finalizing
- *   settled final response         → idle
- *   Gate 1st FAIL                  → building (repair)
+ *   Transitions:
+ *     write canonical plan artifact → awaiting_approval (plan exists; not yet approved)
+ *     native approved-plan prompt    → building
+ *     task(gate)                     → gating
+ *     Gate PASS                      → finalizing
+ *     Gate 2nd valid FAIL            → awaiting_human → building (via /flowcontinue)
+ *     Gate 1st valid FAIL            → repair_preparing → building (repair record ready)
+ *                          ↘ awaiting_human (repair record failed)
+ *     Gate BLOCKED                   → building (evidence recovery)
+ *     Gate operational error ×4 (per-cycle) → awaiting_human
+ *     settled final response         → idle
  */
 
 export type LeanFlowPhase =
@@ -23,6 +27,7 @@ export type LeanFlowPhase =
 	| "awaiting_approval"
 	| "building"
 	| "gating"
+	| "repair_preparing"
 	| "awaiting_human"
 	| "finalizing";
 export type RunMarkerStatus = "awaiting_approval" | "building" | "paused" | "completed" | "failed" | "abandoned" | "invalidated";
@@ -43,6 +48,10 @@ export interface OperationLease {
 	startedAt: number;
 	/** SHA-256 over the pre-Gate artifact snapshot; gate leases only. */
 	snapshotDigest?: string;
+	/** SHA-256 of the canonical plan at dispatch; gate leases only. */
+	planDigest?: string;
+	/** Durable BUILD record round validated at dispatch; gate leases only. */
+	buildRecordRound?: number;
 	/** Diagnostics target; LSP leases only. */
 	lspTarget?: string;
 }
@@ -81,7 +90,10 @@ export interface LeanFlowStats {
 	gatePasses: number;
 	gateVerdictFailures: number;
 	gateBlocked: number;
+	/** Cumulative operational/unparseable Gate failures. */
 	gateErrors: number;
+	/** Session-switch interruptions while Gate was in flight; not counted toward the per-cycle error budget. */
+	gateInterruptions?: number;
 	gateReadinessBlocks: number;
 	repairRounds: number;
 	repairSuccesses: number;
@@ -97,7 +109,7 @@ export interface LeanFlowState {
 	gateCalls: number;
 	/** Gate dispatches, including BLOCKED and operationally failed calls. */
 	gateDispatches?: number;
-	/** Which gate round: 0 = not yet gated, 1 = first gate, 2 = repair gate. */
+	/** Which gate round: 0 = not yet gated, 1 = first gate, 2+ including human repair cycles. */
 	gateAttempt: number;
 	/** Stable opaque identity persisted in the fresh-session run marker. */
 	runId?: string;
@@ -160,6 +172,10 @@ export interface LeanFlowState {
 	buildMutationObserved?: boolean;
 	/** Build evidence artifacts written this round: build / diff / evidence. */
 	writtenArtifacts?: string[];
+	/** Per-cycle consecutive operational Gate errors used for the 4-error pause cap; reset on PASS/FAIL/BLOCKED and /flowcontinue. */
+	consecutiveGateErrors?: number;
+	/** Persisted workflow schema version; absence implies v1 (pre-7614368). */
+	stateVersion?: number;
 	/** Runtime token/context statistics for the current run. */
 	stats?: LeanFlowStats;
 }
@@ -195,6 +211,8 @@ export function defaultState(): LeanFlowState {
 		gateDispatches: 0,
 		gateAttempt: 0,
 		humanRepairCycles: 0,
+		consecutiveGateErrors: 0,
+		stateVersion: STATE_VERSION,
 		lspProbeStatus: "pending",
 		stats: defaultStats(),
 	};
@@ -225,16 +243,39 @@ export function restoreState(branch: Iterable<BranchEntry>): LeanFlowState {
 	return normalizeState(latest);
 }
 
+export const STATE_VERSION = 2;
+
+function migrateLegacyGateState(
+	state: LeanFlowState,
+	rawPhase: LeanFlowPhase,
+): { phase: LeanFlowPhase; gateCalls: number } {
+	const version = typeof (state as Record<string, unknown>).stateVersion === "number" ? (state.stateVersion as number) : 1;
+	const rawGateCalls = numberOr(state.gateCalls, 0);
+	if (version >= STATE_VERSION) {
+		return { phase: rawPhase, gateCalls: rawGateCalls };
+	}
+	if (rawPhase === "gating") {
+		const repair = state.gateRetryMode === "repair";
+		return { phase: "building", gateCalls: repair ? 1 : 0 };
+	}
+	if (rawPhase === "building" && rawGateCalls >= 2) {
+		return { phase: "building", gateCalls: 1 };
+	}
+	return { phase: rawPhase, gateCalls: rawGateCalls };
+}
+
 function normalizeState(value: LeanFlowState | undefined): LeanFlowState {
 	const state = value ?? defaultState();
-	const phase = isPhase(state.phase) ? state.phase : "idle";
-	const gateCalls = numberOr(state.gateCalls, 0);
+	const rawPhase = isPhase(state.phase) ? state.phase : "idle";
+	const migrated = migrateLegacyGateState(state, rawPhase);
+	const phase = migrated.phase;
+	const gateCalls = migrated.gateCalls;
 	return {
 		phase,
+		stateVersion: STATE_VERSION,
 		phaseStartedAt: optionalNumber(state.phaseStartedAt),
 		scoutCalls: numberOr(state.scoutCalls, 0),
-		// Pre-overhaul BUILD states counted dispatches, so leave one verdict slot.
-		gateCalls: phase === "building" && gateCalls >= 2 ? 1 : gateCalls,
+		gateCalls,
 		gateDispatches:
 			typeof state.gateDispatches === "number" && Number.isFinite(state.gateDispatches) && state.gateDispatches >= 0
 				? state.gateDispatches
@@ -296,6 +337,10 @@ function normalizeState(value: LeanFlowState | undefined): LeanFlowState {
 		baselineCaptured: state.baselineCaptured === true,
 		buildMutationObserved: state.buildMutationObserved === true,
 		writtenArtifacts: Array.isArray(state.writtenArtifacts) ? state.writtenArtifacts.filter((v) => typeof v === "string") : undefined,
+		consecutiveGateErrors:
+			typeof state.consecutiveGateErrors === "number" && Number.isFinite(state.consecutiveGateErrors) && state.consecutiveGateErrors >= 0
+				? Math.floor(state.consecutiveGateErrors)
+				: 0,
 		terminalOutcome:
 			state.terminalOutcome === "pass" ||
 			state.terminalOutcome === "fail_after_retry" ||
@@ -333,6 +378,10 @@ function normalizeStats(value: LeanFlowStats | undefined): LeanFlowStats {
 				? legacy.gateBlocked
 				: 0,
 		gateErrors: numberOr(legacy?.gateErrors, 0),
+		gateInterruptions:
+			typeof legacy?.gateInterruptions === "number" && Number.isFinite(legacy.gateInterruptions) && legacy.gateInterruptions >= 0
+				? Math.floor(legacy.gateInterruptions)
+				: 0,
 		gateReadinessBlocks: numberOr(legacy?.gateReadinessBlocks, 0),
 		repairRounds: numberOr(legacy?.repairRounds ?? legacy?.repairs, 0),
 		repairSuccesses: numberOr(legacy?.repairSuccesses, 0),
@@ -368,6 +417,7 @@ function optionalNumber(value: unknown): number | undefined {
 }
 
 const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const SHA256_PATTERN = /^[0-9a-f]{64}$/i;
 const HANDOFF_BLOCKER_CODES: Record<string, true> = {
 	TARGET_MISSING: true,
 	BEHAVIOR_MISSING: true,
@@ -384,6 +434,8 @@ function normalizeOperationLease(value: unknown): OperationLease | undefined {
 		cycle?: unknown;
 		startedAt?: unknown;
 		snapshotDigest?: unknown;
+		planDigest?: unknown;
+		buildRecordRound?: unknown;
 		lspTarget?: unknown;
 	};
 	const cycle = optionalNumber(lease.cycle);
@@ -400,13 +452,18 @@ function normalizeOperationLease(value: unknown): OperationLease | undefined {
 		return undefined;
 	}
 	if (lease.kind === "gate") {
+		const snapshotDigest = typeof lease.snapshotDigest === "string" && SHA256_PATTERN.test(lease.snapshotDigest) ? lease.snapshotDigest : undefined;
+		const planDigest = typeof lease.planDigest === "string" && SHA256_PATTERN.test(lease.planDigest) ? lease.planDigest : undefined;
+		const buildRecordRound = optionalNumber(lease.buildRecordRound);
 		return {
 			toolCallId: lease.toolCallId,
 			kind: lease.kind,
 			runId: lease.runId,
 			cycle,
 			startedAt,
-			snapshotDigest: typeof lease.snapshotDigest === "string" ? lease.snapshotDigest : undefined,
+			snapshotDigest,
+			planDigest,
+			buildRecordRound: buildRecordRound !== undefined && Number.isInteger(buildRecordRound) && buildRecordRound >= 1 ? buildRecordRound : undefined,
 		};
 	}
 	return {
@@ -432,6 +489,7 @@ function isPhase(value: unknown): value is LeanFlowPhase {
 		value === "awaiting_approval" ||
 		value === "building" ||
 		value === "gating" ||
+		value === "repair_preparing" ||
 		value === "awaiting_human" ||
 		value === "finalizing"
 	);

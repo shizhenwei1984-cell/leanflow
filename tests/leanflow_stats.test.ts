@@ -125,6 +125,7 @@ test("restore normalizes an older persisted state without new metric fields", ()
 
 test("restore accepts paused state and preserves only valid compact operation metadata", () => {
 	const validRunId = "11111111-1111-4111-8111-111111111111";
+	const sha = "a".repeat(64);
 	const restored = restoreState([
 		{
 			type: "custom",
@@ -146,7 +147,9 @@ test("restore accepts paused state and preserves only valid compact operation me
 					runId: validRunId,
 					cycle: 2,
 					startedAt: 1,
-					snapshotDigest: "snapshot",
+					snapshotDigest: sha,
+					planDigest: sha,
+					buildRecordRound: 2,
 				},
 				lspLease: {
 					toolCallId: "lsp-call",
@@ -172,7 +175,9 @@ test("restore accepts paused state and preserves only valid compact operation me
 			runId: validRunId,
 			cycle: 2,
 			startedAt: 1,
-			snapshotDigest: "snapshot",
+			snapshotDigest: sha,
+			planDigest: sha,
+			buildRecordRound: 2,
 		},
 	});
 	expect(restored.lspLease).toBeUndefined();
@@ -239,9 +244,8 @@ test("flowstats labels message, byte, and token measures without conflation", ()
 	expect(output).toContain("provider token reduction: not measured");
 	expect(output).toContain("Scout/Gate tokens: not measured");
 	expect(output).toContain("verdict attempts: 1   passes: 0   verdict failures: 0");
-	expect(output).toContain(
-		"dispatches: 3   blocked: 0   execution/unparseable errors: 0   readiness blocks: 0",
-	);
+	expect(output).toContain("dispatches: 3   blocked: 0   execution/unparseable errors: 0");
+	expect(output).toContain("interruptions: 0   consecutive errors: 0   readiness blocks: 0");
 	expect(output).toContain("human repair cycles: 2");
 });
 

@@ -9,8 +9,12 @@
  *   write/edit canonical *-plan.md → awaiting_approval
  *   exact native approved-plan prompt → building (LSP may still lock mutation)
  *   task(gate)                     → gating
- *   Gate PASS / 2nd FAIL           → finalizing → idle
- *   Gate 1st valid FAIL            → building (repair)
+ *   Gate PASS                      → finalizing → idle
+ *   Gate 2nd valid FAIL            → awaiting_human → building (via /flowcontinue)
+ *   Gate 1st valid FAIL            → repair_preparing → building (repair record ready)
+ *                          ↘ awaiting_human (repair record failed)
+ *   Gate BLOCKED                   → building (evidence recovery)
+ *   Gate operational error ×4 (per-cycle) → awaiting_human
  *
  * The critical correctness property: a successful proposal is not approval.
  * BUILD begins only when OMP's synthetic approval prompt names the exact plan
@@ -18,7 +22,8 @@
  * before its first repository mutation.
  *
  * State persists via appendEntry and restores from the session branch,
- * surviving compaction and session switches.
+ * surviving compaction and session switches. Gate leases retain planDigest +
+ * snapshotDigest + buildRecordRound as durable correlation for settlement.
  */
 
 import { createHash, randomUUID } from "node:crypto";
@@ -29,6 +34,7 @@ import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolCallEvent } from "@oh-my-pi/pi-coding-agent";
 import { approvedPlanArtifact, filterForBuilder } from "./context";
 import {
+	buildGateSnapshotDigest,
 	composeCompleteDiff,
 	createBuildEvidenceRecord,
 	parseBuildEvidenceRecord,
@@ -814,13 +820,17 @@ export default function leanflow(pi: ExtensionAPI): void {
 		return parseBuildEvidenceRecord(value, activeBuildIdentity(round));
 	}
 
+	function expectedGateRoundForSnapshot(): number {
+		return state.gateRetryMode === "operational" || state.gateRetryMode === "evidence" ? state.gateAttempt : state.gateAttempt + 1;
+	}
+
 	/**
 	 * Re-read the immutable Gate inputs immediately before dispatch. State marks
 	 * are merely readiness hints; the files and build record are the authority.
 	 */
 	async function prepareGateSnapshot(
 		ctx: ExtensionContext,
-	): Promise<{ ok: true; snapshotDigest: string } | { ok: false; reason: string }> {
+	): Promise<{ ok: true; snapshotDigest: string; planDigest: string; buildRecordRound: number; build: string; diff: string; evidence: string } | { ok: false; reason: string }> {
 		if (pendingEvidenceObservations.size > 0) {
 			return {
 				ok: false,
@@ -876,10 +886,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 			return { ok: false, reason: "canonical plan digest does not match the approved plan" };
 		}
 
-		const recordRound =
-			state.gateRetryMode === "operational" || state.gateRetryMode === "evidence"
-				? state.gateAttempt
-				: state.gateAttempt + 1;
+		const recordRound = expectedGateRoundForSnapshot();
 		try {
 			const record = await loadBuildRecord(ctx, recordRound);
 			if (record.round !== recordRound) {
@@ -891,10 +898,70 @@ export default function leanflow(pi: ExtensionAPI): void {
 
 		return {
 			ok: true,
-			snapshotDigest: sha256Hex(
-				`${state.planDigest}\n${build.content}\n${diff.content}\n${evidence.content}`,
-			),
+			snapshotDigest: buildGateSnapshotDigest({ planDigest: state.planDigest!, build: build.content, diff: diff.content, evidence: evidence.content }),
+			planDigest: state.planDigest!,
+			buildRecordRound: recordRound,
+			build: build.content,
+			diff: diff.content,
+			evidence: evidence.content,
 		};
+	}
+
+	async function verifyGateSnapshot(
+		ctx: ExtensionContext,
+		lease: NonNullable<LeanFlowState["gateLease"]>,
+	): Promise<{ ok: true } | { ok: false; reason: string }> {
+		if (!ctx.localProtocolOptions || !state.runId || !state.planDigest || !lease.planDigest || !lease.snapshotDigest || lease.buildRecordRound === undefined) {
+			return { ok: false, reason: "Gate lease is missing durable snapshot identity" };
+		}
+		if (state.planDigest !== lease.planDigest) {
+			return { ok: false, reason: "canonical plan digest changed since Gate dispatch" };
+		}
+		const artifacts = expectedGateArtifacts(state);
+		if (!artifacts) return { ok: false, reason: "canonical Gate artifact identity is unavailable" };
+		const readArtifact = async (kind: string, artifact: string): Promise<{ ok: true; content: string } | { ok: false; reason: string }> => {
+			const artifactPath = resolveRunMarkerPath(ctx.localProtocolOptions!, artifact);
+			if (!artifactPath) return { ok: false, reason: `canonical ${kind} artifact path cannot be resolved` };
+			try {
+				const content = await fs.readFile(artifactPath, "utf8");
+				if (content.length === 0) return { ok: false, reason: `canonical ${kind} artifact is empty` };
+				if (!content.includes(state.runId!)) return { ok: false, reason: `canonical ${kind} artifact does not belong to this run` };
+				return { ok: true, content };
+			} catch {
+				return { ok: false, reason: `canonical ${kind} artifact is missing or unreadable` };
+			}
+		};
+		const [build, diff, evidence] = await Promise.all([
+			readArtifact("build", artifacts.build),
+			readArtifact("diff", artifacts.diff),
+			readArtifact("evidence", artifacts.evidence),
+		]);
+		if (!build.ok) return build;
+		if (!diff.ok) return diff;
+		if (!evidence.ok) return evidence;
+		const planPath = resolveRunMarkerPath(ctx.localProtocolOptions, artifacts.plan);
+		if (!planPath) return { ok: false, reason: "canonical plan artifact path cannot be resolved" };
+		try {
+			const canonicalPlan = await fs.readFile(planPath, "utf8");
+			if (sha256Hex(canonicalPlan) !== lease.planDigest) {
+				return { ok: false, reason: "canonical plan digest changed since Gate dispatch" };
+			}
+		} catch {
+			return { ok: false, reason: "canonical plan artifact is missing or unreadable" };
+		}
+		try {
+			const record = await loadBuildRecord(ctx, lease.buildRecordRound);
+			if (record.round !== lease.buildRecordRound) {
+				return { ok: false, reason: "BUILD record round does not match the dispatched Gate lease" };
+			}
+		} catch (error) {
+			return { ok: false, reason: `BUILD record validation failed: ${evidenceFailureMessage(error)}` };
+		}
+		const currentDigest = buildGateSnapshotDigest({ planDigest: lease.planDigest, build: build.content, diff: diff.content, evidence: evidence.content });
+		if (currentDigest !== lease.snapshotDigest) {
+			return { ok: false, reason: "Gate snapshot changed since dispatch; retry with unchanged evidence" };
+		}
+		return { ok: true };
 	}
 	async function planDriftedDuringGate(ctx: ExtensionContext, dispatchedPlanDigest: string | undefined): Promise<boolean> {
 		if (!ctx.localProtocolOptions || !dispatchedPlanDigest || state.planDigest !== dispatchedPlanDigest) return true;
@@ -1491,10 +1558,22 @@ export default function leanflow(pi: ExtensionAPI): void {
 				case "begin_repair_round": {
 					const buildRecord = await beginRepairBuildRound(ctx);
 					if (!buildRecord.ok) {
-						ctx.ui.notify(
-							`LeanFlow: Cannot start repair BUILD record: ${buildRecord.reason}. Staying in BUILD.`,
-							"warning",
-						);
+						const { effects: repairEffects } = reduceGate(state, {
+							type: "repair_round_failed",
+							reason: buildRecord.reason,
+						});
+						await executeGateEffects(ctx, repairEffects);
+						persist();
+						updateStatus(ctx);
+						const violations = checkInvariants(state);
+						if (violations.length > 0) {
+							ctx.ui.notify(`LeanFlow invariant violation: ${violations.join("; ")}`, "warning");
+						}
+						break;
+					}
+					if (state.phase === "repair_preparing") {
+						const { effects: readyEffects } = reduceGate(state, { type: "repair_round_ready" });
+						await executeGateEffects(ctx, readyEffects);
 					}
 					break;
 				}
@@ -1560,6 +1639,9 @@ export default function leanflow(pi: ExtensionAPI): void {
 				reason: `${pendingEvidenceObservations.size} BUILD evidence observation(s) are still pending`,
 			};
 		}
+		if (state.phase === "repair_preparing") {
+			return { ready: false, reason: "repair preparation in progress" };
+		}
 		if (!ctx.localProtocolOptions) return { ready: false, reason: "local artifact storage is unavailable" };
 		if (!state.runId || !state.planDigest) return { ready: false, reason: "active run identity is incomplete" };
 		if (!expectedGateArtifacts(state)) {
@@ -1568,11 +1650,21 @@ export default function leanflow(pi: ExtensionAPI): void {
 		return { ready: true };
 	}
 
-	function formatFlowStatus(ctx: ExtensionContext): string {
+	async function formatFlowStatus(ctx: ExtensionContext): Promise<string> {
 		const written = new Set(state.writtenArtifacts ?? []);
 		const markedArtifacts = REQUIRED_ARTIFACTS.filter((kind) => written.has(kind));
-		const readiness = cheapGateReadiness(ctx);
-		const readinessLine = readiness.ready ? "READY" : `BLOCKED: ${readiness.reason}`;
+		const cheap = cheapGateReadiness(ctx);
+		let readinessLine: string;
+		if (!cheap.ready) {
+			readinessLine = `BLOCKED: ${cheap.reason}`;
+		} else {
+			const deep = await prepareGateSnapshot(ctx);
+			if (deep.ok) {
+				readinessLine = `READY (deep: verified, round ${deep.buildRecordRound}, snapshot ${deep.snapshotDigest.slice(0, 12)})`;
+			} else {
+				readinessLine = `BLOCKED: ${deep.reason}`;
+			}
+		}
 		const digest = state.planDigest ? state.planDigest.slice(0, 12) : "unavailable";
 
 		return [
@@ -1584,6 +1676,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 			`- Gate verdicts: ${state.gateCalls}/2`,
 			`- Gate dispatches: ${state.gateDispatches ?? 0}`,
 			`- Gate blocked: ${state.stats?.gateBlocked ?? 0}`,
+			`- Consecutive errors: ${state.consecutiveGateErrors ?? 0}/4`,
 			`- Pending evidence observations: ${pendingEvidenceObservations.size}`,
 			`- Baseline captured: ${state.baselineCaptured === true ? "yes" : "no"}`,
 			`- Written artifacts: ${markedArtifacts.length}/${REQUIRED_ARTIFACTS.length} (${markedArtifacts.join(", ") || "none"} / ${REQUIRED_ARTIFACTS.join(", ")})`,
@@ -1600,6 +1693,16 @@ export default function leanflow(pi: ExtensionAPI): void {
 	const restoreSessionState = async (_event: unknown, ctx: ExtensionContext): Promise<void> => {
 		const branch = ctx.sessionManager.getBranch();
 		hasPersistedLeanFlowState = hasPersistedState(branch);
+		const rawBeforeRestore = (() => {
+			for (let i = branch.length - 1; i >= 0; i--) {
+				const entry = branch[i] as Record<string, unknown>;
+				if (entry?.type === "custom" && entry?.customType === CUSTOM_TYPE) {
+					return entry.data as LeanFlowState;
+				}
+			}
+			return undefined;
+		})();
+		const wasGatingRaw = rawBeforeRestore?.phase === "gating" && rawBeforeRestore?.gateLease !== undefined;
 		state = restoreState(branch);
 		pendingPlanRefreshes.clear();
 		pendingLspProbes.clear();
@@ -1613,6 +1716,36 @@ export default function leanflow(pi: ExtensionAPI): void {
 		const lspLeaseBeforeReconciliation = state.lspLease;
 		const { effects } = reduceGate(state, { type: "restore_reconcile", now: Date.now() });
 		await executeGateEffects(ctx, effects);
+
+		if (wasGatingRaw) {
+			const leaseToRestore = (rawBeforeRestore?.gateLease ?? gateLeaseBeforeReconciliation) as NonNullable<LeanFlowState["gateLease"]>;
+			const isGatingNow = state.phase === "gating" && state.gateLease !== undefined;
+			if (!isGatingNow) {
+				if (leaseToRestore) state.gateLease = leaseToRestore as typeof state.gateLease;
+				if (state.phase !== "gating") state.phase = "gating";
+			}
+			const interrupted = reduceGate(state, { type: "gate_interrupted" });
+			await executeGateEffects(ctx, interrupted.effects);
+		}
+
+		if (state.phase === "building" || state.phase === "repair_preparing") {
+			try {
+				const round = expectedGateRoundForSnapshot();
+				const record = await loadBuildRecord(ctx, round);
+				if (record.round !== state.gateAttempt && record.round !== state.gateAttempt + 1) {
+					if (record.round >= 1 && record.round <= 100) {
+						state.gateAttempt = record.round;
+						if (record.round === 1 && state.gateRetryMode === "repair") {
+							state.gateRetryMode = undefined;
+						}
+					}
+				} else if (record.round !== round) {
+					state.gateAttempt = record.round;
+				}
+			} catch {
+				// Missing or unreadable record is handled at next preflight as a blocked readiness reason.
+			}
+		}
 
 		const violations = checkInvariants(state);
 		if (violations.length > 0) {
@@ -2036,7 +2169,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 
 		if (
 			canonicalPlanMutation &&
-			(state.phase === "building" || state.phase === "gating")
+			(state.phase === "building" || state.phase === "gating" || state.phase === "repair_preparing")
 		) {
 			return {
 				block: true,
@@ -2097,6 +2230,12 @@ export default function leanflow(pi: ExtensionAPI): void {
 				reason: "LeanFlow: Gate evidence recovery must reuse the implementation unchanged.",
 			};
 		}
+		if (state.phase === "repair_preparing") {
+			return {
+				block: true,
+				reason: "LeanFlow: repair preparation is in progress; no tools are allowed until the next BUILD round is ready.",
+			};
+		}
 		if (state.phase === "awaiting_human" && effect !== "read_only") {
 			return {
 				block: true,
@@ -2145,10 +2284,12 @@ export default function leanflow(pi: ExtensionAPI): void {
 					toolCallId: event.toolCallId,
 					runId: state.runId ?? "",
 					snapshotDigest: snapshot.snapshotDigest,
+					planDigest: snapshot.planDigest,
+					buildRecordRound: snapshot.buildRecordRound,
 					now: Date.now(),
 				});
 				pendingGateCalls.add(event.toolCallId);
-				pendingGatePlanDigests.set(event.toolCallId, state.planDigest ?? "");
+				pendingGatePlanDigests.set(event.toolCallId, snapshot.planDigest);
 			}
 			state.scoutCalls += scoutCount;
 			if (roles.length > 0) {
@@ -2347,9 +2488,22 @@ export default function leanflow(pi: ExtensionAPI): void {
 			(pendingGateCalls.has(event.toolCallId) ||
 				(state.phase === "gating" && state.gateLease?.toolCallId === event.toolCallId))
 		) {
-			const dispatchedPlanDigest = pendingGatePlanDigests.get(event.toolCallId);
+			const dispatchedPlanDigest = pendingGatePlanDigests.get(event.toolCallId) ?? state.gateLease?.planDigest;
 			pendingGateCalls.delete(event.toolCallId);
 			pendingGatePlanDigests.delete(event.toolCallId);
+			if (!event.isError && state.phase === "gating" && state.gateLease) {
+				const snapshotCheck = await verifyGateSnapshot(ctx, state.gateLease);
+				if (!snapshotCheck.ok) {
+					const isSnapshotDrift = snapshotCheck.reason.includes("snapshot") || snapshotCheck.reason.includes("changed since dispatch");
+					if (isSnapshotDrift) {
+						ctx.ui.notify(`LeanFlow: ${snapshotCheck.reason}; retry with unchanged evidence.`, "warning");
+						await finishGateResult(undefined, true, ctx);
+						return;
+					}
+					// BUILD record / artifact unreadable → treat the Gate result as operational error
+					// and fall through to verdict extraction; the repair_preparing transaction will handle record failures.
+				}
+			}
 			if (!event.isError && (await planDriftedDuringGate(ctx, dispatchedPlanDigest))) {
 				ctx.ui.notify("LeanFlow: plan drifted during Gate; retry with unchanged evidence.", "warning");
 				await finishGateResult(undefined, true, ctx);
@@ -2465,9 +2619,9 @@ export default function leanflow(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("flowstatus", {
-		description: "Show the current LeanFlow phase and in-memory Gate readiness.",
+		description: "Show the current LeanFlow phase and deep Gate readiness.",
 		handler: async (_args, ctx) => {
-			ctx.ui.notify(formatFlowStatus(ctx), "info");
+			ctx.ui.notify(await formatFlowStatus(ctx), "info");
 		},
 	});
 

@@ -46,7 +46,7 @@ export function findApprovedPlanBoundary(messages: AgentMessage[], artifact: str
  * Builder context through building.
  */
 export function filterForBuilder(messages: AgentMessage[], state: LeanFlowState): AgentMessage[] | undefined {
-	if (state.phase !== "building" && state.phase !== "awaiting_approval" && state.phase !== "finalizing") return undefined;
+	if (state.phase !== "building" && state.phase !== "awaiting_approval" && state.phase !== "repair_preparing" && state.phase !== "finalizing") return undefined;
 	const artifact = state.approvedPlanArtifact;
 	if (!artifact) return undefined;
 

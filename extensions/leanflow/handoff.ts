@@ -1,11 +1,3 @@
-/**
- * Deterministic canonical-plan handoff assessment.
- *
- * The checks deliberately recognize explicit plan signals rather than trying
- * to infer implementation intent from prose. Workflow metadata is excluded so
- * opaque run IDs cannot accidentally satisfy an English behavior-verb check.
- */
-
 import type { HandoffStatus } from "./state";
 
 export type HandoffBlockerCode =
@@ -25,36 +17,26 @@ export interface HandoffResult {
 	warnings: string[];
 }
 
-const TARGET_PATH = /\b[\w.-]+\/[\w./-]+\.(?:ts|tsx|js|py|md|json|yml|yaml|pm|pl)\b/i;
-const TARGET_PATH_OCCURRENCES = /\b[\w.-]+\/[\w./-]+\.(?:ts|tsx|js|py|md|json|yml|yaml|pm|pl)\b/gi;
+const TARGET_PATH =
+	/\b[\w.-]+\/[\w./-]+\.(?:ts|tsx|js|py|md|json|yml|yaml|pm|pl|go|rs|toml|lock|mk|mod|sum|gradle)\b|\bDockerfile\b|\bMakefile\b|\bgo\.mod\b|\bgo\.sum\b/i;
+const TARGET_PATH_OCCURRENCES =
+	/\b[\w.-]+\/[\w./-]+\.(?:ts|tsx|js|py|md|json|yml|yaml|pm|pl|go|rs|toml|lock|mk|mod|sum|gradle)\b|\bDockerfile\b|\bMakefile\b|\bgo\.mod\b|\bgo\.sum\b/gi;
 const BEHAVIOR_VERB =
-	/\b(?:change|update|add|remove|implement|fix|refactor|extend|replace|rename|delete|create|migrate|split|merge|rewrite)\b|修改|新增|添加|删除|创建|调整|替换|迁移|拆分|合并|重写|修复|实现|扩展|重命名/i;
-const ACCEPTANCE_CUE = /- \[ \]|\bmust\b|\bexpected\b|必须|期望/i;
+	/\b(?:change|update|add|remove|implement|fix|refactor|extend|replace|rename|delete|create|migrate|split|merge|rewrite|ensure|prevent|persist|validate|check|verify|support|enable|disable|handle|process)\b|修改|新增|添加|删除|创建|调整|替换|迁移|拆分|合并|重写|修复|实现|扩展|重命名|支持|确保|避免|保证|处理|校验|验证|检查|兼容/i;
+const PLACEHOLDER_LINE = /^(?:TBD|N\/A|\?|unknown|待定|待补充)\s*$/i;
 const EDGE_CASE_CUE = /\bedge[ -]?cases?\b|边界(?:情况|条件)?|异常(?:情况)?/i;
 const METADATA_LINE = /^\s*(?:LeanFlow run ID|LSP applicability):/i;
 const MARKDOWN_HEADING = /^(#{1,6})\s+/;
 
+function stripListMarker(line: string): string {
+	return line.replace(/^\s*(?:[-*]|\d+\.)\s+/, "").replace(/^[`]+|[`]+$/g, "").trim();
+}
+
 function hasBehaviorEvidence(lines: string[]): boolean {
-	let criticalFilesDepth: number | undefined;
-
 	for (const line of lines) {
-		const heading = MARKDOWN_HEADING.exec(line);
-		if (heading) {
-			if (/^#{2,6}\s+critical files\s*#*\s*$/i.test(line)) {
-				criticalFilesDepth = heading[1]!.length;
-				continue;
-			}
-			if (criticalFilesDepth !== undefined && heading[1]!.length <= criticalFilesDepth) {
-				criticalFilesDepth = undefined;
-			}
-		}
-		if (criticalFilesDepth !== undefined || METADATA_LINE.test(line)) continue;
-
-		// Strip paths before scanning: a target such as `src/add.ts` is not
-		// evidence that the plan describes an add operation.
-		if (BEHAVIOR_VERB.test(line.replace(TARGET_PATH_OCCURRENCES, ""))) return true;
+		if (MARKDOWN_HEADING.test(line) || METADATA_LINE.test(line)) continue;
+		if (BEHAVIOR_VERB.test(line.replace(TARGET_PATH_OCCURRENCES, " "))) return true;
 	}
-
 	return false;
 }
 
@@ -62,35 +44,111 @@ function hasCriticalFilesEntries(lines: string[]): boolean {
 	for (let index = 0; index < lines.length; index++) {
 		const heading = /^(#{2,6})\s+critical files\s*#*\s*$/i.exec(lines[index]!);
 		if (!heading) continue;
-
 		const depth = heading[1]!.length;
 		for (let next = index + 1; next < lines.length; next++) {
 			const line = lines[next]!;
 			const nextHeading = /^(#{1,6})\s+/.exec(line);
 			if (nextHeading && nextHeading[1]!.length <= depth) break;
-			if (!nextHeading && line.trim().length > 0) return true;
+			const trimmed = stripListMarker(line);
+			if (trimmed.length === 0) continue;
+			if (PLACEHOLDER_LINE.test(trimmed)) continue;
+			if (TARGET_PATH.test(trimmed) || /::/.test(trimmed) || /\//.test(trimmed)) return true;
 		}
 	}
 	return false;
 }
 
-function hasVerificationEvidence(lines: string[]): boolean {
+function sliceSection(lines: string[], headingPattern: RegExp): string[] {
 	for (let index = 0; index < lines.length; index++) {
-		const heading = /^(#{1,6})\s+.*(?:verification|验证).*$/i.exec(lines[index]!);
-		if (!heading) continue;
-
+		const heading = /^(#{1,6})\s+(.*)$/.exec(lines[index]!);
+		if (!heading || !headingPattern.test(heading[2]!)) continue;
 		const depth = heading[1]!.length;
-		const section: string[] = [];
+		const body: string[] = [];
 		for (let next = index + 1; next < lines.length; next++) {
 			const line = lines[next]!;
 			const nextHeading = /^(#{1,6})\s+/.exec(line);
 			if (nextHeading && nextHeading[1]!.length <= depth) break;
-			section.push(line);
+			body.push(line);
 		}
-		const content = section.join("\n");
-		if (/^\s*(```|~~~)/m.test(content) || /`(?:bun test|tsc|python|pytest|npm|make|cargo)\b[^`]*`/i.test(content)) {
-			return true;
+		return body;
+	}
+	return [];
+}
+
+function parseArgvLoosely(command: string): string[] | undefined {
+	const trimmed = command.trim();
+	if (!trimmed || trimmed.startsWith("#")) return undefined;
+	const args: string[] = [];
+	let current = "";
+	let quote: string | undefined;
+	let escaped = false;
+	for (const ch of trimmed) {
+		if (escaped) {
+			current += ch;
+			escaped = false;
+			continue;
 		}
+		if (ch === "\\" && quote !== "'") {
+			escaped = true;
+			continue;
+		}
+		if (quote) {
+			if (ch === quote) quote = undefined;
+			else current += ch;
+			continue;
+		}
+		if (ch === '"' || ch === "'") {
+			quote = ch;
+			continue;
+		}
+		if (/\s/.test(ch)) {
+			if (current) {
+				args.push(current);
+				current = "";
+			}
+			continue;
+		}
+		current += ch;
+	}
+	if (quote || escaped) return undefined;
+	if (current) args.push(current);
+	return args.length > 0 ? args : undefined;
+}
+
+function hasVerificationEvidence(lines: string[]): boolean {
+	const section = sliceSection(lines, /verification|验证/i);
+	if (section.length === 0) return false;
+	const text = section.join("\n");
+	const fenceBlocks: string[] = [];
+	const fenceRe = /(```|~~~)[^\n]*\n([\s\S]*?)\n\1/g;
+	let match: RegExpExecArray | null;
+	while ((match = fenceRe.exec(text)) !== null) {
+		fenceBlocks.push(match[2] ?? "");
+	}
+	for (const block of fenceBlocks) {
+		for (const rawLine of block.split(/\r?\n/)) {
+			const line = rawLine.trim();
+			if (!line || line.startsWith("#")) continue;
+			if (parseArgvLoosely(line)) return true;
+		}
+	}
+	for (const line of section) {
+		const inline = /`([^`]+)`/g;
+		let im: RegExpExecArray | null;
+		while ((im = inline.exec(line)) !== null) {
+			if (parseArgvLoosely(im[1] ?? "")) return true;
+		}
+	}
+	return false;
+}
+
+function hasAcceptanceEvidence(lines: string[]): boolean {
+	const section = sliceSection(lines, /acceptance|验收/i);
+	if (section.length === 0) return false;
+	for (const line of section) {
+		const trimmed = line.trim();
+		if (/^- \[ \]/.test(trimmed)) return true;
+		if (/^(?:[-*]|\d+\.)\s+\S+/.test(trimmed) && /(must|expected|should|shall|必须|期望|应当)/i.test(trimmed)) return true;
 	}
 	return false;
 }
@@ -101,9 +159,6 @@ export function assessHandoff(planContent: string): HandoffResult {
 	const blockers: HandoffBlocker[] = [];
 	const warnings: string[] = [];
 
-	// TARGET is a supported source/config/document path or an explicitly
-	// populated `## Critical files` section. Symbols need no special syntax
-	// when documented in that section.
 	if (!TARGET_PATH.test(content) && !hasCriticalFilesEntries(lines)) {
 		blockers.push({
 			code: "TARGET_MISSING",
@@ -116,10 +171,10 @@ export function assessHandoff(planContent: string): HandoffResult {
 			detail: "Plan has no recognized change or behavior verb.",
 		});
 	}
-	if (!/^#{1,6}\s+.*(?:acceptance|验收).*$/im.test(content) && !ACCEPTANCE_CUE.test(content)) {
+	if (!hasAcceptanceEvidence(lines)) {
 		blockers.push({
 			code: "ACCEPTANCE_MISSING",
-			detail: "Plan has no acceptance section or acceptance criterion.",
+			detail: "Plan has no acceptance section with a concrete criterion.",
 		});
 	}
 	if (!hasVerificationEvidence(lines)) {
