@@ -23,13 +23,29 @@ export type LeanFlowPhase =
 	| "awaiting_approval"
 	| "building"
 	| "gating"
+	| "awaiting_human"
 	| "finalizing";
-export type RunMarkerStatus = "awaiting_approval" | "building" | "completed" | "failed" | "abandoned" | "invalidated";
+export type RunMarkerStatus = "awaiting_approval" | "building" | "paused" | "completed" | "failed" | "abandoned" | "invalidated";
 
 export type ObservablePhase = Exclude<LeanFlowPhase, "idle">;
 
 export type HandoffStatus = "READY" | "READY_WITH_WARNINGS" | "NEEDS_UPDATE";
 export type LspProbeStatus = "not_required" | "pending" | "completed";
+export type GateOutcome = "PASS" | "FAIL" | "BLOCKED";
+export type OperationLeaseKind = "gate" | "lsp";
+
+export interface OperationLease {
+	toolCallId: string;
+	kind: OperationLeaseKind;
+	runId: string;
+	/** Gate round (gateAttempt) or LSP probe cycle the lease belongs to. */
+	cycle: number;
+	startedAt: number;
+	/** SHA-256 over the pre-Gate artifact snapshot; gate leases only. */
+	snapshotDigest?: string;
+	/** Diagnostics target; LSP leases only. */
+	lspTarget?: string;
+}
 
 /** Main-session provider usage accrued while a workflow phase is active. */
 export interface PhaseMetrics {
@@ -64,6 +80,7 @@ export interface LeanFlowStats {
 
 	gatePasses: number;
 	gateVerdictFailures: number;
+	gateBlocked: number;
 	gateErrors: number;
 	gateReadinessBlocks: number;
 	repairRounds: number;
@@ -76,13 +93,16 @@ export interface LeanFlowState {
 	/** Timestamp at which the current observable phase started, when observed. */
 	phaseStartedAt?: number;
 	scoutCalls: number;
+	/** Settled Gate verdicts in the current human repair cycle. */
 	gateCalls: number;
+	/** Gate dispatches, including BLOCKED and operationally failed calls. */
+	gateDispatches?: number;
 	/** Which gate round: 0 = not yet gated, 1 = first gate, 2 = repair gate. */
 	gateAttempt: number;
 	/** Stable opaque identity persisted in the fresh-session run marker. */
 	runId?: string;
 	/** Why BUILD resumed after a Gate attempt. */
-	gateRetryMode?: "repair" | "operational";
+	gateRetryMode?: "repair" | "evidence" | "operational";
 	/** Stable slug naming all canonical workflow artifacts. */
 	planSlug?: string;
 	/** Canonical local:// plan artifact written for this run. */
@@ -92,6 +112,8 @@ export interface LeanFlowState {
 	startedAt?: number;
 	handoffStatus?: HandoffStatus;
 	handoffWarnings?: string[];
+	/** Structured handoff blocker codes, without human-readable details. */
+	handoffBlockers?: string[];
 	/** Branch index immediately after the exact proposal request was dispatched. */
 	proposalBoundary?: number;
 	/** Canonical artifact named by the successful xd://propose request. */
@@ -124,6 +146,14 @@ export interface LeanFlowState {
 	lspProbeStatus: LspProbeStatus;
 	/** Path (or `*`) passed to the completed diagnostics probe. */
 	lspProbeTarget?: string;
+	/** Persisted in-flight Gate operation, if any. */
+	gateLease?: OperationLease;
+	/** Persisted in-flight LSP diagnostics operation, if any. */
+	lspLease?: OperationLease;
+	/** Number of Gate-retry cycles explicitly resumed by a human. */
+	humanRepairCycles?: number;
+	/** Compact JSON findings from the most recent settled Gate verdict. */
+	lastGateFindings?: string;
 	/** Whether the immutable BUILD HEAD/status has been captured for this run. */
 	baselineCaptured?: boolean;
 	/** Whether any repository mutation was conservatively allowed after baseline capture. */
@@ -148,6 +178,7 @@ export function defaultStats(): LeanFlowStats {
 		gating: defaultPhaseMetrics(),
 		gatePasses: 0,
 		gateVerdictFailures: 0,
+		gateBlocked: 0,
 		gateErrors: 0,
 		gateReadinessBlocks: 0,
 		repairRounds: 0,
@@ -157,7 +188,16 @@ export function defaultStats(): LeanFlowStats {
 }
 
 export function defaultState(): LeanFlowState {
-	return { phase: "idle", scoutCalls: 0, gateCalls: 0, gateAttempt: 0, lspProbeStatus: "pending", stats: defaultStats() };
+	return {
+		phase: "idle",
+		scoutCalls: 0,
+		gateCalls: 0,
+		gateDispatches: 0,
+		gateAttempt: 0,
+		humanRepairCycles: 0,
+		lspProbeStatus: "pending",
+		stats: defaultStats(),
+	};
 }
 
 interface BranchEntry {
@@ -187,19 +227,34 @@ export function restoreState(branch: Iterable<BranchEntry>): LeanFlowState {
 
 function normalizeState(value: LeanFlowState | undefined): LeanFlowState {
 	const state = value ?? defaultState();
+	const phase = isPhase(state.phase) ? state.phase : "idle";
+	const gateCalls = numberOr(state.gateCalls, 0);
 	return {
-		phase: isPhase(state.phase) ? state.phase : "idle",
+		phase,
 		phaseStartedAt: optionalNumber(state.phaseStartedAt),
 		scoutCalls: numberOr(state.scoutCalls, 0),
-		gateCalls: numberOr(state.gateCalls, 0),
+		// Pre-overhaul BUILD states counted dispatches, so leave one verdict slot.
+		gateCalls: phase === "building" && gateCalls >= 2 ? 1 : gateCalls,
+		gateDispatches:
+			typeof state.gateDispatches === "number" && Number.isFinite(state.gateDispatches) && state.gateDispatches >= 0
+				? state.gateDispatches
+				: 0,
 		gateAttempt: numberOr(state.gateAttempt, 0),
 		runId: typeof state.runId === "string" ? state.runId : undefined,
 		planSlug: typeof state.planSlug === "string" ? state.planSlug : undefined,
 		planArtifact: typeof state.planArtifact === "string" ? state.planArtifact : undefined,
 		startedAt: optionalNumber(state.startedAt),
-		gateRetryMode: state.gateRetryMode === "repair" || state.gateRetryMode === "operational" ? state.gateRetryMode : undefined,
+		gateRetryMode:
+			state.gateRetryMode === "repair" || state.gateRetryMode === "evidence" || state.gateRetryMode === "operational"
+				? state.gateRetryMode
+				: undefined,
 		handoffStatus: isHandoffStatus(state.handoffStatus) ? state.handoffStatus : undefined,
 		handoffWarnings: Array.isArray(state.handoffWarnings) ? state.handoffWarnings.filter((v) => typeof v === "string") : undefined,
+		handoffBlockers: Array.isArray(state.handoffBlockers)
+			? state.handoffBlockers.filter(
+					(blocker): blocker is string => typeof blocker === "string" && HANDOFF_BLOCKER_CODES[blocker] === true,
+				)
+			: undefined,
 		proposalBoundary: optionalNumber(state.proposalBoundary),
 		planDigest: typeof state.planDigest === "string" ? state.planDigest : undefined,
 		proposedPlanArtifact: typeof state.proposedPlanArtifact === "string" ? state.proposedPlanArtifact : undefined,
@@ -224,6 +279,20 @@ function normalizeState(value: LeanFlowState | undefined): LeanFlowState {
 		approvalInvalidated: state.approvalInvalidated === true,
 		approvalRepairBoundary: optionalNumber(state.approvalRepairBoundary),
 		lspProbeTarget: typeof state.lspProbeTarget === "string" ? state.lspProbeTarget : undefined,
+		gateLease: normalizeOperationLease(state.gateLease),
+		lspLease: normalizeOperationLease(state.lspLease),
+		humanRepairCycles:
+			typeof state.humanRepairCycles === "number" &&
+			Number.isFinite(state.humanRepairCycles) &&
+			state.humanRepairCycles >= 0
+				? state.humanRepairCycles
+				: 0,
+		lastGateFindings:
+			typeof state.lastGateFindings === "string"
+				? state.lastGateFindings.length <= 4_000
+					? state.lastGateFindings
+					: `${state.lastGateFindings.slice(0, 3_999)}…`
+				: undefined,
 		baselineCaptured: state.baselineCaptured === true,
 		buildMutationObserved: state.buildMutationObserved === true,
 		writtenArtifacts: Array.isArray(state.writtenArtifacts) ? state.writtenArtifacts.filter((v) => typeof v === "string") : undefined,
@@ -259,6 +328,10 @@ function normalizeStats(value: LeanFlowStats | undefined): LeanFlowStats {
 			optionalNumber(legacy?.byteReductionPercent) ?? derivePercent(legacy?.beforeBytes, legacy?.afterBytes),
 		gatePasses: numberOr(legacy?.gatePasses, 0),
 		gateVerdictFailures: numberOr(legacy?.gateVerdictFailures ?? legacy?.gateFailures, 0),
+		gateBlocked:
+			typeof legacy?.gateBlocked === "number" && Number.isFinite(legacy.gateBlocked) && legacy.gateBlocked >= 0
+				? legacy.gateBlocked
+				: 0,
 		gateErrors: numberOr(legacy?.gateErrors, 0),
 		gateReadinessBlocks: numberOr(legacy?.gateReadinessBlocks, 0),
 		repairRounds: numberOr(legacy?.repairRounds ?? legacy?.repairs, 0),
@@ -289,10 +362,62 @@ function numberOr(value: unknown, fallback: number): number {
 	return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
+
 function optionalNumber(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const HANDOFF_BLOCKER_CODES: Record<string, true> = {
+	TARGET_MISSING: true,
+	BEHAVIOR_MISSING: true,
+	ACCEPTANCE_MISSING: true,
+	VERIFICATION_MISSING: true,
+};
+
+function normalizeOperationLease(value: unknown): OperationLease | undefined {
+	if (typeof value !== "object" || value === null) return undefined;
+	const lease = value as {
+		toolCallId?: unknown;
+		kind?: unknown;
+		runId?: unknown;
+		cycle?: unknown;
+		startedAt?: unknown;
+		snapshotDigest?: unknown;
+		lspTarget?: unknown;
+	};
+	const cycle = optionalNumber(lease.cycle);
+	const startedAt = optionalNumber(lease.startedAt);
+	if (
+		(lease.kind !== "gate" && lease.kind !== "lsp") ||
+		typeof lease.toolCallId !== "string" ||
+		lease.toolCallId.length === 0 ||
+		typeof lease.runId !== "string" ||
+		!RUN_ID_PATTERN.test(lease.runId) ||
+		cycle === undefined ||
+		startedAt === undefined
+	) {
+		return undefined;
+	}
+	if (lease.kind === "gate") {
+		return {
+			toolCallId: lease.toolCallId,
+			kind: lease.kind,
+			runId: lease.runId,
+			cycle,
+			startedAt,
+			snapshotDigest: typeof lease.snapshotDigest === "string" ? lease.snapshotDigest : undefined,
+		};
+	}
+	return {
+		toolCallId: lease.toolCallId,
+		kind: lease.kind,
+		runId: lease.runId,
+		cycle,
+		startedAt,
+		lspTarget: typeof lease.lspTarget === "string" ? lease.lspTarget : undefined,
+	};
+}
 function normalizeLspProbeStatus(state: LeanFlowState): LspProbeStatus {
 	if (state.lspProbeStatus === "not_required" || state.lspProbeStatus === "pending" || state.lspProbeStatus === "completed") {
 		return state.lspProbeStatus;
@@ -301,11 +426,27 @@ function normalizeLspProbeStatus(state: LeanFlowState): LspProbeStatus {
 }
 
 function isPhase(value: unknown): value is LeanFlowPhase {
-	return value === "idle" || value === "planning" || value === "awaiting_approval" || value === "building" || value === "gating" || value === "finalizing";
+	return (
+		value === "idle" ||
+		value === "planning" ||
+		value === "awaiting_approval" ||
+		value === "building" ||
+		value === "gating" ||
+		value === "awaiting_human" ||
+		value === "finalizing"
+	);
 }
 
 function isRunMarkerStatus(value: unknown): value is RunMarkerStatus {
-	return value === "awaiting_approval" || value === "building" || value === "completed" || value === "failed" || value === "abandoned" || value === "invalidated";
+	return (
+		value === "awaiting_approval" ||
+		value === "building" ||
+		value === "paused" ||
+		value === "completed" ||
+		value === "failed" ||
+		value === "abandoned" ||
+		value === "invalidated"
+	);
 }
 
 function isHandoffStatus(value: unknown): value is HandoffStatus {

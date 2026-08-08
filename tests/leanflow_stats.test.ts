@@ -8,6 +8,7 @@ import {
 	addUsage,
 	formatStats,
 	recordContextFilter,
+	recordGateBlocked,
 	recordGateError,
 	recordGateFailure,
 	recordGatePass,
@@ -92,7 +93,7 @@ test("restore normalizes an older persisted state without new metric fields", ()
 				phase: "building",
 				scoutCalls: 1,
 
-				gateCalls: 1,
+				gateCalls: 2,
 				gateAttempt: 1,
 				stats: {
 					planning: { input: 2, output: 1, cacheRead: 0 },
@@ -116,6 +117,67 @@ test("restore normalizes an older persisted state without new metric fields", ()
 	expect(restored.stats?.removedMessages).toBe(3);
 	expect(restored.stats?.gateVerdictFailures).toBe(1);
 	expect(restored.stats?.repairRounds).toBe(1);
+	expect(restored.gateCalls).toBe(1);
+	expect(restored.gateDispatches).toBe(0);
+	expect(restored.humanRepairCycles).toBe(0);
+	expect(restored.stats?.gateBlocked).toBe(0);
+});
+
+test("restore accepts paused state and preserves only valid compact operation metadata", () => {
+	const validRunId = "11111111-1111-4111-8111-111111111111";
+	const restored = restoreState([
+		{
+			type: "custom",
+			customType: CUSTOM_TYPE,
+			data: {
+				phase: "awaiting_human",
+				scoutCalls: 0,
+				gateCalls: 2,
+				gateAttempt: 2,
+				runMarkerStatus: "paused",
+				gateRetryMode: "evidence",
+				gateDispatches: 3,
+				humanRepairCycles: 1,
+				handoffBlockers: ["TARGET_MISSING", "unstructured detail", "VERIFICATION_MISSING"],
+				lastGateFindings: "x".repeat(4_001),
+				gateLease: {
+					toolCallId: "gate-call",
+					kind: "gate",
+					runId: validRunId,
+					cycle: 2,
+					startedAt: 1,
+					snapshotDigest: "snapshot",
+				},
+				lspLease: {
+					toolCallId: "lsp-call",
+					kind: "lsp",
+					runId: "not-a-run-id",
+					cycle: Number.POSITIVE_INFINITY,
+					startedAt: 1,
+				},
+			},
+		},
+	]);
+
+	expect(restored).toMatchObject({
+		phase: "awaiting_human",
+		runMarkerStatus: "paused",
+		gateRetryMode: "evidence",
+		gateDispatches: 3,
+		humanRepairCycles: 1,
+		handoffBlockers: ["TARGET_MISSING", "VERIFICATION_MISSING"],
+		gateLease: {
+			toolCallId: "gate-call",
+			kind: "gate",
+			runId: validRunId,
+			cycle: 2,
+			startedAt: 1,
+			snapshotDigest: "snapshot",
+		},
+	});
+	expect(restored.lspLease).toBeUndefined();
+	expect(restored.lastGateFindings).toHaveLength(4_000);
+	expect(restored.lastGateFindings?.endsWith("…")).toBe(true);
 });
 
 test("restored phases restart timing observation without charging inactive time", () => {
@@ -142,17 +204,19 @@ test("finalizing usage remains attributed to gating until the terminal response 
 	expect(state.stats?.gating).toMatchObject({ input: 5, output: 2, responses: 1, elapsedMs: 20 });
 });
 
-test("Gate counters distinguish repair entry, repair success, terminal failure, error, and readiness block", () => {
+test("Gate counters distinguish repair entry, repair success, terminal failure, BLOCKED, error, and readiness block", () => {
 	const state = defaultState();
 	recordGateFailure(state, true); // first FAIL enters repair
 	recordGatePass(state, true); // repaired run passes
 	recordGateFailure(state, false); // second FAIL
+	recordGateBlocked(state); // evidence was insufficient
 	recordGateError(state, false); // tool/unparseable failure
 	recordGateReadinessBlock(state);
 	recordTerminalFailure(state);
 
 	expect(state.stats?.gatePasses).toBe(1);
 	expect(state.stats?.gateVerdictFailures).toBe(2);
+	expect(state.stats?.gateBlocked).toBe(1);
 	expect(state.stats?.gateErrors).toBe(1);
 	expect(state.stats?.gateReadinessBlocks).toBe(1);
 	expect(state.stats?.repairRounds).toBe(1);
@@ -164,6 +228,8 @@ test("flowstats labels message, byte, and token measures without conflation", ()
 	const state = defaultState();
 	state.phase = "building";
 	state.gateCalls = 1;
+	state.gateDispatches = 3;
+	state.humanRepairCycles = 2;
 	recordContextFilter(state, [{ role: "user" }, { role: "assistant" }], [{ role: "user" }]);
 	const output = formatStats(state);
 
@@ -172,6 +238,11 @@ test("flowstats labels message, byte, and token measures without conflation", ()
 	expect(output).toContain("Byte-count reduction");
 	expect(output).toContain("provider token reduction: not measured");
 	expect(output).toContain("Scout/Gate tokens: not measured");
+	expect(output).toContain("verdict attempts: 1   passes: 0   verdict failures: 0");
+	expect(output).toContain(
+		"dispatches: 3   blocked: 0   execution/unparseable errors: 0   readiness blocks: 0",
+	);
+	expect(output).toContain("human repair cycles: 2");
 });
 
 test("filtering survives an unavailable byte observation and preserves builder essentials", () => {

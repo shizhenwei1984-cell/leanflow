@@ -7,7 +7,7 @@
  */
 
 import { defaultStats } from "./state";
-import type { LeanFlowPhase, LeanFlowState, ObservablePhase, PhaseMetrics } from "./state";
+import type { LeanFlowPhase, LeanFlowState, PhaseMetrics } from "./state";
 
 /** Minimal usage shape read from message_end events. */
 export interface UsageLike {
@@ -16,7 +16,9 @@ export interface UsageLike {
 	cacheRead?: number;
 }
 
-const TRACKED_PHASES: ReadonlySet<ObservablePhase> = new Set([
+type TrackedPhase = "planning" | "awaiting_approval" | "building" | "gating" | "finalizing";
+
+const TRACKED_PHASES: ReadonlySet<TrackedPhase> = new Set([
 	"planning",
 	"awaiting_approval",
 	"building",
@@ -126,6 +128,11 @@ export function recordGateReadinessBlock(state: LeanFlowState): void {
 	(state.stats ??= defaultStats()).gateReadinessBlocks++;
 }
 
+/** Record a parsed Gate BLOCKED outcome without consuming a verdict attempt. */
+export function recordGateBlocked(state: LeanFlowState): void {
+	(state.stats ??= defaultStats()).gateBlocked++;
+}
+
 /** Record a final non-PASS Gate outcome after the retry budget is exhausted. */
 export function recordTerminalFailure(state: LeanFlowState): void {
 	(state.stats ??= defaultStats()).terminalFailures++;
@@ -148,9 +155,9 @@ export function formatStats(state: LeanFlowState): string {
 		`  total tokens:      ${total}`,
 		"",
 		"Workflow outcomes:",
-		`  attempts: ${state.gateCalls}   passes: ${stats.gatePasses}   verdict failures: ${stats.gateVerdictFailures}`,
-		`  execution/unparseable errors: ${stats.gateErrors}   readiness blocks: ${stats.gateReadinessBlocks}`,
-		`  repair rounds/successes: ${stats.repairRounds}/${stats.repairSuccesses}   terminal failures: ${stats.terminalFailures}`,
+		`  verdict attempts: ${state.gateCalls}   passes: ${stats.gatePasses}   verdict failures: ${stats.gateVerdictFailures}`,
+		`  dispatches: ${state.gateDispatches ?? 0}   blocked: ${stats.gateBlocked}   execution/unparseable errors: ${stats.gateErrors}   readiness blocks: ${stats.gateReadinessBlocks}`,
+		`  human repair cycles: ${state.humanRepairCycles ?? 0}`,
 		`  handoff: ${state.handoffStatus ?? "n/a"}   warnings: ${state.handoffWarnings?.length ?? 0}`,
 		"",
 		"Builder context filter:",
@@ -181,11 +188,11 @@ export function formatStats(state: LeanFlowState): string {
 	return lines.join("\n");
 }
 
-function isTrackedPhase(phase: LeanFlowPhase): phase is ObservablePhase {
-	return TRACKED_PHASES.has(phase as ObservablePhase);
+function isTrackedPhase(phase: LeanFlowPhase): phase is TrackedPhase {
+	return TRACKED_PHASES.has(phase as TrackedPhase);
 }
 
-function phaseMetricKey(phase: ObservablePhase): "planning" | "awaitingApproval" | "building" | "gating" {
+function phaseMetricKey(phase: TrackedPhase): "planning" | "awaitingApproval" | "building" | "gating" {
 	if (phase === "awaiting_approval") return "awaitingApproval";
 	return phase === "finalizing" ? "gating" : phase;
 }

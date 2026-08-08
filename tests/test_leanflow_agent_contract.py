@@ -47,6 +47,8 @@ class MinimalRoleContractTest(unittest.TestCase):
         self.assertIn("no shell access", body)
         self.assertIn("evidence.md", body)
         self.assertIn("never runs shell commands", body)
+        self.assertIn("BLOCKED", body)
+        self.assertIn("BLOCKED is not an implementation failure", body)
 
     def test_flow_has_only_three_agent_roles(self) -> None:
         text = (ROOT / "commands" / "flow.md").read_text(encoding="utf-8")
@@ -61,6 +63,8 @@ class MinimalRoleContractTest(unittest.TestCase):
         self.assertIn("at most **3 Scout + 2 Gate**", text)
         self.assertIn("evidence.md", text)
         self.assertIn("Gate has no shell access", text)
+        self.assertIn("/flowcontinue", text)
+        self.assertIn("/flowfinishfailed", text)
 
     def test_docs_and_skill_describe_minimal_architecture(self) -> None:
         for path in (ROOT / "skills" / "leanflow" / "SKILL.md", ROOT / "docs" / "leanflow.md"):

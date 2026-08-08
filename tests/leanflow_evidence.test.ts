@@ -103,6 +103,9 @@ test("renders deterministic complete artifacts from real git outputs", () => {
 		expect(rendered.evidence).toContain("## LSP 1: diagnostics");
 		expect(rendered.evidence).toContain("## Git 1:");
 		expect(rendered.evidence).toContain("## Validation 1:");
+		expect(rendered.build).toContain(runId);
+		expect(rendered.diff).toContain(runId);
+		expect(rendered.evidence).toContain(runId);
 
 		expect(() =>
 			renderBuildArtifacts({

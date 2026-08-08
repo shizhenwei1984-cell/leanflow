@@ -53,6 +53,7 @@ test("Gate agent owns a valid strict verdict schema", async () => {
 			],
 		}).success,
 	).toBe(true);
+	expect(validator!.validate({ verdict: "BLOCKED", findings: [] }).success).toBe(true);
 	expect(
 		validator!.validate({
 			verdict: "FAIL",

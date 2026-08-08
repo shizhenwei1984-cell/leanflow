@@ -59,6 +59,13 @@ class WorkflowPromptTest(unittest.TestCase):
         self.assertIn("NEEDS_UPDATE", handoff)
         context = (ext_dir / "context.ts").read_text(encoding="utf-8")
         self.assertIn("filterForBuilder", context)
+        self.assertIn('"awaiting_human"', state)
+        self.assertIn("restore_reconcile", index)
+        self.assertIn('registerCommand("flowcontinue"', index)
+        self.assertIn('registerCommand("flowfinishfailed"', index)
+        self.assertIn('registerCommand("flowstatus"', index)
+        gate = (ROOT / "agents" / "gate.md").read_text(encoding="utf-8")
+        self.assertIn("BLOCKED", gate)
 
     def test_plan_write_does_not_skip_approval(self) -> None:
         """Issue 1: writing the plan must move to awaiting_approval, not building."""
@@ -96,12 +103,17 @@ class WorkflowPromptTest(unittest.TestCase):
         self.assertIn("resolveRole", guard)
         self.assertIn('"lean-scout"', guard)
 
-    def test_gate_attempt_is_tracked(self) -> None:
-        """Issue 3: first vs repair gate are distinguished via gateAttempt."""
+    def test_gate_attempt_is_tracked_at_dispatch_while_verdicts_settle_later(self) -> None:
+        """Dispatch advances the round; only settled PASS/FAIL consume verdict budget."""
         state = (ROOT / "extensions" / "leanflow" / "state.ts").read_text(encoding="utf-8")
         self.assertIn("gateAttempt", state)
+        self.assertIn("gateCalls", state)
+        self.assertIn("gateDispatches", state)
         index = (ROOT / "extensions" / "leanflow" / "index.ts").read_text(encoding="utf-8")
-        self.assertIn("state.gateAttempt++", index)
+        self.assertIn("gate_dispatch", index)
+        self.assertIn("gate_settled", index)
+        self.assertIn("gate_error", index)
+        self.assertNotIn("state.gateCalls++", index)
 
     def test_context_filter_uses_native_approval_identity(self) -> None:
         """The Builder context starts only after OMP names the approved artifact."""
@@ -185,6 +197,7 @@ class WorkflowPromptTest(unittest.TestCase):
         for counter in (
             "gatePasses",
             "gateVerdictFailures",
+            "gateBlocked",
             "gateErrors",
             "gateReadinessBlocks",
             "repairRounds",
@@ -194,20 +207,20 @@ class WorkflowPromptTest(unittest.TestCase):
             self.assertIn(counter, state)
         stats = (ext_dir / "stats.ts").read_text(encoding="utf-8")
         self.assertIn("recordGateFailure", stats)
+        self.assertIn("recordGateBlocked", stats)
         self.assertIn("recordGateError", stats)
         self.assertIn("recordGateReadinessBlock", stats)
-        index = (ext_dir / "index.ts").read_text(encoding="utf-8")
-        self.assertIn("recordGateFailure(state", index)
-        self.assertIn("recordGateError(state", index)
-
-    def test_gate_shape_and_readiness_precede_attempt_increment(self) -> None:
-        """Malformed calls and missing artifacts block before an attempt is counted."""
+        machine = (ext_dir / "machine.ts").read_text(encoding="utf-8")
+        self.assertIn("recordGateFailure(state", machine)
+        self.assertIn("recordGateError(state", machine)
+    def test_gate_shape_and_readiness_precede_dispatch(self) -> None:
+        """Malformed calls and missing artifacts block before Gate dispatch."""
         index = (ROOT / "extensions" / "leanflow" / "index.ts").read_text(encoding="utf-8")
         shape = index.index("const shape = validateGateTaskCall")
         readiness = index.index("const missing = missingArtifacts(state)", shape)
-        increment = index.index("state.gateCalls++", readiness)
+        dispatch = index.index("gate_dispatch", readiness)
         self.assertLess(shape, readiness)
-        self.assertLess(readiness, increment)
+        self.assertLess(readiness, dispatch)
 
     def test_task_role_budgets_preflight_before_mutation(self) -> None:
         """Exact requested role counts are preflighted before state mutation."""
@@ -219,9 +232,9 @@ class WorkflowPromptTest(unittest.TestCase):
         index = (ROOT / "extensions" / "leanflow" / "index.ts").read_text(encoding="utf-8")
         preflight = index.index("const budget = checkAgentBudget")
         scout_increment = index.index("state.scoutCalls += scoutCount")
-        gate_increment = index.index("state.gateCalls++", scout_increment)
+        gate_dispatch = index.index("gate_dispatch")
         self.assertLess(preflight, scout_increment)
-        self.assertLess(preflight, gate_increment)
+        self.assertLess(preflight, gate_dispatch)
 
     def test_stats_keep_token_measurements_honest(self) -> None:
         """Message and byte reductions are never called provider token reductions."""

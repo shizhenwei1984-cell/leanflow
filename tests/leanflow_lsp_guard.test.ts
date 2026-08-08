@@ -5,7 +5,7 @@ import { basename, dirname, join } from "node:path";
 import { expect, test } from "bun:test";
 import { z } from "zod";
 import { canonicalGateTask } from "../extensions/leanflow/guard";
-import { assessHandoff } from "../extensions/leanflow/handoff";
+import { assessHandoff, formatHandoffNotification } from "../extensions/leanflow/handoff";
 import leanflow, { resolveRunMarkerPath } from "../extensions/leanflow/index";
 
 type TestContext = {
@@ -41,12 +41,14 @@ type PersistedState = {
 	gateAttempt: number;
 	handoffStatus?: string;
 	handoffWarnings?: string[];
+	handoffBlockers?: string[];
 	planSlug?: string;
 	planArtifact?: string;
 	proposalBoundary?: number;
 	proposedPlanArtifact?: string;
 	approvedPlanArtifact?: string;
 	runId?: string;
+	planDigest?: string;
 	runMarkerArtifact?: string;
 	lspProbeStatus: "not_required" | "pending" | "completed";
 	lspProbeTarget?: string;
@@ -65,6 +67,11 @@ type PersistedState = {
 	persistenceFailureCode?: string;
 	persistenceFailureMessage?: string;
 	writtenArtifacts?: string[];
+	gateRetryMode?: "repair" | "operational" | "evidence";
+	humanRepairCycles?: number;
+	lastGateFindings?: string;
+	gateDispatches?: number;
+	gateLease?: { toolCallId: string; snapshotDigest?: string };
 };
 
 type Harness = {
@@ -357,7 +364,17 @@ async function writeInitialPlan(
 ): Promise<void> {
 	await harness.commands.get("flow")!.handler(EXAMPLE_TASK, harness.ctx);
 	const latest = harness.states.at(-1)!;
-	const planContent = `${content}\nLeanFlow run ID: ${latest.runId}`;
+	const planContent = [
+		content,
+		"## Critical files",
+		"- extensions/leanflow/index.ts",
+		"## Acceptance",
+		"- [ ] Expected behavior must remain observable.",
+		"## Verification",
+		"`bun test tests/leanflow_lsp_guard.test.ts`",
+		"Consider edge cases.",
+		`LeanFlow run ID: ${latest.runId}`,
+	].join("\n");
 	const planArtifact = `local://${latest.planSlug}-plan.md`;
 	await harness.handlers.get("tool_call")!(
 		{
@@ -378,6 +395,21 @@ async function writeInitialPlan(
 		harness.ctx,
 	);
 	expect(harness.states.at(-1)!.phase).toBe("awaiting_approval");
+}
+
+function completeHandoffPlan(content: string): string {
+	return [
+		content,
+		"## Critical files",
+		"- extensions/leanflow/index.ts",
+		"## Acceptance",
+		"- [ ] Expected behavior must remain observable.",
+		"## Verification",
+		"```sh",
+		"bun test tests/leanflow_lsp_guard.test.ts",
+		"```",
+		"Consider edge cases.",
+	].join("\n");
 }
 
 function approvalMessagesFor(slug: string, planArtifact: string): unknown[] {
@@ -416,15 +448,121 @@ function approvalMessagesFor(slug: string, planArtifact: string): unknown[] {
 const approvalMessages = approvalMessagesFor(EXAMPLE_SLUG, EXAMPLE_PLAN_ARTIFACT);
 const legacyApprovalMessages = approvalMessagesFor(LEGACY_SLUG, LEGACY_PLAN_ARTIFACT);
 
-test("handoff ignores modification verbs embedded in LeanFlow metadata", () => {
-	const assessed = assessHandoff(
+test("handoff emits deterministic structured blockers and notifications", () => {
+	const metadataOnly = assessHandoff(
 		[
 			"Needs more detail.",
 			"LeanFlow run ID: aaaaaaaa-3add-4aaa-8aaa-aaaaaaaaaaaa",
 			"LSP applicability: required",
 		].join("\n"),
 	);
-	expect(assessed).toMatchObject({ status: "NEEDS_UPDATE" });
+	expect(metadataOnly.status).toBe("NEEDS_UPDATE");
+	expect(metadataOnly.blockers.map((blocker) => blocker.code)).toEqual([
+		"TARGET_MISSING",
+		"BEHAVIOR_MISSING",
+		"ACCEPTANCE_MISSING",
+		"VERIFICATION_MISSING",
+	]);
+
+
+	const targetNamedAdd = assessHandoff(
+		[
+			"## Critical files",
+			"- src/add.ts",
+			"## Acceptance",
+			"- [ ] Expected result must remain observable.",
+			"## Verification",
+			"```sh",
+			"bun test tests/add.test.ts",
+			"```",
+			"Consider edge cases.",
+		].join("\n"),
+	);
+	expect(targetNamedAdd).toMatchObject({
+		status: "NEEDS_UPDATE",
+		blockers: [{ code: "BEHAVIOR_MISSING" }],
+	});
+
+	const multipleTargetPathsWithoutBehavior = assessHandoff(
+		[
+			"## Critical files",
+			"- src/neutral.ts",
+			"## Implementation",
+			"- Coordinate src/neutral.ts with src/add.ts.",
+			"## Acceptance",
+			"- [ ] Expected result must remain observable.",
+			"## Verification",
+			"```sh",
+			"bun test tests/leanflow_lsp_guard.test.ts",
+			"```",
+			"Consider edge cases.",
+		].join("\n"),
+	);
+	expect(multipleTargetPathsWithoutBehavior.status).toBe("NEEDS_UPDATE");
+	expect(multipleTargetPathsWithoutBehavior.blockers.map((blocker) => blocker.code)).toEqual(["BEHAVIOR_MISSING"]);
+
+	const missingVerification = assessHandoff(
+		[
+			"## Critical files",
+			"- extensions/leanflow/handoff.ts",
+			"## Implementation",
+			"- Update the handoff assessment.",
+			"## Acceptance",
+			"- [ ] Expected result must contain a blocker code.",
+		].join("\n"),
+	);
+	expect(missingVerification).toMatchObject({
+		status: "NEEDS_UPDATE",
+		blockers: [{ code: "VERIFICATION_MISSING" }],
+	});
+	const notification = formatHandoffNotification(missingVerification);
+	expect(notification).toContain("Blockers:\n- VERIFICATION_MISSING:");
+	expect(notification.indexOf("Blockers:")).toBeLessThan(notification.indexOf("Warnings:"));
+	expect(notification).not.toContain("Proceeding to approval.");
+
+	const completePlan = [
+		"# Handoff plan",
+		"## Critical files",
+		"- extensions/leanflow/handoff.ts",
+		"## Implementation",
+		"- Update structured handoff blockers.",
+		"## Acceptance",
+		"- [ ] Expected status must be READY.",
+		"## Verification",
+		"```sh",
+		"bun test tests/leanflow_lsp_guard.test.ts",
+		"```",
+		"## Edge cases",
+		"- Handle missing sections.",
+		"- Detail 01",
+		"- Detail 02",
+		"- Detail 03",
+		"- Detail 04",
+		"- Detail 05",
+		"- Detail 06",
+		"- Detail 07",
+		"- Detail 08",
+		"- Detail 09",
+		"- Detail 10",
+		"- Detail 11",
+		"- Detail 12",
+		"- Detail 13",
+		"- Detail 14",
+		"- Detail 15",
+		"- Detail 16",
+		"- Detail 17",
+		"- Detail 18",
+		"- Detail 19",
+		"- Detail 20",
+		"- Detail 21",
+		"- Detail 22",
+		"- Detail 23",
+		"- Detail 24",
+		"- Detail 25",
+		"- Detail 26",
+		"- Detail 27",
+	].join("\n");
+	expect(assessHandoff(completePlan)).toMatchObject({ status: "READY", blockers: [], warnings: [] });
 });
 
 test("runtime Planner prompt requires Simplified Chinese while preserving technical identifiers", async () => {
@@ -469,6 +607,18 @@ test("proposal is fail-closed until the canonical plan is valid and marked", asy
 		{ toolName: "write", toolCallId: "invalid-plan", isError: false },
 		needsUpdate.ctx,
 	);
+	expect(needsUpdate.states.at(-1)!.handoffBlockers).toEqual([
+		"TARGET_MISSING",
+		"BEHAVIOR_MISSING",
+		"ACCEPTANCE_MISSING",
+		"VERIFICATION_MISSING",
+	]);
+	expect(JSON.parse(readFileSync(runMarkerPath(needsUpdate), "utf8")).handoffBlockers).toEqual([
+		"TARGET_MISSING",
+		"BEHAVIOR_MISSING",
+		"ACCEPTANCE_MISSING",
+		"VERIFICATION_MISSING",
+	]);
 	expect(needsUpdate.states.at(-1)!.phase).toBe("planning");
 	expect(
 		await needsUpdate.handlers.get("tool_call")!(
@@ -524,11 +674,13 @@ test("forty-character Chinese tasks persist a fixed-length pointer and can propo
 	const state = harness.states.at(-1)!;
 	const slug = state.planSlug!;
 	const planArtifact = `local://${slug}-plan.md`;
-	const planContent = [
-		"修改 src/example.ts 并运行验证。",
-		"LSP applicability: required",
-		`LeanFlow run ID: ${state.runId}`,
-	].join("\n");
+	const planContent = completeHandoffPlan(
+		[
+			"修改 src/example.ts 并运行验证。",
+			"LSP applicability: required",
+			`LeanFlow run ID: ${state.runId}`,
+		].join("\n"),
+	);
 	const call = harness.handlers.get("tool_call")!;
 	await call(
 		{ toolName: "write", toolCallId: "unicode-plan", input: { path: planArtifact, content: planContent } },
@@ -705,12 +857,17 @@ test("native approval requires a real write-device diagnostics result before the
 			harness.ctx,
 		),
 	).toBeUndefined();
-	expect(harness.states.at(-1)!.lspProbeStatus).toBe("pending");
+	expect(harness.states.at(-1)).toMatchObject({
+		lspProbeStatus: "pending",
+		lspLease: { toolCallId: "probe", kind: "lsp", lspTarget: "src/example.ts" },
+	});
 	await result({ toolName: "write", toolCallId: "probe", isError: true }, harness.ctx);
 	expect(harness.states.at(-1)).toMatchObject({
 		lspProbeStatus: "completed",
 		lspProbeTarget: "src/example.ts",
+		lspLease: undefined,
 	});
+
 
 	expect(
 		await call(
@@ -730,6 +887,61 @@ test("native approval requires a real write-device diagnostics result before the
 	expect(
 		await call({ toolName: "edit", toolCallId: "edit-after-baseline", input: {} }, harness.ctx),
 	).toBeUndefined();
+});
+test("session restoration clears a pending LSP lease and ignores its late result", async () => {
+	const harness = createHarness();
+	await writeInitialPlan(harness);
+	const call = harness.handlers.get("tool_call")!;
+	const result = harness.handlers.get("tool_result")!;
+	await call(
+		{ toolName: "write", toolCallId: "leased-probe-propose", input: { path: "xd://propose", content: EXAMPLE_SLUG } },
+		harness.ctx,
+	);
+	await result({ toolName: "write", toolCallId: "leased-probe-propose", isError: false }, harness.ctx);
+	harness.branch.push({ type: "mode_change", mode: "none" });
+	await harness.handlers.get("context")!({ messages: approvalMessages }, harness.ctx);
+	await call(
+		{
+			toolName: "write",
+			toolCallId: "leased-probe",
+			input: { path: "xd://lsp", content: JSON.stringify({ action: "diagnostics", file: "src/example.ts" }) },
+		},
+		harness.ctx,
+	);
+	expect(harness.states.at(-1)).toMatchObject({
+		lspProbeStatus: "pending",
+		lspLease: { toolCallId: "leased-probe", lspTarget: "src/example.ts" },
+	});
+
+	await harness.handlers.get("session_switch")!({}, harness.ctx);
+	expect(harness.states.at(-1)).toMatchObject({
+		phase: "building",
+		lspProbeStatus: "pending",
+		lspLease: undefined,
+	});
+	const stateCountAfterRestore = harness.states.length;
+
+	await result({ toolName: "write", toolCallId: "leased-probe", isError: false }, harness.ctx);
+	expect(harness.states).toHaveLength(stateCountAfterRestore);
+	expect(harness.states.at(-1)).toMatchObject({
+		lspProbeStatus: "pending",
+		lspLease: undefined,
+	});
+
+	await call(
+		{
+			toolName: "write",
+			toolCallId: "replacement-probe",
+			input: { path: "xd://lsp", content: JSON.stringify({ action: "diagnostics", file: "src/example.ts" }) },
+		},
+		harness.ctx,
+	);
+	await result({ toolName: "write", toolCallId: "replacement-probe", isError: false }, harness.ctx);
+	expect(harness.states.at(-1)).toMatchObject({
+		lspProbeStatus: "completed",
+		lspProbeTarget: "src/example.ts",
+		lspLease: undefined,
+	});
 });
 
 test("the observed xd LSP dispatch and issue report remain reachable before the baseline", async () => {
@@ -981,16 +1193,39 @@ test("accepts documented diagnostics timeout before the BUILD baseline", async (
 	});
 });
 
+test("BUILD record setup failure keeps approval out of BUILD", async () => {
+	const harness = createHarness();
+	await writeInitialPlan(harness, "Update docs only.\nLSP applicability: not_required");
+	mkdirSync(buildRecordPath(harness), { recursive: true });
+
+	const call = harness.handlers.get("tool_call")!;
+	const result = harness.handlers.get("tool_result")!;
+	await call(
+		{ toolName: "write", toolCallId: "propose-build-record-failure", input: { path: "xd://propose", content: EXAMPLE_SLUG } },
+		harness.ctx,
+	);
+	await result({ toolName: "write", toolCallId: "propose-build-record-failure", isError: false }, harness.ctx);
+	harness.branch.push({ type: "mode_change", mode: "none" });
+	const snapshotsBeforeApproval = harness.states.length;
+	await harness.handlers.get("context")!({ messages: approvalMessages }, harness.ctx);
+
+	expect(harness.states.at(-1)).toMatchObject({ phase: "awaiting_approval" });
+	expect(harness.states.slice(snapshotsBeforeApproval)).not.toContainEqual(expect.objectContaining({ phase: "building" }));
+	expect(harness.notifications.at(-1)).toContain("Cannot enter BUILD:");
+});
+
 test("fresh recovery falls back to a legacy percent-encoded pointer", async () => {
 	const harness = createHarness();
 	const slug = "审".repeat(10);
 	const runId = "4f414c4c-8f8f-4dca-8df3-9e0fabada555";
 	const planArtifact = `local://${slug}-plan.md`;
-	const planContent = [
-		"修改 src/example.ts 并运行验证。",
-		`LeanFlow run ID: ${runId}`,
-		"LSP applicability: required",
-	].join("\n");
+	const planContent = completeHandoffPlan(
+		[
+			"修改 src/example.ts 并运行验证。",
+			`LeanFlow run ID: ${runId}`,
+			"LSP applicability: required",
+		].join("\n"),
+	);
 	const artifacts = writeFreshArtifacts(harness, { planContent, pointer: "legacy", slug });
 	const hashedPath = resolveRunMarkerPath(
 		harness.ctx.localProtocolOptions,
@@ -1017,11 +1252,13 @@ test("fresh recovery repairs a marker-only run whose legacy pointer name is too 
 	const slug = "审".repeat(40);
 	const runId = "4f414c4c-8f8f-4dca-8df3-9e0fabada555";
 	const planArtifact = `local://${slug}-plan.md`;
-	const planContent = [
-		"修改 src/example.ts 并运行验证。",
-		`LeanFlow run ID: ${runId}`,
-		"LSP applicability: required",
-	].join("\n");
+	const planContent = completeHandoffPlan(
+		[
+			"修改 src/example.ts 并运行验证。",
+			`LeanFlow run ID: ${runId}`,
+			"LSP applicability: required",
+		].join("\n"),
+	);
 	writeFreshArtifacts(harness, { planContent, pointer: false, slug });
 	const legacyPath = resolveRunMarkerPath(harness.ctx.localProtocolOptions, legacyPointerArtifact(slug))!;
 	expect(Buffer.byteLength(basename(legacyPath), "utf8")).toBeGreaterThan(255);
@@ -1066,12 +1303,14 @@ test("fresh approval session recovers the native plan identity before enforcing 
 	const call = harness.handlers.get("tool_call")!;
 	const result = harness.handlers.get("tool_result")!;
 	const context = harness.handlers.get("context")!;
-	const finalPlanContent = [
-		"Update src/example.ts with the approved behavior.",
-		"Run focused tests and verify the changed source path.",
-		"LSP applicability: required",
-		`LeanFlow run ID: 4f414c4c-8f8f-4dca-8df3-9e0fabada555`,
-	].join("\n");
+	const finalPlanContent = completeHandoffPlan(
+		[
+			"Update src/example.ts with the approved behavior.",
+			"Run focused tests and verify the changed source path.",
+			"LSP applicability: required",
+			`LeanFlow run ID: 4f414c4c-8f8f-4dca-8df3-9e0fabada555`,
+		].join("\n"),
+	);
 	const marker = {
 		version: 2,
 		runId: "4f414c4c-8f8f-4dca-8df3-9e0fabada555",
@@ -1208,6 +1447,7 @@ test("successful edits refresh all repair evidence artifacts", async () => {
 	expect(harness.states.at(-1)).toMatchObject({
 		phase: "building",
 		baselineCaptured: true,
+		gateCalls: 1,
 		writtenArtifacts: [],
 	});
 	const repairRecord = JSON.parse(readFileSync(buildRecordPath(harness), "utf8"));
@@ -1275,6 +1515,7 @@ test("rejects malformed Gate calls before consuming an attempt", async () => {
 			gateCalls: 0,
 			gateAttempt: 0,
 		});
+		expect(harness.states.at(-1)!.gateDispatches ?? 0).toBe(0);
 	}
 });
 
@@ -1292,13 +1533,412 @@ test("accepts one strict Gate call with canonical artifact references", async ()
 				},
 				harness.ctx,
 			),
+
 		).toBeUndefined();
+		const artifacts = gateArtifacts();
+		const readArtifact = (artifact: string) =>
+			readFileSync(resolveRunMarkerPath(harness.ctx.localProtocolOptions, artifact)!, "utf8");
+		const expectedSnapshot = createHash("sha256")
+			.update(
+				`${harness.states.at(-1)!.planDigest}\n${readArtifact(artifacts.build)}\n${readArtifact(artifacts.diff)}\n${readArtifact(artifacts.evidence)}`,
+				"utf8",
+			)
+			.digest("hex");
 		expect(harness.states.at(-1)).toMatchObject({
 			phase: "gating",
-			gateCalls: 1,
+			gateCalls: 0,
+			gateDispatches: 1,
 			gateAttempt: 1,
+			gateLease: {
+				toolCallId: `valid-gate-${batch ? "batch" : "flat"}`,
+				snapshotDigest: expectedSnapshot,
+			},
+		});
+		await harness.handlers.get("tool_result")!(
+			{
+				toolName: "task",
+				toolCallId: `valid-gate-${batch ? "batch" : "flat"}`,
+				isError: false,
+				content: [{ type: "text", text: JSON.stringify({ verdict: "PASS", findings: [] }) }],
+			},
+			harness.ctx,
+		);
+		expect(harness.states.at(-1)).toMatchObject({
+			phase: "finalizing",
+			gateCalls: 1,
+			gateLease: undefined,
 		});
 	}
+});
+
+test("snapshot preflight blocks missing canonical artifacts without dispatching Gate", async () => {
+	const harness = createHarness();
+	await enterDocumentationBuild(harness);
+	await completeBuildEvidence(harness, "bun test snapshot-missing");
+	const evidencePath = resolveRunMarkerPath(harness.ctx.localProtocolOptions, gateArtifacts().evidence)!;
+	rmSync(evidencePath);
+
+	expect(
+		await harness.handlers.get("tool_call")!(
+			{ toolName: "task", toolCallId: "snapshot-missing-evidence", input: gateCallInput() },
+			harness.ctx,
+		),
+	).toMatchObject({
+		block: true,
+		reason: expect.stringContaining("canonical evidence artifact is missing or unreadable"),
+	});
+	expect(harness.states.at(-1)).toMatchObject({
+		phase: "building",
+		gateCalls: 0,
+		gateAttempt: 0,
+	});
+	expect(harness.states.at(-1)!.gateDispatches ?? 0).toBe(0);
+});
+
+test("snapshot preflight blocks Gate while BUILD evidence is unsettled", async () => {
+	const harness = createHarness();
+	await enterDocumentationBuild(harness);
+	await completeBuildEvidence(harness, "bun test snapshot-pending");
+	const call = harness.handlers.get("tool_call")!;
+	await call(
+		{ toolName: "lsp", toolCallId: "snapshot-pending-observation", input: { action: "hover", file: "src/example.ts" } },
+		harness.ctx,
+	);
+
+	expect(
+		await call({ toolName: "task", toolCallId: "snapshot-pending-gate", input: gateCallInput() }, harness.ctx),
+	).toMatchObject({
+		block: true,
+		reason: expect.stringContaining("BUILD evidence observation(s) are still pending"),
+	});
+	expect(harness.states.at(-1)).toMatchObject({ phase: "building", gateCalls: 0, gateAttempt: 0 });
+});
+
+test("snapshot preflight rejects a stale canonical plan without consuming Gate budget", async () => {
+	const harness = createHarness();
+	await enterDocumentationBuild(harness);
+	await completeBuildEvidence(harness, "bun test snapshot-plan");
+	const planPath = resolveRunMarkerPath(harness.ctx.localProtocolOptions, gateArtifacts().plan)!;
+	writeFileSync(planPath, `${readFileSync(planPath, "utf8")}\nstale plan`);
+
+	expect(
+		await harness.handlers.get("tool_call")!(
+			{ toolName: "task", toolCallId: "snapshot-stale-plan", input: gateCallInput() },
+			harness.ctx,
+		),
+	).toMatchObject({
+		block: true,
+		reason: expect.stringContaining("canonical plan digest does not match the approved plan"),
+	});
+	expect(harness.states.at(-1)).toMatchObject({ phase: "building", gateCalls: 0, gateAttempt: 0 });
+});
+
+test("snapshot preflight rejects a mismatched BUILD record without dispatching Gate", async () => {
+	const harness = createHarness();
+	await enterDocumentationBuild(harness);
+	await completeBuildEvidence(harness, "bun test snapshot-record");
+	const recordPath = buildRecordPath(harness);
+	const record = JSON.parse(readFileSync(recordPath, "utf8"));
+	writeFileSync(recordPath, JSON.stringify({ ...record, round: 99 }));
+
+	expect(
+		await harness.handlers.get("tool_call")!(
+			{ toolName: "task", toolCallId: "snapshot-invalid-record", input: gateCallInput() },
+			harness.ctx,
+		),
+	).toMatchObject({
+		block: true,
+		reason: expect.stringContaining("BUILD record validation failed"),
+	});
+	expect(harness.states.at(-1)).toMatchObject({ phase: "building", gateCalls: 0, gateAttempt: 0 });
+});
+
+test("repair record setup failure leaves Gate recovery in BUILD", async () => {
+	const harness = createHarness();
+	await enterDocumentationBuild(harness);
+	await completeBuildEvidence(harness, "bun test repair-record-failure");
+	const call = harness.handlers.get("tool_call")!;
+	const result = harness.handlers.get("tool_result")!;
+	await call({ toolName: "task", toolCallId: "repair-record-failure-gate", input: gateCallInput() }, harness.ctx);
+	const recordPath = buildRecordPath(harness);
+	rmSync(recordPath);
+	mkdirSync(recordPath);
+
+	await result(
+		{
+			toolName: "task",
+			toolCallId: "repair-record-failure-gate",
+			isError: false,
+			content: [{ type: "text", text: JSON.stringify({ verdict: "FAIL", findings: [{ severity: "blocking" }] }) }],
+		},
+		harness.ctx,
+	);
+
+	expect(harness.states.at(-1)).toMatchObject({ phase: "building", gateCalls: 1, writtenArtifacts: [] });
+	expect(harness.notifications.some((message) => message.includes("Cannot start repair BUILD record:"))).toBe(true);
+});
+
+test("plan drift during Gate becomes an operational recovery", async () => {
+	const harness = createHarness();
+	await enterDocumentationBuild(harness);
+	await completeBuildEvidence(harness, "bun test snapshot-plan-drift");
+	const call = harness.handlers.get("tool_call")!;
+	const result = harness.handlers.get("tool_result")!;
+	await call({ toolName: "task", toolCallId: "snapshot-plan-drift", input: gateCallInput() }, harness.ctx);
+	const planPath = resolveRunMarkerPath(harness.ctx.localProtocolOptions, gateArtifacts().plan)!;
+	writeFileSync(planPath, `${readFileSync(planPath, "utf8")}\nplan drift`);
+
+	await result(
+		{
+			toolName: "task",
+			toolCallId: "snapshot-plan-drift",
+			isError: false,
+			content: [{ type: "text", text: JSON.stringify({ verdict: "PASS", findings: [] }) }],
+		},
+		harness.ctx,
+	);
+	expect(harness.states.at(-1)).toMatchObject({
+		phase: "building",
+		gateCalls: 0,
+		gateDispatches: 1,
+		gateRetryMode: "operational",
+		stats: { gateErrors: 1 },
+	});
+	expect(harness.notifications).toContain("LeanFlow: plan drifted during Gate; retry with unchanged evidence.");
+});
+test("session restoration reconciles an interrupted Gate and ignores its late result", async () => {
+	const harness = createHarness();
+	await enterDocumentationBuild(harness);
+	await completeBuildEvidence(harness, "bun test gate-lease");
+	const call = harness.handlers.get("tool_call")!;
+	const result = harness.handlers.get("tool_result")!;
+	await call({ toolName: "task", toolCallId: "leased-gate", input: gateCallInput() }, harness.ctx);
+	expect(harness.states.at(-1)).toMatchObject({
+		phase: "gating",
+		gateCalls: 0,
+		gateLease: { toolCallId: "leased-gate", kind: "gate" },
+	});
+
+	await harness.handlers.get("session_switch")!({}, harness.ctx);
+	expect(harness.states.at(-1)).toMatchObject({
+		phase: "building",
+		gateCalls: 0,
+		gateLease: undefined,
+		gateRetryMode: "operational",
+		stats: { gateErrors: 1 },
+	});
+	const stateCountAfterRestore = harness.states.length;
+
+	await result(
+		{
+			toolName: "task",
+			toolCallId: "leased-gate",
+			isError: false,
+			content: [{ type: "text", text: JSON.stringify({ verdict: "PASS", findings: [] }) }],
+		},
+		harness.ctx,
+	);
+	expect(harness.states).toHaveLength(stateCountAfterRestore);
+	expect(harness.states.at(-1)).toMatchObject({
+		phase: "building",
+		gateCalls: 0,
+		gateLease: undefined,
+		gateRetryMode: "operational",
+		stats: { gateErrors: 1 },
+	});
+});
+
+test("findings-first nested BLOCKED Gate result returns to evidence recovery without consuming verdict budget", async () => {
+	const harness = createHarness();
+	await enterDocumentationBuild(harness);
+	await completeBuildEvidence(harness, "bun test blocked-gate");
+	const call = harness.handlers.get("tool_call")!;
+	const result = harness.handlers.get("tool_result")!;
+	await call({ toolName: "task", toolCallId: "blocked-gate", input: gateCallInput() }, harness.ctx);
+	await result(
+		{
+			toolName: "task",
+			toolCallId: "blocked-gate",
+			isError: false,
+			content: [
+				{
+					type: "text",
+					text: '{"findings":[{"category":"evidence","severity":"blocking"}],"verdict":"BLOCKED"}',
+				},
+			],
+		},
+		harness.ctx,
+	);
+	expect(harness.states.at(-1)).toMatchObject({
+		phase: "building",
+		gateCalls: 0,
+		gateDispatches: 1,
+		gateLease: undefined,
+		gateRetryMode: "evidence",
+		writtenArtifacts: [],
+		stats: { gateBlocked: 1, gateErrors: 0 },
+	});
+	expect(
+		await call({ toolName: "edit", toolCallId: "blocked-evidence-source-edit", input: { path: "src/example.ts" } }, harness.ctx),
+	).toMatchObject({ block: true });
+	expect(
+		await call(
+			{
+				toolName: "write",
+				toolCallId: "blocked-evidence-source-write",
+				input: { path: "src/example.ts", content: "export {};\n" },
+			},
+			harness.ctx,
+		),
+	).toMatchObject({ block: true });
+	await recordSuccessfulValidation(harness, "bun test tests/leanflow_lsp_guard.test.ts");
+	const finalized = await executeRegisteredTool(harness, "leanflow_finalize_artifacts", {
+		validationCommands: ["bun test tests/leanflow_lsp_guard.test.ts"],
+	});
+	expect(finalized.isError).not.toBe(true);
+
+	const allowedEvidenceValidationCommands = [
+		"bun test",
+		"bun test tests/leanflow_lsp_guard.test.ts",
+		"bun test tests/*.test.ts",
+		"bunx tsc --noEmit",
+		"python3 -m unittest discover -s tests -p 'test_*.py' -v",
+		'python -m unittest discover -s tests -p "test_*.py" -v',
+		"git diff --check",
+		"bun build extensions/leanflow/index.ts --target bun --outfile /tmp/leanflow-bundle.js",
+	];
+	for (const [index, command] of allowedEvidenceValidationCommands.entries()) {
+		// This calls only the guard. A successful result is deliberately not
+		// fabricated: the allowlist decision must happen before Bash executes.
+		expect(
+			await call(
+				{ toolName: "bash", toolCallId: `allowed-evidence-validation-${index}`, input: { command } },
+				harness.ctx,
+			),
+		).toBeUndefined();
+	}
+
+	const rejectedEvidenceValidationCommands = [
+		"bun test --watch",
+		"bun test tests/../src/example.test.ts",
+		"bunx tsc --noEmit --pretty false",
+		"python3 -m unittest discover -s tests -p 'test_*.py' -v --failfast",
+		"git diff --check --output=src/example.ts",
+		"git diff --check --output src/example.ts",
+		"git diff --check --stat",
+		"bun build extensions/leanflow/index.ts --target bun --outfile src/example.js",
+		"bun build extensions/leanflow/index.ts --target bun --outdir /tmp/leanflow-build",
+		"bun build extensions/leanflow/index.ts --target bun --outfile=/tmp/leanflow-bundle.js",
+		"git diff --check && printf 'export {};' > src/example.ts",
+	];
+	for (const [index, command] of rejectedEvidenceValidationCommands.entries()) {
+		const stateCountBefore = harness.states.length;
+		const stateBefore = JSON.stringify(harness.states.at(-1));
+		expect(
+			await call(
+				{ toolName: "bash", toolCallId: `blocked-evidence-validation-${index}`, input: { command } },
+				harness.ctx,
+			),
+		).toMatchObject({
+			block: true,
+			reason: expect.stringContaining("Gate evidence recovery must reuse the implementation unchanged"),
+		});
+		expect(harness.states).toHaveLength(stateCountBefore);
+		expect(JSON.stringify(harness.states.at(-1))).toBe(stateBefore);
+	}
+});
+
+test("evidence recovery accepts only command-only Bash validations while Gate is in flight", async () => {
+	const harness = createHarness();
+	await enterDocumentationBuild(harness);
+	await completeBuildEvidence(harness, "bun test evidence-retry-gate");
+	const call = harness.handlers.get("tool_call")!;
+	const result = harness.handlers.get("tool_result")!;
+
+	await call({ toolName: "task", toolCallId: "evidence-retry-blocked-gate", input: gateCallInput() }, harness.ctx);
+	await result(
+		{
+			toolName: "task",
+			toolCallId: "evidence-retry-blocked-gate",
+			isError: false,
+			content: [{ type: "text", text: '{"verdict":"BLOCKED","findings":[]}' }],
+		},
+		harness.ctx,
+	);
+	expect(harness.states.at(-1)).toMatchObject({ phase: "building", gateRetryMode: "evidence" });
+
+	await recordSuccessfulValidation(harness, "git diff --check");
+	const recordWithPlainValidation = JSON.parse(readFileSync(buildRecordPath(harness), "utf8"));
+	expect(recordWithPlainValidation.observations).toContainEqual(
+		expect.objectContaining({ toolName: "bash", command: "git diff --check" }),
+	);
+	const finalized = await executeRegisteredTool(harness, "leanflow_finalize_artifacts", {
+		validationCommands: ["git diff --check"],
+	});
+	expect(finalized.isError).not.toBe(true);
+
+	expect(
+		await call({ toolName: "task", toolCallId: "evidence-retry-inflight-gate", input: gateCallInput() }, harness.ctx),
+	).toBeUndefined();
+	expect(harness.states.at(-1)).toMatchObject({ phase: "gating", gateRetryMode: "evidence" });
+	const stateCountBeforeDeniedCalls = harness.states.length;
+	const stateBeforeDeniedCalls = JSON.stringify(harness.states.at(-1));
+	const recordBeforeDeniedCalls = readFileSync(buildRecordPath(harness), "utf8");
+	const deniedInputs: Array<[string, Record<string, unknown>]> = [
+		["mutating command", { command: "git diff --check && touch src/example.ts" }],
+		["PATH environment", { command: "git diff --check", env: { PATH: "/tmp/attacker" } }],
+		["working directory", { command: "git diff --check", cwd: "/tmp" }],
+		["timeout", { command: "git diff --check", timeout: 1 }],
+		["unknown option", { command: "git diff --check", unexpected: "value" }],
+		["PTY", { command: "git diff --check", pty: true }],
+		["async execution", { command: "git diff --check", async: true }],
+	];
+	for (const [name, input] of deniedInputs) {
+		expect(
+			await call(
+				{ toolName: "bash", toolCallId: `blocked-evidence-gating-${name}`, input },
+				harness.ctx,
+			),
+		).toMatchObject({
+			block: true,
+			reason: expect.stringContaining("Gate evidence recovery must reuse the implementation unchanged"),
+		});
+		expect(harness.states).toHaveLength(stateCountBeforeDeniedCalls);
+		expect(JSON.stringify(harness.states.at(-1))).toBe(stateBeforeDeniedCalls);
+		expect(readFileSync(buildRecordPath(harness), "utf8")).toBe(recordBeforeDeniedCalls);
+	}
+});
+
+test("findings-first nested FAIL Gate result settles as a verdict failure", async () => {
+	const harness = createHarness();
+	await enterDocumentationBuild(harness);
+	await completeBuildEvidence(harness, "bun test findings-first-fail");
+	const call = harness.handlers.get("tool_call")!;
+	const result = harness.handlers.get("tool_result")!;
+	await call({ toolName: "task", toolCallId: "findings-first-fail", input: gateCallInput() }, harness.ctx);
+	await result(
+		{
+			toolName: "task",
+			toolCallId: "findings-first-fail",
+			isError: false,
+			content: [
+				{
+					type: "text",
+					text: '{"findings":[{"category":"correctness","severity":"blocking"}],"verdict":"FAIL"}',
+				},
+			],
+		},
+		harness.ctx,
+	);
+	expect(harness.states.at(-1)).toMatchObject({
+		phase: "building",
+		gateCalls: 1,
+		gateRetryMode: "repair",
+		gateLease: undefined,
+		lastGateFindings: '{"findings":[{"category":"correctness","severity":"blocking"}],"verdict":"FAIL"}',
+		writtenArtifacts: [],
+		stats: { gateErrors: 0, gateVerdictFailures: 1 },
+	});
 });
 
 test("BUILD sequence reaches batch Gate through generated artifacts", async () => {
@@ -1373,7 +2013,13 @@ test("BUILD sequence reaches batch Gate through generated artifacts", async () =
 	expect(
 		await call({ toolName: "task", toolCallId: "smoke-batch-gate", input: gateCallInput() }, harness.ctx),
 	).toBeUndefined();
-	expect(harness.states.at(-1)).toMatchObject({ phase: "gating", gateCalls: 1, gateAttempt: 1 });
+	expect(harness.states.at(-1)).toMatchObject({
+		phase: "gating",
+		gateCalls: 0,
+		gateDispatches: 1,
+		gateAttempt: 1,
+		gateLease: { toolCallId: "smoke-batch-gate" },
+	});
 });
 
 test("records only allowed bash and LSP results and clears skipped pending calls", async () => {
@@ -1601,6 +2247,65 @@ test("NEEDS_UPDATE invalidates the prior active marker", async () => {
 	expect(marker.status).toBe("invalidated");
 });
 
+test("flowstatus is read-only in every phase and reports cheap Gate readiness", async () => {
+	const harness = createHarness();
+	const idleSnapshots = harness.states.length;
+
+	await harness.commands.get("flowstatus")!.handler("", harness.ctx);
+
+	expect(harness.states).toHaveLength(idleSnapshots);
+	expect(harness.notifications.at(-1)).toBe(
+		[
+			"LeanFlow status:",
+			"- Phase: idle",
+			"- Run ID: unavailable",
+			"- Plan digest: unavailable",
+			"- Repair round: 0",
+			"- Gate verdicts: 0/2",
+			"- Gate dispatches: 0",
+			"- Gate blocked: 0",
+			"- Pending evidence observations: 0",
+			"- Baseline captured: no",
+			"- Written artifacts: 0/3 (none / build, diff, evidence)",
+			"- LSP probe: pending",
+			"- Human repair cycles: 0",
+			"- Gate readiness: BLOCKED: missing artifact marks: build.md, diff.md, evidence.md",
+		].join("\n"),
+	);
+
+	await enterDocumentationBuild(harness);
+	await completeBuildEvidence(harness);
+	const state = harness.states.at(-1)!;
+	const evidencePath = resolveRunMarkerPath(
+		harness.ctx.localProtocolOptions,
+		`local://${state.planSlug}-evidence.md`,
+	)!;
+	rmSync(evidencePath);
+	const buildingSnapshots = harness.states.length;
+
+	await harness.commands.get("flowstatus")!.handler("", harness.ctx);
+
+	expect(harness.states).toHaveLength(buildingSnapshots);
+	expect(harness.notifications.at(-1)).toBe(
+		[
+			"LeanFlow status:",
+			"- Phase: building",
+			`- Run ID: ${state.runId}`,
+			`- Plan digest: ${state.planDigest!.slice(0, 12)}`,
+			"- Repair round: 0",
+			"- Gate verdicts: 0/2",
+			"- Gate dispatches: 0",
+			"- Gate blocked: 0",
+			"- Pending evidence observations: 0",
+			"- Baseline captured: yes",
+			"- Written artifacts: 3/3 (build, diff, evidence / build, diff, evidence)",
+			"- LSP probe: not_required",
+			"- Human repair cycles: 0",
+			"- Gate readiness: READY",
+		].join("\n"),
+	);
+});
+
 test("flowcancel abandons an active recovery marker", async () => {
 	const harness = createHarness();
 	await writeInitialPlan(harness);
@@ -1658,6 +2363,53 @@ test("flowcancel abandons an active recovery marker", async () => {
 		buildMutationObserved: false,
 	});
 });
+test("flowcancel clears persisted lease and Gate recovery state", async () => {
+	const harness = createHarness();
+	await enterDocumentationBuild(harness);
+	const activeState = harness.states.at(-1)!;
+	const now = Date.now();
+	harness.branch.push({
+		type: "custom",
+		customType: "leanflow-state",
+		data: {
+			...activeState,
+			phase: "building",
+			lspProbeStatus: "completed",
+			gateLease: {
+				toolCallId: "cancel-gate",
+				kind: "gate",
+				runId: activeState.runId!,
+				cycle: 3,
+				startedAt: now,
+				snapshotDigest: "snapshot",
+			},
+			lspLease: {
+				toolCallId: "cancel-lsp",
+				kind: "lsp",
+				runId: activeState.runId!,
+				cycle: 0,
+				startedAt: now,
+				lspTarget: "src/example.ts",
+			},
+			gateDispatches: 3,
+			humanRepairCycles: 2,
+			lastGateFindings: '{"findings":["must clear"]}',
+		},
+	});
+	await harness.handlers.get("session_switch")!({}, harness.ctx);
+
+	await harness.commands.get("flowcancel")!.handler("", harness.ctx);
+	const cancelled = harness.states.at(-1)! as unknown as Record<string, unknown>;
+	for (const field of [
+		"gateLease",
+		"lspLease",
+		"gateDispatches",
+		"humanRepairCycles",
+		"lastGateFindings",
+	]) {
+		expect(cancelled[field]).toBeUndefined();
+	}
+});
 
 test("marker storage uses the session-scoped fallback local root", async () => {
 	const harness = createHarness();
@@ -1698,6 +2450,8 @@ test("Gate operational errors preserve evidence and do not enter repair", async 
 	await result({ toolName: "task", toolCallId: "gate-error", isError: true, content: [] }, harness.ctx);
 	expect(harness.states.at(-1)).toMatchObject({
 		phase: "building",
+		gateCalls: 0,
+		gateRetryMode: "operational",
 		writtenArtifacts: ["build", "diff", "evidence"],
 		stats: { gateErrors: 1, repairRounds: 0 },
 	});
@@ -1721,6 +2475,27 @@ test("Gate operational errors preserve evidence and do not enter repair", async 
 		harness.ctx,
 	);
 	expect(harness.states.at(-1)!.stats).toMatchObject({ repairRounds: 0, repairSuccesses: 0 });
+});
+
+test("four consecutive Gate operational errors pause instead of looping indefinitely", async () => {
+	const harness = createHarness();
+	await enterDocumentationBuild(harness);
+	await completeBuildEvidence(harness, "bun test operational-cap");
+	const call = harness.handlers.get("tool_call")!;
+	const result = harness.handlers.get("tool_result")!;
+
+	for (const attempt of [1, 2, 3, 4]) {
+		await call({ toolName: "task", toolCallId: `operational-cap-${attempt}`, input: gateCallInput() }, harness.ctx);
+		await result({ toolName: "task", toolCallId: `operational-cap-${attempt}`, isError: true, content: [] }, harness.ctx);
+	}
+
+	expect(harness.states.at(-1)).toMatchObject({
+		phase: "awaiting_human",
+		gateCalls: 0,
+		gateRetryMode: "operational",
+		stats: { gateErrors: 4 },
+	});
+	expect(JSON.parse(readFileSync(runMarkerPath(harness), "utf8")).status).toBe("paused");
 });
 
 test("Gate PASS completes marker and preserves filtering through final agent end", async () => {
@@ -1875,7 +2650,7 @@ test("terminal PASS remains authoritative when marker persistence fails", async 
 		{ toolName: "task", toolCallId: "gate-marker-failure", input: gateCallInput() },
 		harness.ctx,
 	);
-	harness.ctx.localProtocolOptions = { getArtifactsDir: () => "/dev/null" };
+	chmodSync(dirname(runMarkerPath(harness)), 0o500);
 	await result(
 		{
 			toolName: "task",
@@ -1890,7 +2665,7 @@ test("terminal PASS remains authoritative when marker persistence fails", async 
 	expect(JSON.stringify(finalContext)).toContain("Gate passed");
 });
 
-test("second Gate FAIL marks the run failed before final response", async () => {
+test("second Gate FAIL pauses the run and flowcontinue starts a human repair cycle", async () => {
 	const harness = createHarness();
 	await writeInitialPlan(harness, "Update docs only.\nLSP applicability: not_required");
 	const call = harness.handlers.get("tool_call")!;
@@ -1916,9 +2691,108 @@ test("second Gate FAIL marks the run failed before final response", async () => 
 		);
 		if (attempt === 1) await completeBuildEvidence(harness, "bun test fail-2");
 	}
-	expect(harness.states.at(-1)!.phase).toBe("finalizing");
+	expect(harness.states.at(-1)).toMatchObject({
+		phase: "awaiting_human",
+		gateCalls: 2,
+		lastGateFindings: JSON.stringify({ verdict: "FAIL", findings: [{ severity: "blocking" }] }),
+	});
+	expect(harness.states.at(-1)!.terminalOutcome).toBeUndefined();
 	const marker = JSON.parse(readFileSync(runMarkerPath(harness), "utf8"));
-	expect(marker.status).toBe("failed");
+	expect(marker.status).toBe("paused");
+
+	expect(
+		await call({ toolName: "edit", toolCallId: "paused-edit", input: { path: "src/example.ts" } }, harness.ctx),
+	).toMatchObject({ block: true, reason: expect.stringContaining("paused") });
+	expect(
+		await call(
+			{ toolName: "write", toolCallId: "paused-local-write", input: { path: "local://paused-note.md", content: "note" } },
+			harness.ctx,
+		),
+	).toMatchObject({ block: true, reason: expect.stringContaining("read-only") });
+	expect(
+		await call(
+			{
+				toolName: "write",
+				toolCallId: "paused-finalize",
+				input: {
+					path: "xd://leanflow_finalize_artifacts",
+					content: JSON.stringify({ validationCommands: ["bun test tests/leanflow_lsp_guard.test.ts"] }),
+				},
+			},
+			harness.ctx,
+		),
+	).toMatchObject({ block: true, reason: expect.stringContaining("read-only") });
+	expect(
+		await call({ toolName: "task", toolCallId: "paused-gate", input: gateCallInput() }, harness.ctx),
+	).toMatchObject({ block: true, reason: expect.stringContaining("no subagents") });
+	expect(
+		await call({ toolName: "read", toolCallId: "paused-read", input: { path: "src/example.ts" } }, harness.ctx),
+	).toBeUndefined();
+	const repairRecordPath = buildRecordPath(harness);
+	const repairRecord = readFileSync(repairRecordPath, "utf8");
+	rmSync(repairRecordPath);
+	mkdirSync(repairRecordPath);
+	await harness.commands.get("flowcontinue")!.handler("repair the blocking finding", harness.ctx);
+	expect(harness.states.at(-1)).toMatchObject({ phase: "awaiting_human", gateCalls: 2 });
+	expect(harness.notifications.at(-1)).toContain("Cannot continue:");
+	rmSync(repairRecordPath, { recursive: true });
+	writeFileSync(repairRecordPath, repairRecord);
+
+
+	await harness.commands.get("flowcontinue")!.handler("repair the blocking finding", harness.ctx);
+	expect(harness.states.at(-1)).toMatchObject({
+		phase: "building",
+		gateCalls: 0,
+		gateRetryMode: "repair",
+		humanRepairCycles: 1,
+		writtenArtifacts: [],
+	});
+	expect(JSON.parse(readFileSync(buildRecordPath(harness), "utf8"))).toMatchObject({ round: 3 });
+	expect(JSON.parse(readFileSync(runMarkerPath(harness), "utf8")).status).toBe("building");
+	expect(harness.editorTexts.at(-1)).toContain("repair the blocking finding");
+	expect(harness.editorTexts.at(-1)).toContain("Gate FAIL");
+
+	await harness.commands.get("flowcontinue")!.handler("", harness.ctx);
+	expect(harness.notifications.at(-1)).toBe("LeanFlow: No paused Gate failure to continue.");
+});
+
+test("flowfinishfailed explicitly finalizes a paused Gate failure", async () => {
+	const harness = createHarness();
+	await writeInitialPlan(harness, "Update docs only.\nLSP applicability: not_required");
+	const call = harness.handlers.get("tool_call")!;
+	const result = harness.handlers.get("tool_result")!;
+	await call(
+		{ toolName: "write", toolCallId: "propose-finish-failed", input: { path: "xd://propose", content: EXAMPLE_SLUG } },
+		harness.ctx,
+	);
+	await result({ toolName: "write", toolCallId: "propose-finish-failed", isError: false }, harness.ctx);
+	harness.branch.push({ type: "mode_change", mode: "none" });
+	await harness.handlers.get("context")!({ messages: approvalMessages }, harness.ctx);
+	await completeBuildEvidence(harness, "bun test finish-failed-1");
+	for (const attempt of [1, 2]) {
+		await call({ toolName: "task", toolCallId: `finish-failed-gate-${attempt}`, input: gateCallInput() }, harness.ctx);
+		await result(
+			{
+				toolName: "task",
+				toolCallId: `finish-failed-gate-${attempt}`,
+				isError: false,
+				content: [{ type: "text", text: JSON.stringify({ verdict: "FAIL", findings: [{ severity: "blocking" }] }) }],
+			},
+			harness.ctx,
+		);
+		if (attempt === 1) await completeBuildEvidence(harness, "bun test finish-failed-2");
+	}
+
+	await harness.commands.get("flowfinishfailed")!.handler("", harness.ctx);
+	expect(harness.states.at(-1)).toMatchObject({
+		phase: "finalizing",
+		terminalOutcome: "fail_after_retry",
+	});
+	expect(JSON.parse(readFileSync(runMarkerPath(harness), "utf8")).status).toBe("failed");
+	expect(harness.notifications.at(-1)).toBe("LeanFlow: Marked run as failed; finalizing.");
+
+	await harness.commands.get("flowfinishfailed")!.handler("", harness.ctx);
+	expect(harness.notifications.at(-1)).toBe("LeanFlow: No paused Gate failure to mark as failed.");
 });
 
 test("canonical plan edits are reread and reassessed from actual content", async () => {
@@ -1929,12 +2803,14 @@ test("canonical plan edits are reread and reassessed from actual content", async
 	const runId = harness.states.at(-1)!.runId;
 	const planPath = resolveRunMarkerPath(harness.ctx.localProtocolOptions, EXAMPLE_PLAN_ARTIFACT)!;
 
-	const requiredContent = [
-		"Update src/example.ts and verify the requested behavior.",
-		"Run focused tests for the changed source.",
-		"LSP applicability: required",
-		`LeanFlow run ID: ${runId}`,
-	].join("\n");
+	const requiredContent = completeHandoffPlan(
+		[
+			"Update src/example.ts and verify the requested behavior.",
+			"Run focused tests for the changed source.",
+			"LSP applicability: required",
+			`LeanFlow run ID: ${runId}`,
+		].join("\n"),
+	);
 	expect(
 		await call(
 			{ toolName: "edit", toolCallId: "plan-required", input: { path: EXAMPLE_PLAN_ARTIFACT } },
@@ -1961,12 +2837,14 @@ test("canonical plan edits are reread and reassessed from actual content", async
 		),
 	).toMatchObject({ block: true, reason: expect.stringContaining("native plan approval") });
 
-	const docsContent = [
-		"Update documentation only and verify the rendered text.",
-		"No source paths are changed by this plan.",
-		"LSP applicability: not_required",
-		`LeanFlow run ID: ${runId}`,
-	].join("\n");
+	const docsContent = completeHandoffPlan(
+		[
+			"Update documentation only and verify the rendered text.",
+			"No source paths are changed by this plan.",
+			"LSP applicability: not_required",
+			`LeanFlow run ID: ${runId}`,
+		].join("\n"),
+	);
 	await call({ toolName: "edit", toolCallId: "plan-docs", input: { path: EXAMPLE_PLAN_ARTIFACT } }, harness.ctx);
 	writeFileSync(planPath, docsContent);
 	await result({ toolName: "edit", toolCallId: "plan-docs", isError: false }, harness.ctx);
@@ -1991,12 +2869,14 @@ test("native approval rereads overlay-modified plan content before BUILD", async
 	);
 	await validResult({ toolName: "write", toolCallId: "overlay-propose", isError: false }, valid.ctx);
 	valid.branch.push({ type: "mode_change", mode: "none" });
-	const finalContent = [
-		"Update src/example.ts after plan review and verify behavior.",
-		"Run focused source tests.",
-		"LSP applicability: required",
-		`LeanFlow run ID: ${valid.states.at(-1)!.runId}`,
-	].join("\n");
+	const finalContent = completeHandoffPlan(
+		[
+			"Update src/example.ts after plan review and verify behavior.",
+			"Run focused source tests.",
+			"LSP applicability: required",
+			`LeanFlow run ID: ${valid.states.at(-1)!.runId}`,
+		].join("\n"),
+	);
 	writeFileSync(resolveRunMarkerPath(valid.ctx.localProtocolOptions, EXAMPLE_PLAN_ARTIFACT)!, finalContent);
 	await valid.handlers.get("context")!({ messages: approvalMessages }, valid.ctx);
 	expect(valid.states.at(-1)).toMatchObject({
@@ -2042,12 +2922,14 @@ test("native approval rereads overlay-modified plan content before BUILD", async
 	).toMatchObject({ block: true, reason: expect.stringContaining("before native plan approval") });
 	expect(invalid.states.at(-1)).toMatchObject({ phase: "planning", approvalInvalidated: true });
 	expect(invalid.editorTexts.at(-1)).toContain("/plan Repair the existing LeanFlow plan");
-	const repairedContent = [
-		"Update documentation only after repairing the reviewed plan.",
-		"Verify the rendered text and final diff.",
-		"LSP applicability: not_required",
-		`LeanFlow run ID: ${invalid.states.at(-1)!.runId}`,
-	].join("\n");
+	const repairedContent = completeHandoffPlan(
+		[
+			"Update documentation only after repairing the reviewed plan.",
+			"Verify the rendered text and final diff.",
+			"LSP applicability: not_required",
+			`LeanFlow run ID: ${invalid.states.at(-1)!.runId}`,
+		].join("\n"),
+	);
 	expect(
 		await invalidCall(
 			{ toolName: "edit", toolCallId: "repair-invalid-plan", input: { path: EXAMPLE_PLAN_ARTIFACT } },
@@ -2190,11 +3072,13 @@ test("agent end clears and refreshes an interrupted canonical plan mutation", as
 	await harness.handlers.get("agent_end")!({}, harness.ctx);
 	expect(harness.states.at(-1)).toMatchObject({ phase: "planning", handoffStatus: "NEEDS_UPDATE" });
 
-	const repairedContent = [
-		"Update src/example.ts with the requested behavior and run focused tests.",
-		`LeanFlow run ID: ${runId}`,
-		"LSP applicability: required",
-	].join("\n");
+	const repairedContent = completeHandoffPlan(
+		[
+			"Update src/example.ts with the requested behavior and run focused tests.",
+			`LeanFlow run ID: ${runId}`,
+			"LSP applicability: required",
+		].join("\n"),
+	);
 	expect(
 		await call(
 			{
@@ -2490,11 +3374,13 @@ test("pointer persistence failures report the stage, path, and filesystem code",
 	const harness = createHarness();
 	await harness.commands.get("flow")!.handler(EXAMPLE_TASK, harness.ctx);
 	const initial = harness.states.at(-1)!;
-	const planContent = [
-		"Update src/example.ts and run focused tests.",
-		`LeanFlow run ID: ${initial.runId}`,
-		"LSP applicability: required",
-	].join("\n");
+	const planContent = completeHandoffPlan(
+		[
+			"Update src/example.ts and run focused tests.",
+			`LeanFlow run ID: ${initial.runId}`,
+			"LSP applicability: required",
+		].join("\n"),
+	);
 	const call = harness.handlers.get("tool_call")!;
 	await call(
 		{
@@ -2532,14 +3418,16 @@ test("pointer persistence failures report the stage, path, and filesystem code",
 	expect(marker.status).toBe("awaiting_approval");
 });
 
-test("marker durability is required before proposal but best-effort after approval", async () => {
+test("marker durability is required before proposal and BUILD setup failures keep approval pending", async () => {
 	const preProposal = createHarness();
 	await preProposal.commands.get("flow")!.handler("example", preProposal.ctx);
-	const planContent = [
-		"Update src/example.ts and run focused tests.",
-		`LeanFlow run ID: ${preProposal.states.at(-1)!.runId}`,
-		"LSP applicability: required",
-	].join("\n");
+	const planContent = completeHandoffPlan(
+		[
+			"Update src/example.ts and run focused tests.",
+			`LeanFlow run ID: ${preProposal.states.at(-1)!.runId}`,
+			"LSP applicability: required",
+		].join("\n"),
+	);
 	const planPath = resolveRunMarkerPath(preProposal.ctx.localProtocolOptions, EXAMPLE_PLAN_ARTIFACT)!;
 	writeFileSync(planPath, planContent);
 	const stateRoot = resolveRunMarkerPath(preProposal.ctx.localProtocolOptions, "local://.leanflow")!;
@@ -2567,16 +3455,19 @@ test("marker durability is required before proposal but best-effort after approv
 	writeFileSync(approvedStateRoot, "blocks marker updates");
 	approved.branch.push({ type: "mode_change", mode: "none" });
 	await approved.handlers.get("context")!({ messages: approvalMessages }, approved.ctx);
-	expect(approved.states.at(-1)).toMatchObject({ phase: "building", persistenceDegraded: true });
+	expect(approved.states.at(-1)).toMatchObject({ phase: "awaiting_approval", persistenceDegraded: true });
+	expect(approved.notifications.at(-1)).toContain("Cannot enter BUILD:");
 
 	const fresh = createHarness();
 	const freshRunId = "4f414c4c-8f8f-4dca-8df3-9e0fabada555";
 	const freshArtifacts = writeFreshArtifacts(fresh, {
-		planContent: [
-			"Update src/example.ts and run focused tests.",
-			`LeanFlow run ID: ${freshRunId}`,
-			"LSP applicability: required",
-		].join("\n"),
+		planContent: completeHandoffPlan(
+			[
+				"Update src/example.ts and run focused tests.",
+				`LeanFlow run ID: ${freshRunId}`,
+				"LSP applicability: required",
+			].join("\n"),
+		),
 	});
 	const markerDirectory = dirname(freshArtifacts.markerPath);
 	const pointerDirectory = dirname(freshArtifacts.pointerPath);
@@ -2584,7 +3475,8 @@ test("marker durability is required before proposal but best-effort after approv
 	chmodSync(pointerDirectory, 0o555);
 	try {
 		await fresh.handlers.get("context")!({ messages: legacyApprovalMessages }, fresh.ctx);
-		expect(fresh.states.at(-1)).toMatchObject({ phase: "building", persistenceDegraded: true });
+		expect(fresh.states.at(-1)).toMatchObject({ phase: "awaiting_approval", persistenceDegraded: true });
+		expect(fresh.notifications.at(-1)).toContain("Cannot enter BUILD:");
 	} finally {
 		chmodSync(pointerDirectory, 0o755);
 		chmodSync(markerDirectory, 0o755);
