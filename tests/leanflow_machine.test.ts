@@ -95,12 +95,27 @@ test("first FAIL starts a repair round with artifacts cleared before initializat
 	});
 	expect(state.stats).toMatchObject({ gateVerdictFailures: 1, repairRounds: 1 });
 	expect(state.consecutiveGateErrors).toBe(0);
-	expect(effects.map((effect) => effect.kind)).toEqual(["clear_artifacts", "begin_repair_round", "notify"]);
+	expect(effects.map((effect) => effect.kind)).toEqual(["clear_artifacts", "notify", "begin_repair_round"]);
 	expect(checkInvariants(state)).toEqual([]);
 	const ready = reduceGate(state, { type: "repair_round_ready", round: 2, baselineCaptured: true });
 	expect(state.phase).toBe("building");
 	expect(state.baselineCaptured).toBe(true);
 	expect(ready.effects.map((e) => e.kind)).toEqual(["write_marker", "notify"]);
+	expect(ready.effects[1]).toEqual({
+		kind: "notify",
+		level: "info",
+		message: "Repair round 2 ready; rebuild and re-gate.",
+	});
+	const human = buildingState();
+	human.phase = "awaiting_human";
+	human.gateAttempt = 1;
+	reduceGate(human, { type: "human_continue", now: 10 });
+	const humanReady = reduceGate(human, { type: "repair_round_ready", round: 2, baselineCaptured: false });
+	expect(humanReady.effects[1]).toEqual({
+		kind: "notify",
+		level: "info",
+		message: "Human repair cycle started; rebuild and re-gate.",
+	});
 	const failed = dispatch();
 	reduceGate(failed, { type: "gate_settled", outcome: "FAIL" });
 	const failEffects = reduceGate(failed, { type: "repair_round_failed", reason: "disk full" });

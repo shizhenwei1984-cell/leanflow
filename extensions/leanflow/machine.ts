@@ -175,8 +175,8 @@ function reduceGateSettlement(
 				return {
 					effects: [
 						{ kind: "clear_artifacts" },
-						{ kind: "begin_repair_round" },
 						{ kind: "notify", level: "warning", message: "Gate failed; beginning the repair round." },
+						{ kind: "begin_repair_round" },
 					],
 				};
 			}
@@ -280,6 +280,7 @@ function reduceRepairRoundReady(
 			],
 		};
 	}
+	const reason = state.repairLease?.reason;
 	state.gateAttempt = event.round - 1;
 	if (state.gateAttempt < 0) state.gateAttempt = 0;
 	state.gateRetryMode = "repair";
@@ -289,7 +290,14 @@ function reduceRepairRoundReady(
 	return {
 		effects: [
 			{ kind: "write_marker", status: "building" },
-			{ kind: "notify", level: "info", message: "Human repair cycle started; rebuild and re-gate." },
+			{
+				kind: "notify",
+				level: "info",
+				message:
+					reason === "human_continue"
+						? "Human repair cycle started; rebuild and re-gate."
+						: `Repair round ${event.round} ready; rebuild and re-gate.`,
+			},
 		],
 	};
 }

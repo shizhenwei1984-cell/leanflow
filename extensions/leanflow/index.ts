@@ -821,6 +821,24 @@ export default function leanflow(pi: ExtensionAPI): void {
 		return parseBuildEvidenceRecord(value, activeBuildIdentity(round));
 	}
 
+	async function isRecordedValidationCommand(ctx: ExtensionContext, event: ToolCallEvent): Promise<boolean> {
+		if (event.toolName !== "bash" || !isPlainRecord(event.input)) return false;
+		const keys = Reflect.ownKeys(event.input);
+		if (keys.length !== 1 || keys[0] !== "command" || typeof event.input.command !== "string") return false;
+		try {
+			const record = await loadBuildRecord(ctx, state.gateAttempt);
+			return record.observations.some(
+				(observation) =>
+					observation.toolName === "bash" &&
+					observation.command === event.input.command &&
+					!observation.isError &&
+					observation.exitCode === 0,
+			);
+		} catch {
+			return false;
+		}
+	}
+
 	async function readBuildRecordForReconciliation(ctx: ExtensionContext): Promise<BuildEvidenceRecordV1> {
 		const recordPath = activeBuildRecordPath(ctx);
 		let value: unknown;
@@ -1016,20 +1034,23 @@ export default function leanflow(pi: ExtensionAPI): void {
 	}
 
 	async function beginRepairBuildRound(ctx: ExtensionContext): Promise<BuildRecordSetupResult> {
+		const lease = state.repairLease;
+		const fromRound = lease ? lease.fromRound : state.gateAttempt;
+		const toRound = lease ? lease.toRound : state.gateAttempt + 1;
+		let recoveryEligible = false;
 		try {
-			const lease = state.repairLease;
-			const fromRound = lease ? lease.fromRound : state.gateAttempt;
-			const toRound = lease ? lease.toRound : state.gateAttempt + 1;
 			let actual: BuildEvidenceRecordV1;
 			try {
 				actual = await readBuildRecordForReconciliation(ctx);
 			} catch (error) {
+				recoveryEligible = true;
 				throw new Error(`internal build record is missing or unreadable: ${evidenceFailureMessage(error)}`);
 			}
 			if (actual.round === toRound) {
 				return { ok: true, round: toRound, baselinePresent: !!actual.baseline };
 			}
 			if (actual.round !== fromRound) {
+				recoveryEligible = true;
 				throw new Error(`BUILD record round ${actual.round} does not match expected ${fromRound} → ${toRound}`);
 			}
 			const nextRecord: BuildEvidenceRecordV1 = {
@@ -1040,7 +1061,18 @@ export default function leanflow(pi: ExtensionAPI): void {
 			await writeJsonAtomically(activeBuildRecordPath(ctx), nextRecord);
 			return { ok: true, round: toRound, baselinePresent: !!nextRecord.baseline };
 		} catch (error) {
-			const reason = evidenceFailureMessage(error);
+			let failure = error;
+			if (recoveryEligible && lease?.reason === "human_continue") {
+				try {
+					const fresh = createBuildEvidenceRecord(activeBuildIdentity(toRound));
+					await writeJsonAtomically(activeBuildRecordPath(ctx), fresh);
+					state.buildMutationObserved = false;
+					return { ok: true, round: toRound, baselinePresent: false };
+				} catch (recoveryError) {
+					failure = recoveryError;
+				}
+			}
+			const reason = evidenceFailureMessage(failure);
 			if (ctx.hasUI) {
 				ctx.ui.notify(
 					`LeanFlow: failed to start the repair evidence round: ${reason}`,
@@ -1647,6 +1679,34 @@ export default function leanflow(pi: ExtensionAPI): void {
 		}
 	}
 
+	async function recoverFromPlanDrift(ctx: ExtensionContext, reason: string): Promise<void> {
+		const { effects } = reduceGate(state, { type: "snapshot_plan_drift", reason });
+		await executeGateEffects(ctx, effects);
+		const refreshed = await refreshCanonicalPlanState(ctx, "mutation");
+		if (refreshed || state.phase !== "gating") return;
+
+		// A false return with the run still gating is one of refresh's early,
+		// no-mutation failures: the canonical plan cannot be identified or read.
+		// Explicitly leave gating so the cleared Gate lease cannot strand the run
+		// in a blocked phase.
+		state.proposalBoundary = undefined;
+		state.proposedPlanArtifact = undefined;
+		state.proposedPlanDigest = undefined;
+		state.approvedPlanArtifact = undefined;
+		state.approvalInvalidated = true;
+		state.handoffStatus = "NEEDS_UPDATE";
+		transitionPhase(state, "planning");
+		await writeRunMarker(ctx, "invalidated");
+		persist();
+		updateStatus(ctx);
+		ctx.ui.notify(`LeanFlow: ${reason}; canonical plan is unreadable — repair and re-propose the plan.`, "warning");
+		if (ctx.hasUI && state.planSlug) {
+			ctx.ui.setEditorText(
+				`/plan Repair the existing LeanFlow plan at local://${state.planSlug}-plan.md in place. Preserve its run ID, fix only the invalid final-plan content, write the same artifact, then re-propose ${state.planSlug}. Do not repeat repository investigation.`,
+			);
+		}
+	}
+
 	function updateStatus(ctx: ExtensionContext): void {
 		if (!ctx.hasUI) return;
 		if (state.phase === "idle") {
@@ -1825,7 +1885,10 @@ export default function leanflow(pi: ExtensionAPI): void {
 							round: buildRecord.round,
 							baselineCaptured: buildRecord.baselinePresent,
 						});
-						await executeGateEffects(ctx, readyEffects);
+						await executeGateEffects(
+							ctx,
+							readyEffects.filter((effect) => effect.kind !== "notify"),
+						);
 					} else {
 						const { effects: repairEffects } = reduceGate(state, {
 							type: "repair_round_failed",
@@ -2351,7 +2414,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 			((state.phase === "building" && state.gateRetryMode === "operational") ||
 				((state.phase === "building" || state.phase === "gating") &&
 					state.gateRetryMode === "evidence" &&
-					!isEvidenceRecoveryValidationBash(event)))
+					!(isEvidenceRecoveryValidationBash(event) || (await isRecordedValidationCommand(ctx, event)))))
 		) {
 			return {
 				block: true,
@@ -2638,9 +2701,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 						return;
 					}
 					if (snapshotCheck.kind === "plan_drift") {
-						const { effects } = reduceGate(state, { type: "snapshot_plan_drift", reason: snapshotCheck.reason });
-						await executeGateEffects(ctx, effects);
-						await refreshCanonicalPlanState(ctx, "mutation");
+						await recoverFromPlanDrift(ctx, snapshotCheck.reason);
 						return;
 					}
 					await finishGateResult(undefined, true, ctx);
@@ -2648,8 +2709,8 @@ export default function leanflow(pi: ExtensionAPI): void {
 				}
 			}
 			if (!event.isError && (await planDriftedDuringGate(ctx, dispatchedPlanDigest))) {
-				ctx.ui.notify("LeanFlow: plan drifted during Gate; retry with unchanged evidence.", "warning");
-				await finishGateResult(undefined, true, ctx);
+				ctx.ui.notify("LeanFlow: plan drifted during Gate; Gate result was discarded.", "warning");
+				await recoverFromPlanDrift(ctx, "canonical plan digest changed during Gate");
 				return;
 			}
 			const verdict = event.isError ? undefined : extractVerdict(event.content);

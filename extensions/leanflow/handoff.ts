@@ -30,8 +30,10 @@ const MARKDOWN_HEADING = /^(#{1,6})\s+/;
 
 const PLACEHOLDER_TOKENS =
 	/^(?:TBD|N\/A|\?|unknown|待定|待补充|none|nope|todo|fixme)$/i;
-const DECORATED_PLACEHOLDER = /^(?:TBD|N\/A|TODO|unknown|待定|待补充)\b/i;
-const EXECUTABLE_TOKENS = /^(?:bun|npm|pnpm|yarn|pytest|python|python3|ruby|go|cargo|make|git|tsc|bunx)$/i;
+const DECORATED_PLACEHOLDER = /^(?:TBD|N\/A|TODO|unknown)\b/i;
+const DECORATED_PLACEHOLDER_CJK = /^(?:待定|待补充)/;
+const EXECUTABLE_TOKENS = /^(?:bun|bunx|npm|npx|pnpm|yarn|pytest|python|python3|ruby|bundle|rake|rails|go|cargo|make|tsc)$/i;
+const PATH_EXECUTABLE = /^(?:\.{1,2}\/|bin\/|scripts\/)[\w./-]+$/;
 
 function normalizeEntry(line: string): string {
 	return line
@@ -50,7 +52,7 @@ function isDecoratedPlaceholder(value: string): boolean {
 	const n = normalizeEntry(value);
 	if (!n) return false;
 	if (PLACEHOLDER_TOKENS.test(n) || PLACEHOLDER_LINE.test(n)) return true;
-	if (DECORATED_PLACEHOLDER.test(n)) return true;
+	if (DECORATED_PLACEHOLDER.test(n) || DECORATED_PLACEHOLDER_CJK.test(n)) return true;
 	if (/^(?:echo|printf)\s+(?:TBD|N\/A|unknown|TODO)\b/i.test(n)) return true;
 	return false;
 }
@@ -179,7 +181,7 @@ function hasVerificationEvidence(lines: string[]): boolean {
 			if (!args) continue;
 			if (isDecoratedPlaceholder(args[0]!) || isPlaceholder(args[0]!)) continue;
 			if (args.length === 1 && (isPlaceholder(args[0]!) || isDecoratedPlaceholder(args[0]!))) continue;
-			if (!EXECUTABLE_TOKENS.test(args[0]!)) continue;
+			if (!EXECUTABLE_TOKENS.test(args[0]!) && !PATH_EXECUTABLE.test(args[0]!)) continue;
 			return true;
 		}
 	}
@@ -192,7 +194,7 @@ function hasVerificationEvidence(lines: string[]): boolean {
 			const args = parseArgvLoosely(normalized);
 			if (!args) continue;
 			if (isDecoratedPlaceholder(args[0]!) || isPlaceholder(args[0]!)) continue;
-			if (!EXECUTABLE_TOKENS.test(args[0]!)) continue;
+			if (!EXECUTABLE_TOKENS.test(args[0]!) && !PATH_EXECUTABLE.test(args[0]!)) continue;
 			return true;
 		}
 	}

@@ -181,10 +181,10 @@ async function restoreFromCrafted(h: Harness, mutate: (state: Record<string, unk
 	await h.handlers.get("session_switch")!({}, h.ctx);
 }
 
-test("liveness 1: deleted evidence discards PASS, rebuilds, and re-gates to PASS", async () => {
+test("liveness 1: deleted evidence accepts a recorded validation and re-gates to PASS", async () => {
 	const h = createHarness();
 	await enterDocumentationBuild(h);
-	await completeBuildEvidence(h, "bun test live-one");
+	await completeBuildEvidence(h, "make test");
 	await dispatchGate(h, "live-gate-1");
 	rmSync(resolveRunMarkerPath(h.ctx.localProtocolOptions, gateArtifacts().evidence)!);
 
@@ -195,8 +195,15 @@ test("liveness 1: deleted evidence discards PASS, rebuilds, and re-gates to PASS
 	expect(lastState(h).writtenArtifacts).toEqual([]);
 	expect(h.notifications.some((m) => m.includes("Gate result was discarded"))).toBe(true);
 
-	// Evidence mode must allow re-validation and re-finalization, not dead-end.
-	await completeBuildEvidence(h, "bun test");
+	const curlGuard = await h.handlers.get("tool_call")!(
+		{ toolName: "bash", toolCallId: "unrecorded-curl", input: { command: "curl https://example.com" } },
+		h.ctx,
+	);
+	expect(curlGuard).toMatchObject({ block: true });
+
+	// Evidence mode may rerun a successful command from this round, but not
+	// unrelated shell commands.
+	await completeBuildEvidence(h, "make test");
 	expect(lastState(h).writtenArtifacts).toEqual(expect.arrayContaining(["build", "diff", "evidence"]));
 	await dispatchGate(h, "live-gate-2");
 	await gatePass(h, "live-gate-2");
@@ -204,25 +211,28 @@ test("liveness 1: deleted evidence discards PASS, rebuilds, and re-gates to PASS
 	expect(lastState(h).terminalOutcome).toBe("pass");
 });
 
-test("liveness 2: corrupt BUILD record discards PASS into awaiting_human with a working recovery action", async () => {
+test("liveness 2: corrupt BUILD record recovers through a self-contained /flowcontinue", async () => {
 	const h = createHarness();
 	await enterDocumentationBuild(h);
 	await completeBuildEvidence(h, "bun test live-two");
 	await dispatchGate(h, "live-gate-record");
 	const rp = buildRecordPath(h);
-	const original = readFileSync(rp, "utf8");
-	writeFileSync(rp, JSON.stringify({ ...JSON.parse(original), round: 99 }));
+	writeFileSync(rp, JSON.stringify({ ...JSON.parse(readFileSync(rp, "utf8")), round: 99 }));
 
 	await gatePass(h, "live-gate-record");
 	expect(lastState(h).phase).toBe("awaiting_human");
 	expect(lastState(h).gateCalls).toBe(0);
 	expect(JSON.parse(readFileSync(runMarkerPath(h), "utf8")).status).toBe("paused");
 
-	// The documented recovery path (/flowcontinue) works once the record is readable.
-	writeFileSync(rp, original);
+	// /flowcontinue recreates the damaged record and re-enforces capture-first.
 	await h.commands.get("flowcontinue")!.handler("repair after record recovery", h.ctx);
 	expect(lastState(h).phase).toBe("building");
 	expect(lastState(h).gateRetryMode).toBe("repair");
+	expect(lastState(h).baselineCaptured).toBeFalsy();
+	await completeBuildEvidence(h, "bun test live-two-repair");
+	await dispatchGate(h, "live-gate-record-repair");
+	await gatePass(h, "live-gate-record-repair");
+	expect(lastState(h).phase).toBe("finalizing");
 });
 
 test("liveness 3: crash window A (lease persisted, record still round 1) replays to a working BUILD", async () => {
@@ -247,6 +257,7 @@ test("liveness 3: crash window A (lease persisted, record still round 1) replays
 	expect(lastState(h).gateRetryMode).toBe("repair");
 	expect(lastState(h).repairLease).toBeUndefined();
 	expect(JSON.parse(readFileSync(buildRecordPath(h), "utf8")).round).toBe(2);
+	expect(h.notifications).not.toEqual(expect.arrayContaining([expect.stringContaining("Repair round")]));
 
 	// The recovered round supports the full edit → validate → finalize → Gate chain.
 	const editGuard = await h.handlers.get("tool_call")!({ toolName: "edit", toolCallId: "live3-edit", input: { path: "src/example.ts" } }, h.ctx);
@@ -401,9 +412,30 @@ test("liveness 8: decorated placeholders are rejected across sections", () => {
 		expect(result.status).toBe("NEEDS_UPDATE");
 		expect(result.blockers.map((b) => b.code)).toContain("TARGET_MISSING");
 	}
+
 	const verification = assessHandoff(handoffPlan(["- extensions/leanflow/index.ts"], ["echo TBD"]));
 	expect(verification.status).toBe("NEEDS_UPDATE");
 	expect(verification.blockers.map((b) => b.code)).toContain("VERIFICATION_MISSING");
+});
+test("liveness 9: verification accepts runnable commands but rejects git status", () => {
+	for (const command of ["./scripts/test.sh", "bin/rails test", "bundle exec rspec"]) {
+		const result = assessHandoff(handoffPlan(["- extensions/leanflow/index.ts"], [command]));
+		expect(result.blockers.map((blocker) => blocker.code)).not.toContain("VERIFICATION_MISSING");
+	}
+	const git = assessHandoff(handoffPlan(["- extensions/leanflow/index.ts"], ["git status"]));
+	expect(git.blockers.map((blocker) => blocker.code)).toContain("VERIFICATION_MISSING");
+});
+
+test("liveness 10: decorated CJK placeholders are rejected across sections", () => {
+	const acceptance = assessHandoff(
+		handoffPlan(["- extensions/leanflow/index.ts"], ["bun test"]).replace(
+			"- [ ] Expected behavior must remain observable.",
+			"- [ ] 待定后补",
+		),
+	);
+	expect(acceptance.blockers.map((blocker) => blocker.code)).toContain("ACCEPTANCE_MISSING");
+	const target = assessHandoff(handoffPlan(["- 待补充::symbol"], ["bun test"]));
+	expect(target.blockers.map((blocker) => blocker.code)).toContain("TARGET_MISSING");
 });
 
 test("regression: repair-Gate plan drift clears the baseline and satisfies invariants", async () => {
@@ -427,6 +459,37 @@ test("regression: repair-Gate plan drift clears the baseline and satisfies invar
 	expect(["planning", "awaiting_approval"]).toContain(settled.phase as string);
 	expect(settled.baselineCaptured).toBeFalsy();
 	expect(checkInvariants(settled as never)).toEqual([]);
+});
+
+test("liveness: unreadable canonical plan during Gate returns to persisted planning repair", async () => {
+	const h = createHarness();
+	await enterDocumentationBuild(h);
+	await completeBuildEvidence(h, "bun test unreadable-plan");
+	await dispatchGate(h, "unreadable-plan-gate");
+	const persistedBefore = h.states.length;
+	const planPath = resolveRunMarkerPath(h.ctx.localProtocolOptions, gateArtifacts().plan)!;
+	rmSync(planPath);
+
+	await gatePass(h, "unreadable-plan-gate");
+
+	const settled = lastState(h);
+	expect(settled.phase).toBe("planning");
+	expect(settled.gateLease).toBeUndefined();
+	expect(settled.proposalBoundary).toBeUndefined();
+	expect(settled.proposedPlanArtifact).toBeUndefined();
+	expect(settled.proposedPlanDigest).toBeUndefined();
+	expect(settled.approvedPlanArtifact).toBeUndefined();
+	expect(settled.approvalInvalidated).toBe(true);
+	expect(settled.handoffStatus).toBe("NEEDS_UPDATE");
+	expect(JSON.parse(readFileSync(runMarkerPath(h), "utf8")).status).toBe("invalidated");
+	expect(h.states.length).toBeGreaterThan(persistedBefore);
+	expect(checkInvariants(settled as never)).toEqual([]);
+	expect(h.notifications).toEqual(
+		expect.arrayContaining([expect.stringContaining("canonical plan is unreadable")]),
+	);
+	expect(h.editorTexts.at(-1)).toBe(
+		`/plan Repair the existing LeanFlow plan at local://${EXAMPLE_SLUG}-plan.md in place. Preserve its run ID, fix only the invalid final-plan content, write the same artifact, then re-propose ${EXAMPLE_SLUG}. Do not repeat repository investigation.`,
+	);
 });
 
 test("liveness 9: building round reconciliation persists the corrected gateAttempt", async () => {
