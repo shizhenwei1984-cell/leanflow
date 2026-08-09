@@ -100,6 +100,13 @@ export interface LeanFlowStats {
 	terminalFailures: number;
 }
 
+export interface RepairLease {
+	fromRound: number;
+	toRound: number;
+	reason: "gate_fail" | "repair_setup_failed" | "human_continue";
+	startedAt: number;
+}
+
 export interface LeanFlowState {
 	phase: LeanFlowPhase;
 	/** Timestamp at which the current observable phase started, when observed. */
@@ -174,6 +181,8 @@ export interface LeanFlowState {
 	writtenArtifacts?: string[];
 	/** Per-cycle consecutive operational Gate errors used for the 4-error pause cap; reset on PASS/FAIL/BLOCKED and /flowcontinue. */
 	consecutiveGateErrors?: number;
+	/** Persisted repair transaction lease for crash recovery. */
+	repairLease?: RepairLease;
 	/** Persisted workflow schema version; absence implies v1 (pre-7614368). */
 	stateVersion?: number;
 	/** Runtime token/context statistics for the current run. */
@@ -243,7 +252,7 @@ export function restoreState(branch: Iterable<BranchEntry>): LeanFlowState {
 	return normalizeState(latest);
 }
 
-export const STATE_VERSION = 2;
+export const STATE_VERSION = 3;
 
 function migrateLegacyGateState(
 	state: LeanFlowState,
@@ -262,6 +271,23 @@ function migrateLegacyGateState(
 		return { phase: "building", gateCalls: 1 };
 	}
 	return { phase: rawPhase, gateCalls: rawGateCalls };
+}
+
+function normalizeRepairLease(value: unknown): RepairLease | undefined {
+	if (typeof value !== "object" || value === null) return undefined;
+	const lease = value as { fromRound?: unknown; toRound?: unknown; reason?: unknown; startedAt?: unknown };
+	const fromRound = optionalNumber(lease.fromRound);
+	const toRound = optionalNumber(lease.toRound);
+	const startedAt = optionalNumber(lease.startedAt);
+	if (
+		fromRound === undefined || toRound === undefined || startedAt === undefined ||
+		!Number.isInteger(fromRound) || !Number.isInteger(toRound) ||
+		fromRound < 0 || toRound < 1 || toRound !== fromRound + 1 ||
+		(lease.reason !== "gate_fail" && lease.reason !== "repair_setup_failed" && lease.reason !== "human_continue")
+	) {
+		return undefined;
+	}
+	return { fromRound, toRound, reason: lease.reason, startedAt };
 }
 
 function normalizeState(value: LeanFlowState | undefined): LeanFlowState {
@@ -341,6 +367,7 @@ function normalizeState(value: LeanFlowState | undefined): LeanFlowState {
 			typeof state.consecutiveGateErrors === "number" && Number.isFinite(state.consecutiveGateErrors) && state.consecutiveGateErrors >= 0
 				? Math.floor(state.consecutiveGateErrors)
 				: 0,
+		repairLease: normalizeRepairLease((state as Record<string, unknown>).repairLease),
 		terminalOutcome:
 			state.terminalOutcome === "pass" ||
 			state.terminalOutcome === "fail_after_retry" ||

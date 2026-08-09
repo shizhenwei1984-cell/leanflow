@@ -28,8 +28,20 @@ const EDGE_CASE_CUE = /\bedge[ -]?cases?\b|边界(?:情况|条件)?|异常(?:情
 const METADATA_LINE = /^\s*(?:LeanFlow run ID|LSP applicability):/i;
 const MARKDOWN_HEADING = /^(#{1,6})\s+/;
 
-function stripListMarker(line: string): string {
-	return line.replace(/^\s*(?:[-*]|\d+\.)\s+/, "").replace(/^[`]+|[`]+$/g, "").trim();
+const PLACEHOLDER_TOKENS =
+	/^(?:TBD|N\/A|\?|unknown|待定|待补充|none|nope|todo|fixme)$/i;
+
+function normalizeEntry(line: string): string {
+	return line
+		.replace(/^\s*(?:[-*]|\d+\.)\s+/, "")
+		.replace(/^\[[ xX]\]\s*/, "")
+		.replace(/^[`'"]+|[`'"]+$/g, "")
+		.trim();
+}
+
+function isPlaceholder(value: string): boolean {
+	const n = normalizeEntry(value).toLowerCase();
+	return PLACEHOLDER_TOKENS.test(n) || PLACEHOLDER_LINE.test(n);
 }
 
 function hasBehaviorEvidence(lines: string[]): boolean {
@@ -49,10 +61,9 @@ function hasCriticalFilesEntries(lines: string[]): boolean {
 			const line = lines[next]!;
 			const nextHeading = /^(#{1,6})\s+/.exec(line);
 			if (nextHeading && nextHeading[1]!.length <= depth) break;
-			const trimmed = stripListMarker(line);
-			if (trimmed.length === 0) continue;
-			if (PLACEHOLDER_LINE.test(trimmed)) continue;
-			if (TARGET_PATH.test(trimmed) || /::/.test(trimmed) || /\//.test(trimmed)) return true;
+			const trimmed = normalizeEntry(line);
+			if (!trimmed || isPlaceholder(trimmed)) continue;
+			if (TARGET_PATH.test(trimmed) || /::/.test(trimmed)) return true;
 		}
 	}
 	return false;
@@ -127,16 +138,25 @@ function hasVerificationEvidence(lines: string[]): boolean {
 	}
 	for (const block of fenceBlocks) {
 		for (const rawLine of block.split(/\r?\n/)) {
-			const line = rawLine.trim();
-			if (!line || line.startsWith("#")) continue;
-			if (parseArgvLoosely(line)) return true;
+			const normalized = normalizeEntry(rawLine);
+			if (!normalized || isPlaceholder(normalized)) continue;
+			if (normalized.startsWith("#")) continue;
+			const args = parseArgvLoosely(normalized);
+			if (!args) continue;
+			if (args.length === 1 && isPlaceholder(args[0]!)) continue;
+			return true;
 		}
 	}
 	for (const line of section) {
 		const inline = /`([^`]+)`/g;
 		let im: RegExpExecArray | null;
 		while ((im = inline.exec(line)) !== null) {
-			if (parseArgvLoosely(im[1] ?? "")) return true;
+			const normalized = normalizeEntry(im[1] ?? "");
+			if (!normalized || isPlaceholder(normalized)) continue;
+			const args = parseArgvLoosely(normalized);
+			if (!args) continue;
+			if (args.length === 1 && isPlaceholder(args[0]!)) continue;
+			return true;
 		}
 	}
 	return false;
@@ -147,8 +167,15 @@ function hasAcceptanceEvidence(lines: string[]): boolean {
 	if (section.length === 0) return false;
 	for (const line of section) {
 		const trimmed = line.trim();
-		if (/^- \[ \]/.test(trimmed)) return true;
-		if (/^(?:[-*]|\d+\.)\s+\S+/.test(trimmed) && /(must|expected|should|shall|必须|期望|应当)/i.test(trimmed)) return true;
+		if (/^- \[ \]/.test(trimmed)) {
+			const rest = normalizeEntry(trimmed);
+			if (rest && !isPlaceholder(rest)) return true;
+			continue;
+		}
+		if (/^(?:[-*]|\d+\.)\s+\S+/.test(trimmed) && /(must|expected|should|shall|必须|期望|应当)/i.test(trimmed)) {
+			const rest = normalizeEntry(trimmed);
+			if (rest && !isPlaceholder(rest)) return true;
+		}
 	}
 	return false;
 }

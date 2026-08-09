@@ -227,6 +227,42 @@ export function parseBuildEvidenceRecord(value: unknown, expected: BuildRecordId
 	return value as unknown as BuildEvidenceRecordV1;
 }
 
+export function parseBuildEvidenceRecordWithoutRound(
+	value: unknown,
+	expected: Omit<BuildRecordIdentity, "round">,
+): BuildEvidenceRecordV1 {
+	if (!isPlainRecord(value) || !hasOnlyKeys(value, RECORD_KEYS)) {
+		throw new BuildEvidenceError("Internal build record is missing or has an invalid shape.");
+	}
+	if (
+		value.version !== BUILD_EVIDENCE_RECORD_VERSION ||
+		value.runId !== expected.runId ||
+		value.planSlug !== expected.planSlug ||
+		value.planDigest !== expected.planDigest ||
+		!Array.isArray(value.observations)
+	) {
+		throw new BuildEvidenceError("Internal build record identity does not match the active LeanFlow run.");
+	}
+	if (!finiteInteger(value.round) || (value.round as number) < 1) {
+		throw new BuildEvidenceError("Internal build record has an invalid round.");
+	}
+	if (value.baseline !== undefined) {
+		if (!isPlainRecord(value.baseline) || !hasOnlyKeys(value.baseline, BASELINE_KEYS)) {
+			throw new BuildEvidenceError("Internal build record has an invalid baseline.");
+		}
+		if (
+			!nonEmptyString(value.baseline.head) ||
+			typeof value.baseline.status !== "string" ||
+			typeof value.baseline.capturedAt !== "number" ||
+			!Number.isFinite(value.baseline.capturedAt)
+		) {
+			throw new BuildEvidenceError("Internal build record baseline is incomplete.");
+		}
+	}
+	for (const observation of value.observations) assertObservation(observation);
+	return value as unknown as BuildEvidenceRecordV1;
+}
+
 function assertIdentity(identity: BuildRecordIdentity): void {
 	if (
 		!nonEmptyString(identity.runId) ||

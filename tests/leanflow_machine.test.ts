@@ -97,8 +97,9 @@ test("first FAIL starts a repair round with artifacts cleared before initializat
 	expect(state.consecutiveGateErrors).toBe(0);
 	expect(effects.map((effect) => effect.kind)).toEqual(["clear_artifacts", "begin_repair_round", "notify"]);
 	expect(checkInvariants(state)).toEqual([]);
-	const ready = reduceGate(state, { type: "repair_round_ready" });
+	const ready = reduceGate(state, { type: "repair_round_ready", round: 2, baselineCaptured: true });
 	expect(state.phase).toBe("building");
+	expect(state.baselineCaptured).toBe(true);
 	expect(ready.effects).toEqual([]);
 	const failed = dispatch();
 	reduceGate(failed, { type: "gate_settled", outcome: "FAIL" });
@@ -111,7 +112,7 @@ test("second FAIL pauses for a human without setting a terminal outcome", () => 
 	const state = dispatch();
 	state.baselineCaptured = true;
 	reduceGate(state, { type: "gate_settled", outcome: "FAIL" });
-	reduceGate(state, { type: "repair_round_ready" });
+	reduceGate(state, { type: "repair_round_ready", round: 2, baselineCaptured: true });
 	dispatch(state, "gate-2");
 
 	const { effects } = reduceGate(state, { type: "gate_settled", outcome: "FAIL", findingsJson: "x".repeat(4_001) });
@@ -122,7 +123,7 @@ test("second FAIL pauses for a human without setting a terminal outcome", () => 
 		lastGateFindings: `${"x".repeat(3_999)}…`,
 	});
 	expect(state.terminalOutcome).toBeUndefined();
-	expect(state.baselineCaptured).toBeFalse();
+	expect(state.baselineCaptured).toBe(true);
 	expect(checkInvariants(state)).toEqual([]);
 	expect(state.stats).toMatchObject({ gateVerdictFailures: 2, repairRounds: 1 });
 	expect(effects.map((effect) => effect.kind)).toEqual(["write_marker", "notify"]);
@@ -192,7 +193,7 @@ test("human controls begin a fresh repair cycle or terminally fail after the com
 	const continued = pausedAfterTwoFailures();
 	const continuation = reduceGate(continued, { type: "human_continue", now: 50 });
 	expect(continued).toMatchObject({
-		phase: "building",
+		phase: "repair_preparing",
 		gateCalls: 0,
 		gateAttempt: 2,
 		gateRetryMode: "repair",
@@ -263,7 +264,7 @@ test("invariant checker reports every specified invalid state", () => {
 	const pausedWithBaseline = buildingState();
 	pausedWithBaseline.phase = "awaiting_human";
 	pausedWithBaseline.baselineCaptured = true;
-	expect(checkInvariants(pausedWithBaseline)).toContain("baselineCaptured is only valid during building or gating");
+	expect(checkInvariants(pausedWithBaseline)).toEqual([]);
 
 	state.phase = "awaiting_human";
 	state.terminalOutcome = "pass";
@@ -316,7 +317,7 @@ function mulberry32(seed: number): () => number {
 function pausedAfterTwoFailures(): LeanFlowState {
 	const state = dispatch();
 	reduceGate(state, { type: "gate_settled", outcome: "FAIL", findingsJson: '{"id":"first"}' });
-	reduceGate(state, { type: "repair_round_ready" });
+	reduceGate(state, { type: "repair_round_ready", round: 2, baselineCaptured: true });
 	dispatch(state, "gate-2");
 	reduceGate(state, { type: "gate_settled", outcome: "FAIL", findingsJson: '{"id":"second"}' });
 	expect(state.phase).toBe("awaiting_human");
@@ -347,7 +348,7 @@ function randomGateEvent(state: LeanFlowState, random: () => number, seed: numbe
 			if (random() < 0.4) return { type: "restore_reconcile", now: index };
 			return { type: "gate_settled", outcome: randomOutcome(random) };
 		case "repair_preparing":
-			return random() < 0.5 ? { type: "repair_round_ready" } : { type: "repair_round_failed", reason: "disk full" };
+			return random() < 0.5 ? { type: "repair_round_ready", round: state.gateAttempt + 1, baselineCaptured: true } : { type: "repair_round_failed", reason: "disk full" };
 		case "awaiting_human":
 			return random() < 0.5
 				? { type: "human_continue", now: index }
@@ -399,7 +400,7 @@ function terminalInvalidEvents(seed: number, index: number): GateEvent[] {
 		{ type: "gate_error" },
 		{ type: "gate_interrupted" },
 		{ type: "restore_reconcile", now: index },
-		{ type: "repair_round_ready" },
+		{ type: "repair_round_ready", round: 99, baselineCaptured: true },
 		{ type: "repair_round_failed", reason: "x" },
 		{ type: "human_continue", now: index },
 		{ type: "human_finish_failed", now: index },

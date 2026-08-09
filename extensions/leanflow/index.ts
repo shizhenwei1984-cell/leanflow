@@ -38,6 +38,7 @@ import {
 	composeCompleteDiff,
 	createBuildEvidenceRecord,
 	parseBuildEvidenceRecord,
+	parseBuildEvidenceRecordWithoutRound,
 	renderBuildArtifacts,
 	selectValidationObservations,
 } from "./evidence";
@@ -781,7 +782,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 		delete state.persistenceFailureMessage;
 	}
 
-	type BuildRecordSetupResult = { ok: true } | { ok: false; reason: string };
+	type BuildRecordSetupResult = { ok: true; round: number; baselinePresent: boolean } | { ok: false; reason: string };
 
 	function evidenceFailureMessage(error: unknown): string {
 		return error instanceof Error ? error.message : String(error);
@@ -818,6 +819,24 @@ export default function leanflow(pi: ExtensionAPI): void {
 			throw new Error(`internal build record is missing or unreadable: ${evidenceFailureMessage(error)}`);
 		}
 		return parseBuildEvidenceRecord(value, activeBuildIdentity(round));
+	}
+
+	async function readBuildRecordForReconciliation(ctx: ExtensionContext): Promise<BuildEvidenceRecordV1> {
+		const recordPath = activeBuildRecordPath(ctx);
+		let value: unknown;
+		try {
+			value = JSON.parse(await fs.readFile(recordPath, "utf8"));
+		} catch (error) {
+			throw new Error(`internal build record is missing or unreadable: ${evidenceFailureMessage(error)}`);
+		}
+		if (!state.runId || !state.planSlug || !state.planDigest) {
+			throw new Error("active LeanFlow run identity is incomplete");
+		}
+		return parseBuildEvidenceRecordWithoutRound(value, {
+			runId: state.runId,
+			planSlug: state.planSlug,
+			planDigest: state.planDigest,
+		});
 	}
 
 	function expectedGateRoundForSnapshot(): number {
@@ -983,7 +1002,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 			state.baselineCaptured = false;
 			state.buildMutationObserved = false;
 			state.writtenArtifacts = [];
-			return { ok: true };
+			return { ok: true, round: 1, baselinePresent: false };
 		} catch (error) {
 			const reason = evidenceFailureMessage(error);
 			if (ctx.hasUI) {
@@ -998,15 +1017,28 @@ export default function leanflow(pi: ExtensionAPI): void {
 
 	async function beginRepairBuildRound(ctx: ExtensionContext): Promise<BuildRecordSetupResult> {
 		try {
-			const currentRound = state.gateAttempt;
-			const record = await loadBuildRecord(ctx, currentRound);
+			const lease = state.repairLease;
+			const fromRound = lease ? lease.fromRound : state.gateAttempt;
+			const toRound = lease ? lease.toRound : state.gateAttempt + 1;
+			let actual: BuildEvidenceRecordV1;
+			try {
+				actual = await readBuildRecordForReconciliation(ctx);
+			} catch (error) {
+				throw new Error(`internal build record is missing or unreadable: ${evidenceFailureMessage(error)}`);
+			}
+			if (actual.round === toRound) {
+				return { ok: true, round: toRound, baselinePresent: !!actual.baseline };
+			}
+			if (actual.round !== fromRound) {
+				throw new Error(`BUILD record round ${actual.round} does not match expected ${fromRound} → ${toRound}`);
+			}
 			const nextRecord: BuildEvidenceRecordV1 = {
-				...record,
-				round: currentRound + 1,
+				...actual,
+				round: toRound,
 				observations: [],
 			};
 			await writeJsonAtomically(activeBuildRecordPath(ctx), nextRecord);
-			return { ok: true };
+			return { ok: true, round: toRound, baselinePresent: !!nextRecord.baseline };
 		} catch (error) {
 			const reason = evidenceFailureMessage(error);
 			if (ctx.hasUI) {
@@ -1556,6 +1588,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 					state.writtenArtifacts = [];
 					break;
 				case "begin_repair_round": {
+					persist();
 					const buildRecord = await beginRepairBuildRound(ctx);
 					if (!buildRecord.ok) {
 						const { effects: repairEffects } = reduceGate(state, {
@@ -1572,8 +1605,13 @@ export default function leanflow(pi: ExtensionAPI): void {
 						break;
 					}
 					if (state.phase === "repair_preparing") {
-						const { effects: readyEffects } = reduceGate(state, { type: "repair_round_ready" });
+						const { effects: readyEffects } = reduceGate(state, {
+							type: "repair_round_ready",
+							round: buildRecord.round,
+							baselineCaptured: buildRecord.baselinePresent,
+						});
 						await executeGateEffects(ctx, readyEffects);
+						persist();
 					}
 					break;
 				}
@@ -1730,20 +1768,47 @@ export default function leanflow(pi: ExtensionAPI): void {
 
 		if (state.phase === "building" || state.phase === "repair_preparing") {
 			try {
-				const round = expectedGateRoundForSnapshot();
-				const record = await loadBuildRecord(ctx, round);
-				if (record.round !== state.gateAttempt && record.round !== state.gateAttempt + 1) {
+				const record = await readBuildRecordForReconciliation(ctx);
+				const expected = expectedGateRoundForSnapshot();
+				if (record.round !== expected) {
 					if (record.round >= 1 && record.round <= 100) {
-						state.gateAttempt = record.round;
 						if (record.round === 1 && state.gateRetryMode === "repair") {
 							state.gateRetryMode = undefined;
 						}
+						if (state.gateRetryMode === "operational" || state.gateRetryMode === "evidence") {
+							state.gateAttempt = record.round;
+						} else {
+							state.gateAttempt = record.round - 1;
+							if (state.gateAttempt < 0) state.gateAttempt = 0;
+						}
 					}
-				} else if (record.round !== round) {
-					state.gateAttempt = record.round;
 				}
 			} catch {
 				// Missing or unreadable record is handled at next preflight as a blocked readiness reason.
+			}
+		}
+
+		if (state.phase === "repair_preparing" && state.repairLease) {
+			try {
+				const buildRecord = await beginRepairBuildRound(ctx);
+				if (buildRecord.ok) {
+					const { effects: readyEffects } = reduceGate(state, {
+						type: "repair_round_ready",
+						round: buildRecord.round,
+						baselineCaptured: buildRecord.baselinePresent,
+					});
+					await executeGateEffects(ctx, readyEffects);
+					persist();
+				} else {
+					const { effects: repairEffects } = reduceGate(state, {
+						type: "repair_round_failed",
+						reason: buildRecord.reason,
+					});
+					await executeGateEffects(ctx, repairEffects);
+					persist();
+				}
+			} catch {
+				// Reconciliation failure is handled at next preflight.
 			}
 		}
 
@@ -1902,8 +1967,28 @@ export default function leanflow(pi: ExtensionAPI): void {
 				return fail("a repository mutation was already authorized; run /flowcancel and start a new run.");
 			}
 			try {
-				const record = await loadBuildRecord(ctx, 1);
-				if (record.baseline) return fail("the internal record already contains a baseline.");
+				const activeRound = state.repairLease ? state.repairLease.toRound : expectedGateRoundForSnapshot();
+				let record: BuildEvidenceRecordV1;
+				try {
+					record = await loadBuildRecord(ctx, activeRound);
+				} catch {
+					record = await readBuildRecordForReconciliation(ctx);
+					if (record.baseline) {
+						state.baselineCaptured = true;
+						persist();
+						return {
+							content: [{ type: "text" as const, text: `LeanFlow immutable BUILD baseline already captured at ${record.baseline.head}.` }],
+						};
+					}
+					throw new Error(`BUILD record round ${record.round} does not match expected ${activeRound}`);
+				}
+				if (record.baseline) {
+					state.baselineCaptured = true;
+					persist();
+					return {
+						content: [{ type: "text" as const, text: `LeanFlow immutable BUILD baseline already captured at ${record.baseline.head}.` }],
+					};
+				}
 				const headResult = await runGit(ctx, ["rev-parse", "HEAD"], signal);
 				const statusResult = await runGit(ctx, ["status", "--short", "--untracked-files=all"], signal);
 				const head = headResult.stdout.trim();
@@ -2494,14 +2579,9 @@ export default function leanflow(pi: ExtensionAPI): void {
 			if (!event.isError && state.phase === "gating" && state.gateLease) {
 				const snapshotCheck = await verifyGateSnapshot(ctx, state.gateLease);
 				if (!snapshotCheck.ok) {
-					const isSnapshotDrift = snapshotCheck.reason.includes("snapshot") || snapshotCheck.reason.includes("changed since dispatch");
-					if (isSnapshotDrift) {
-						ctx.ui.notify(`LeanFlow: ${snapshotCheck.reason}; retry with unchanged evidence.`, "warning");
-						await finishGateResult(undefined, true, ctx);
-						return;
-					}
-					// BUILD record / artifact unreadable → treat the Gate result as operational error
-					// and fall through to verdict extraction; the repair_preparing transaction will handle record failures.
+					ctx.ui.notify(`LeanFlow: ${snapshotCheck.reason}; Gate result was discarded.`, "warning");
+					await finishGateResult(undefined, true, ctx);
+					return;
 				}
 			}
 			if (!event.isError && (await planDriftedDuringGate(ctx, dispatchedPlanDigest))) {
@@ -2586,19 +2666,19 @@ export default function leanflow(pi: ExtensionAPI): void {
 				return;
 			}
 
-			const buildRecord = await beginRepairBuildRound(ctx);
-			if (!buildRecord.ok) {
-				ctx.ui.notify(`LeanFlow: Cannot continue: ${buildRecord.reason}`, "warning");
+			const { effects } = reduceGate(state, { type: "human_continue", now: Date.now() });
+			await executeGateEffects(ctx, effects);
+			if (state.phase !== "repair_preparing") {
+				if (state.phase === "awaiting_human") {
+					ctx.ui.notify("LeanFlow: Cannot continue: repair setup failed; use /flowcontinue to retry.", "warning");
+					return;
+				}
+				persist();
+				updateStatus(ctx);
+				ctx.ui.setEditorText(buildHumanRepairPrompt(state.runId, state.lastGateFindings, args));
 				return;
 			}
-			const { effects } = reduceGate(state, { type: "human_continue", now: Date.now() });
-			await executeGateEffects(
-				ctx,
-				effects.filter((effect) => effect.kind !== "begin_repair_round"),
-			);
-			persist();
-			updateStatus(ctx);
-			ctx.ui.setEditorText(buildHumanRepairPrompt(state.runId, state.lastGateFindings, args));
+			ctx.ui.notify("LeanFlow: Cannot continue: repair setup did not complete.", "warning");
 		},
 	});
 

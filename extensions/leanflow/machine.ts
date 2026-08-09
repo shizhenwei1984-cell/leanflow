@@ -15,7 +15,7 @@ export type GateEvent =
 	| { type: "gate_error" }
 	| { type: "gate_interrupted" }
 	| { type: "restore_reconcile"; now: number }
-	| { type: "repair_round_ready" }
+	| { type: "repair_round_ready"; round: number; baselineCaptured: boolean }
 	| { type: "repair_round_failed"; reason: string }
 	| { type: "human_continue"; now: number }
 	| { type: "human_finish_failed"; now: number };
@@ -50,7 +50,7 @@ export function reduceGate(state: LeanFlowState, event: GateEvent): { effects: E
 		case "restore_reconcile":
 			return reduceRestoreReconcile(state);
 		case "repair_round_ready":
-			return reduceRepairRoundReady(state);
+			return reduceRepairRoundReady(state, event as Extract<GateEvent, { type: "repair_round_ready" }>);
 		case "repair_round_failed":
 			return reduceRepairRoundFailed(state, event);
 		case "human_continue":
@@ -80,8 +80,8 @@ export function checkInvariants(state: LeanFlowState): string[] {
 	if (state.gateCalls < 0 || state.gateCalls > MAX_GATE_VERDICTS) {
 		violations.push(`gateCalls must be between 0 and ${MAX_GATE_VERDICTS}`);
 	}
-	if (state.baselineCaptured && state.phase !== "building" && state.phase !== "gating") {
-		violations.push("baselineCaptured is only valid during building or gating");
+	if (state.baselineCaptured && state.phase !== "building" && state.phase !== "gating" && state.phase !== "awaiting_human" && state.phase !== "repair_preparing") {
+		violations.push("baselineCaptured is only valid during building, gating, awaiting_human, or repair_preparing");
 	}
 	if ((state.consecutiveGateErrors ?? 0) < 0 || (state.consecutiveGateErrors ?? 0) > MAX_GATE_ERRORS) {
 		violations.push(`consecutiveGateErrors must be between 0 and ${MAX_GATE_ERRORS}`);
@@ -147,6 +147,7 @@ function reduceGateSettlement(
 				state.gateRetryMode = "repair";
 				recordGateFailure(state, true);
 				resetConsecutiveGateErrors(state);
+				state.repairLease = { fromRound: state.gateAttempt, toRound: state.gateAttempt + 1, reason: "gate_fail", startedAt: Date.now() };
 				state.phase = "repair_preparing";
 				state.writtenArtifacts = [];
 				return {
@@ -160,7 +161,7 @@ function reduceGateSettlement(
 
 			recordGateFailure(state, false);
 			resetConsecutiveGateErrors(state);
-			state.baselineCaptured = false;
+			state.repairLease = undefined;
 			state.phase = "awaiting_human";
 			return {
 				effects: [
@@ -241,10 +242,15 @@ function reduceGateInterrupted(state: LeanFlowState): { effects: Effect[] } {
 	};
 }
 
-function reduceRepairRoundReady(state: LeanFlowState): { effects: Effect[] } {
+function reduceRepairRoundReady(
+	state: LeanFlowState,
+	event: Extract<GateEvent, { type: "repair_round_ready" }>,
+): { effects: Effect[] } {
 	if (state.phase !== "repair_preparing") return { effects: [] };
 
+	state.baselineCaptured = event.baselineCaptured;
 	state.phase = "building";
+	state.repairLease = undefined;
 	return { effects: [] };
 }
 
@@ -254,7 +260,7 @@ function reduceRepairRoundFailed(
 ): { effects: Effect[] } {
 	if (state.phase !== "repair_preparing") return { effects: [] };
 
-	state.baselineCaptured = false;
+	state.repairLease = undefined;
 	state.phase = "awaiting_human";
 	return {
 		effects: [
@@ -270,6 +276,14 @@ function reduceRepairRoundFailed(
 
 function reduceRestoreReconcile(state: LeanFlowState): { effects: Effect[] } {
 	if (state.phase === "gating") {
+		if (!state.gateLease) {
+			state.gateRetryMode = "operational";
+			state.phase = "building";
+			recordGateInterruption(state);
+			return {
+				effects: [{ kind: "notify", level: "warning", message: "Gate lease missing; restored to BUILD." }],
+			};
+		}
 		return { effects: [] };
 	}
 	if (state.phase === "building" && state.lspProbeStatus === "pending") {
@@ -286,7 +300,8 @@ function reduceHumanContinue(state: LeanFlowState): { effects: Effect[] } {
 	state.gateRetryMode = "repair";
 	state.terminalOutcome = undefined;
 	resetConsecutiveGateErrors(state);
-	state.phase = "building";
+	state.repairLease = { fromRound: state.gateAttempt, toRound: state.gateAttempt + 1, reason: "human_continue", startedAt: Date.now() };
+	state.phase = "repair_preparing";
 	return {
 		effects: [
 			{ kind: "clear_artifacts" },
