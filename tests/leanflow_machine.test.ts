@@ -100,7 +100,7 @@ test("first FAIL starts a repair round with artifacts cleared before initializat
 	const ready = reduceGate(state, { type: "repair_round_ready", round: 2, baselineCaptured: true });
 	expect(state.phase).toBe("building");
 	expect(state.baselineCaptured).toBe(true);
-	expect(ready.effects).toEqual([]);
+	expect(ready.effects.map((e) => e.kind)).toEqual(["write_marker", "notify"]);
 	const failed = dispatch();
 	reduceGate(failed, { type: "gate_settled", outcome: "FAIL" });
 	const failEffects = reduceGate(failed, { type: "repair_round_failed", reason: "disk full" });
@@ -203,8 +203,6 @@ test("human controls begin a fresh repair cycle or terminally fail after the com
 	expect(continuation.effects.map((effect) => effect.kind)).toEqual([
 		"clear_artifacts",
 		"begin_repair_round",
-		"write_marker",
-		"notify",
 	]);
 	expect(checkInvariants(continued)).toEqual([]);
 

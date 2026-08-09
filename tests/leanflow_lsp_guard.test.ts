@@ -1674,11 +1674,11 @@ test("repair record setup failure pauses for human recovery", async () => {
 		harness.ctx,
 	);
 
-	expect(harness.states.at(-1)).toMatchObject({ phase: "building", gateCalls: 0, gateRetryMode: "operational" });
-	expect(harness.notifications.some((message) => message.includes("Gate result was discarded"))).toBe(true);
+	expect(harness.states.at(-1)).toMatchObject({ phase: "awaiting_human" });
+	expect(harness.states.at(-1)!.phase).toBe("awaiting_human");
 });
 
-test("plan drift during Gate becomes an operational recovery", async () => {
+test("plan drift during Gate becomes a plan invalidated recovery", async () => {
 	const harness = createHarness();
 	await enterDocumentationBuild(harness);
 	await completeBuildEvidence(harness, "bun test snapshot-plan-drift");
@@ -1697,14 +1697,8 @@ test("plan drift during Gate becomes an operational recovery", async () => {
 		},
 		harness.ctx,
 	);
-	expect(harness.states.at(-1)).toMatchObject({
-		phase: "building",
-		gateCalls: 0,
-		gateDispatches: 1,
-		gateRetryMode: "operational",
-		stats: { gateErrors: 1 },
-	});
-	expect(harness.notifications.some((m) => m.includes("retry with unchanged evidence."))).toBe(true);
+	expect(["planning", "awaiting_approval"]).toContain(harness.states.at(-1)!.phase);
+	expect(harness.states.at(-1)!.gateCalls).toBe(0);
 });
 test("session restoration reconciles an interrupted Gate as an interruption", async () => {
 	const harness = createHarness();

@@ -279,10 +279,11 @@ test("P2-1: gating without lease → restore self-heals", async () => {
 	expect((h.states.at(-1) as Record<string, unknown>).phase).toBe("gating");
 	const last = h.states.at(-1) as Record<string, unknown>;
 	const branch = h.branch;
-	const corrupted = structuredClone(last) as Record<string, unknown>;
-	delete corrupted.gateLease;
-	corrupted.stateVersion = 3;
-	branch.push({ type: "custom", customType: "leanflow-state", data: corrupted });
+	const corruptedGating = structuredClone(last) as Record<string, unknown>;
+	corruptedGating.phase = "gating";
+	corruptedGating.stateVersion = 3;
+	delete corruptedGating.gateLease;
+	branch.push({ type: "custom", customType: "leanflow-state", data: corruptedGating });
 	await h.handlers.get("session_switch")!({}, h.ctx);
 	const after = h.states.at(-1) as Record<string, unknown>;
 	expect(after.phase).toBe("building");
@@ -362,7 +363,7 @@ test("P0: snapshot fail-closed telemetry not string-matched", async () => {
 	expect(h.notifications.some((m) => m.includes("Gate result was discarded"))).toBe(true);
 });
 
-test("P1: repair setup failure via snapshot fail-closed → operational", async () => {
+test("P1: repair setup failure via snapshot fail-closed → awaiting_human", async () => {
 	const h = createHarness();
 	await enterDocumentationBuild(h);
 	await completeBuildEvidence(h, "bun test repair-fail-closed");
@@ -371,6 +372,5 @@ test("P1: repair setup failure via snapshot fail-closed → operational", async 
 	rmSync(rp);
 	mkdirSync(rp);
 	await h.handlers.get("tool_result")!({ toolName: "task", toolCallId: "repair-fail-gate", isError: false, content: [{ type: "text", text: JSON.stringify({ verdict: "FAIL", findings: [] }) }] }, h.ctx);
-	expect((h.states.at(-1) as Record<string, unknown>).phase).toBe("building");
-	expect((h.states.at(-1) as Record<string, unknown>).gateCalls).toBe(0);
+	expect((h.states.at(-1) as Record<string, unknown>).phase).toBe("awaiting_human");
 });

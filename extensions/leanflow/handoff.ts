@@ -30,6 +30,8 @@ const MARKDOWN_HEADING = /^(#{1,6})\s+/;
 
 const PLACEHOLDER_TOKENS =
 	/^(?:TBD|N\/A|\?|unknown|待定|待补充|none|nope|todo|fixme)$/i;
+const DECORATED_PLACEHOLDER = /^(?:TBD|N\/A|TODO|unknown|待定|待补充)\b/i;
+const EXECUTABLE_TOKENS = /^(?:bun|npm|pnpm|yarn|pytest|python|python3|ruby|go|cargo|make|git|tsc|bunx)$/i;
 
 function normalizeEntry(line: string): string {
 	return line
@@ -42,6 +44,38 @@ function normalizeEntry(line: string): string {
 function isPlaceholder(value: string): boolean {
 	const n = normalizeEntry(value).toLowerCase();
 	return PLACEHOLDER_TOKENS.test(n) || PLACEHOLDER_LINE.test(n);
+}
+
+function isDecoratedPlaceholder(value: string): boolean {
+	const n = normalizeEntry(value);
+	if (!n) return false;
+	if (PLACEHOLDER_TOKENS.test(n) || PLACEHOLDER_LINE.test(n)) return true;
+	if (DECORATED_PLACEHOLDER.test(n)) return true;
+	if (/^(?:echo|printf)\s+(?:TBD|N\/A|unknown|TODO)\b/i.test(n)) return true;
+	return false;
+}
+
+function isValidRepoPath(value: string): boolean {
+	const trimmed = value.trim();
+	if (!trimmed || trimmed.startsWith("/") || trimmed.includes("\0") || trimmed.includes("..")) return false;
+	if (isDecoratedPlaceholder(trimmed)) return false;
+	return /^[\w.-]+(\/[\w./-]+)*$/.test(trimmed);
+}
+
+function parseTarget(entry: string): { path: string; symbol?: string } | undefined {
+	const n = normalizeEntry(entry);
+	if (!n || isDecoratedPlaceholder(n)) return undefined;
+	const parts = n.split("::");
+	if (parts.length === 2) {
+		const left = parts[0]!.trim();
+		const right = parts[1]!.trim();
+		if (!left || !right || isDecoratedPlaceholder(left) || isDecoratedPlaceholder(right)) return undefined;
+		if (!isValidRepoPath(left)) return undefined;
+		return { path: left, symbol: right };
+	}
+	if (parts.length > 2) return undefined;
+	if (!isValidRepoPath(n)) return undefined;
+	return { path: n };
 }
 
 function hasBehaviorEvidence(lines: string[]): boolean {
@@ -62,8 +96,8 @@ function hasCriticalFilesEntries(lines: string[]): boolean {
 			const nextHeading = /^(#{1,6})\s+/.exec(line);
 			if (nextHeading && nextHeading[1]!.length <= depth) break;
 			const trimmed = normalizeEntry(line);
-			if (!trimmed || isPlaceholder(trimmed)) continue;
-			if (TARGET_PATH.test(trimmed) || /::/.test(trimmed)) return true;
+			if (!trimmed || isPlaceholder(trimmed) || isDecoratedPlaceholder(trimmed)) continue;
+			if (parseTarget(trimmed)) return true;
 		}
 	}
 	return false;
@@ -139,11 +173,13 @@ function hasVerificationEvidence(lines: string[]): boolean {
 	for (const block of fenceBlocks) {
 		for (const rawLine of block.split(/\r?\n/)) {
 			const normalized = normalizeEntry(rawLine);
-			if (!normalized || isPlaceholder(normalized)) continue;
+			if (!normalized || isPlaceholder(normalized) || isDecoratedPlaceholder(normalized)) continue;
 			if (normalized.startsWith("#")) continue;
 			const args = parseArgvLoosely(normalized);
 			if (!args) continue;
-			if (args.length === 1 && isPlaceholder(args[0]!)) continue;
+			if (isDecoratedPlaceholder(args[0]!) || isPlaceholder(args[0]!)) continue;
+			if (args.length === 1 && (isPlaceholder(args[0]!) || isDecoratedPlaceholder(args[0]!))) continue;
+			if (!EXECUTABLE_TOKENS.test(args[0]!)) continue;
 			return true;
 		}
 	}
@@ -152,10 +188,11 @@ function hasVerificationEvidence(lines: string[]): boolean {
 		let im: RegExpExecArray | null;
 		while ((im = inline.exec(line)) !== null) {
 			const normalized = normalizeEntry(im[1] ?? "");
-			if (!normalized || isPlaceholder(normalized)) continue;
+			if (!normalized || isPlaceholder(normalized) || isDecoratedPlaceholder(normalized)) continue;
 			const args = parseArgvLoosely(normalized);
 			if (!args) continue;
-			if (args.length === 1 && isPlaceholder(args[0]!)) continue;
+			if (isDecoratedPlaceholder(args[0]!) || isPlaceholder(args[0]!)) continue;
+			if (!EXECUTABLE_TOKENS.test(args[0]!)) continue;
 			return true;
 		}
 	}
@@ -169,12 +206,12 @@ function hasAcceptanceEvidence(lines: string[]): boolean {
 		const trimmed = line.trim();
 		if (/^- \[ \]/.test(trimmed)) {
 			const rest = normalizeEntry(trimmed);
-			if (rest && !isPlaceholder(rest)) return true;
+			if (rest && !isPlaceholder(rest) && !isDecoratedPlaceholder(rest)) return true;
 			continue;
 		}
 		if (/^(?:[-*]|\d+\.)\s+\S+/.test(trimmed) && /(must|expected|should|shall|必须|期望|应当)/i.test(trimmed)) {
 			const rest = normalizeEntry(trimmed);
-			if (rest && !isPlaceholder(rest)) return true;
+			if (rest && !isPlaceholder(rest) && !isDecoratedPlaceholder(rest)) return true;
 		}
 	}
 	return false;

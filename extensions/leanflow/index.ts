@@ -53,7 +53,7 @@ import type {
 import { CUSTOM_TYPE, defaultState, defaultStats, hasPersistedState, restoreState } from "./state";
 import type { GateOutcome, LeanFlowState } from "./state";
 import { checkInvariants, reduceGate } from "./machine";
-import type { Effect } from "./machine";
+import type { Effect, SnapshotFailureKind } from "./machine";
 import { checkAgentBudget, checkTaskGuard, extractAgentRoles, validateGateTaskCall } from "./guard";
 import type { GateArtifacts, LeanFlowAgentRole } from "./guard";
 import { assessHandoff, formatHandoffNotification } from "./handoff";
@@ -929,15 +929,15 @@ export default function leanflow(pi: ExtensionAPI): void {
 	async function verifyGateSnapshot(
 		ctx: ExtensionContext,
 		lease: NonNullable<LeanFlowState["gateLease"]>,
-	): Promise<{ ok: true } | { ok: false; reason: string }> {
+	): Promise<{ ok: true } | { ok: false; kind: SnapshotFailureKind; reason: string }> {
 		if (!ctx.localProtocolOptions || !state.runId || !state.planDigest || !lease.planDigest || !lease.snapshotDigest || lease.buildRecordRound === undefined) {
-			return { ok: false, reason: "Gate lease is missing durable snapshot identity" };
+			return { ok: false, kind: "lease_invalid", reason: "Gate lease is missing durable snapshot identity" };
 		}
 		if (state.planDigest !== lease.planDigest) {
-			return { ok: false, reason: "canonical plan digest changed since Gate dispatch" };
+			return { ok: false, kind: "plan_drift", reason: "canonical plan digest changed since Gate dispatch" };
 		}
 		const artifacts = expectedGateArtifacts(state);
-		if (!artifacts) return { ok: false, reason: "canonical Gate artifact identity is unavailable" };
+		if (!artifacts) return { ok: false, kind: "artifact_rebuildable", reason: "canonical Gate artifact identity is unavailable" };
 		const readArtifact = async (kind: string, artifact: string): Promise<{ ok: true; content: string } | { ok: false; reason: string }> => {
 			const artifactPath = resolveRunMarkerPath(ctx.localProtocolOptions!, artifact);
 			if (!artifactPath) return { ok: false, reason: `canonical ${kind} artifact path cannot be resolved` };
@@ -955,30 +955,30 @@ export default function leanflow(pi: ExtensionAPI): void {
 			readArtifact("diff", artifacts.diff),
 			readArtifact("evidence", artifacts.evidence),
 		]);
-		if (!build.ok) return build;
-		if (!diff.ok) return diff;
-		if (!evidence.ok) return evidence;
+		if (!build.ok) return { ok: false, kind: "artifact_rebuildable", reason: build.reason };
+		if (!diff.ok) return { ok: false, kind: "artifact_rebuildable", reason: diff.reason };
+		if (!evidence.ok) return { ok: false, kind: "artifact_rebuildable", reason: evidence.reason };
 		const planPath = resolveRunMarkerPath(ctx.localProtocolOptions, artifacts.plan);
-		if (!planPath) return { ok: false, reason: "canonical plan artifact path cannot be resolved" };
+		if (!planPath) return { ok: false, kind: "plan_drift", reason: "canonical plan artifact path cannot be resolved" };
 		try {
 			const canonicalPlan = await fs.readFile(planPath, "utf8");
 			if (sha256Hex(canonicalPlan) !== lease.planDigest) {
-				return { ok: false, reason: "canonical plan digest changed since Gate dispatch" };
+				return { ok: false, kind: "plan_drift", reason: "canonical plan digest changed since Gate dispatch" };
 			}
 		} catch {
-			return { ok: false, reason: "canonical plan artifact is missing or unreadable" };
+			return { ok: false, kind: "plan_drift", reason: "canonical plan artifact is missing or unreadable" };
 		}
 		try {
 			const record = await loadBuildRecord(ctx, lease.buildRecordRound);
 			if (record.round !== lease.buildRecordRound) {
-				return { ok: false, reason: "BUILD record round does not match the dispatched Gate lease" };
+				return { ok: false, kind: "record_invalid", reason: "BUILD record round does not match the dispatched Gate lease" };
 			}
 		} catch (error) {
-			return { ok: false, reason: `BUILD record validation failed: ${evidenceFailureMessage(error)}` };
+			return { ok: false, kind: "record_invalid", reason: `BUILD record validation failed: ${evidenceFailureMessage(error)}` };
 		}
 		const currentDigest = buildGateSnapshotDigest({ planDigest: lease.planDigest, build: build.content, diff: diff.content, evidence: evidence.content });
 		if (currentDigest !== lease.snapshotDigest) {
-			return { ok: false, reason: "Gate snapshot changed since dispatch; retry with unchanged evidence" };
+			return { ok: false, kind: "snapshot_changed", reason: "Gate snapshot changed since dispatch; retry with unchanged evidence" };
 		}
 		return { ok: true };
 	}
@@ -1581,7 +1581,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 		return true;
 	}
 
-	async function executeGateEffects(ctx: ExtensionContext, effects: Effect[]): Promise<void> {
+	async function executeGateEffects(ctx: ExtensionContext, effects: Effect[]): Promise<{ ok: true } | { ok: false; reason?: string }> {
 		for (const effect of effects) {
 			switch (effect.kind) {
 				case "clear_artifacts":
@@ -1602,7 +1602,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 						if (violations.length > 0) {
 							ctx.ui.notify(`LeanFlow invariant violation: ${violations.join("; ")}`, "warning");
 						}
-						break;
+						return { ok: false, reason: buildRecord.reason };
 					}
 					if (state.phase === "repair_preparing") {
 						const { effects: readyEffects } = reduceGate(state, {
@@ -1623,6 +1623,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 					break;
 			}
 		}
+		return { ok: true };
 	}
 
 	async function finishGateResult(
@@ -1728,6 +1729,26 @@ export default function leanflow(pi: ExtensionAPI): void {
 	// State restoration on session lifecycle events
 	// -----------------------------------------------------------------------
 
+	/**
+	 * Captures every persisted field session reconciliation may repair so any
+	 * correction — not only phase/lease swaps — is written back durably.
+	 */
+	function reconciliationFingerprint(value: LeanFlowState): string {
+		return JSON.stringify({
+			phase: value.phase,
+			gateAttempt: value.gateAttempt,
+			gateCalls: value.gateCalls,
+			gateRetryMode: value.gateRetryMode,
+			gateLease: value.gateLease,
+			lspLease: value.lspLease,
+			repairLease: value.repairLease,
+			baselineCaptured: value.baselineCaptured,
+			writtenArtifacts: value.writtenArtifacts,
+			stateVersion: value.stateVersion,
+			consecutiveGateErrors: value.consecutiveGateErrors,
+		});
+	}
+
 	const restoreSessionState = async (_event: unknown, ctx: ExtensionContext): Promise<void> => {
 		const branch = ctx.sessionManager.getBranch();
 		hasPersistedLeanFlowState = hasPersistedState(branch);
@@ -1749,9 +1770,10 @@ export default function leanflow(pi: ExtensionAPI): void {
 		pendingGatePlanDigests.clear();
 		pendingEvidenceObservations.clear();
 
-		const phaseBeforeReconciliation = state.phase;
 		const gateLeaseBeforeReconciliation = state.gateLease;
-		const lspLeaseBeforeReconciliation = state.lspLease;
+		const fingerprintBeforeReconcile = reconciliationFingerprint(state);
+		const migratedFromLegacy =
+			rawBeforeRestore !== undefined && rawBeforeRestore.stateVersion !== state.stateVersion;
 		const { effects } = reduceGate(state, { type: "restore_reconcile", now: Date.now() });
 		await executeGateEffects(ctx, effects);
 
@@ -1766,7 +1788,56 @@ export default function leanflow(pi: ExtensionAPI): void {
 			await executeGateEffects(ctx, interrupted.effects);
 		}
 
-		if (state.phase === "building" || state.phase === "repair_preparing") {
+		if (state.phase === "repair_preparing") {
+			// Repair transactions reconcile from their durable lease and BUILD
+			// record only; the generic round reconciliation below would misread
+			// the pending round and corrupt gateAttempt.
+			if (!state.repairLease) {
+				let degraded = false;
+				try {
+					const record = await readBuildRecordForReconciliation(ctx);
+					const fromRound = state.gateAttempt;
+					const toRound = fromRound + 1;
+					if (record.round === fromRound || record.round === toRound) {
+						state.repairLease = { fromRound, toRound, reason: "gate_fail", startedAt: Date.now() };
+					} else {
+						degraded = true;
+					}
+				} catch {
+					degraded = true;
+				}
+				if (degraded) {
+					state.repairLease = undefined;
+					state.phase = "awaiting_human";
+					await writeRunMarker(ctx, "paused");
+					ctx.ui.notify(
+						"LeanFlow: repair preparation could not be recovered; use /flowcontinue or /flowcancel.",
+						"warning",
+					);
+				}
+			}
+			if (state.phase === "repair_preparing" && state.repairLease) {
+				try {
+					const buildRecord = await beginRepairBuildRound(ctx);
+					if (buildRecord.ok) {
+						const { effects: readyEffects } = reduceGate(state, {
+							type: "repair_round_ready",
+							round: buildRecord.round,
+							baselineCaptured: buildRecord.baselinePresent,
+						});
+						await executeGateEffects(ctx, readyEffects);
+					} else {
+						const { effects: repairEffects } = reduceGate(state, {
+							type: "repair_round_failed",
+							reason: buildRecord.reason,
+						});
+						await executeGateEffects(ctx, repairEffects);
+					}
+				} catch {
+					// Reconciliation failure is handled at next preflight.
+				}
+			}
+		} else if (state.phase === "building") {
 			try {
 				const record = await readBuildRecordForReconciliation(ctx);
 				const expected = expectedGateRoundForSnapshot();
@@ -1788,39 +1859,11 @@ export default function leanflow(pi: ExtensionAPI): void {
 			}
 		}
 
-		if (state.phase === "repair_preparing" && state.repairLease) {
-			try {
-				const buildRecord = await beginRepairBuildRound(ctx);
-				if (buildRecord.ok) {
-					const { effects: readyEffects } = reduceGate(state, {
-						type: "repair_round_ready",
-						round: buildRecord.round,
-						baselineCaptured: buildRecord.baselinePresent,
-					});
-					await executeGateEffects(ctx, readyEffects);
-					persist();
-				} else {
-					const { effects: repairEffects } = reduceGate(state, {
-						type: "repair_round_failed",
-						reason: buildRecord.reason,
-					});
-					await executeGateEffects(ctx, repairEffects);
-					persist();
-				}
-			} catch {
-				// Reconciliation failure is handled at next preflight.
-			}
-		}
-
 		const violations = checkInvariants(state);
 		if (violations.length > 0) {
 			ctx.ui.notify(`LeanFlow invariant violation: ${violations.join("; ")}`, "warning");
 		}
-		if (
-			state.phase !== phaseBeforeReconciliation ||
-			state.gateLease !== gateLeaseBeforeReconciliation ||
-			state.lspLease !== lspLeaseBeforeReconciliation
-		) {
+		if (migratedFromLegacy || reconciliationFingerprint(state) !== fingerprintBeforeReconcile) {
 			persist();
 		}
 
@@ -2580,6 +2623,26 @@ export default function leanflow(pi: ExtensionAPI): void {
 				const snapshotCheck = await verifyGateSnapshot(ctx, state.gateLease);
 				if (!snapshotCheck.ok) {
 					ctx.ui.notify(`LeanFlow: ${snapshotCheck.reason}; Gate result was discarded.`, "warning");
+					if (snapshotCheck.kind === "artifact_rebuildable" || snapshotCheck.kind === "snapshot_changed") {
+						const { effects } = reduceGate(state, { type: "snapshot_evidence_invalid", reason: snapshotCheck.reason });
+						await executeGateEffects(ctx, effects);
+						persist();
+						updateStatus(ctx);
+						return;
+					}
+					if (snapshotCheck.kind === "record_invalid" || snapshotCheck.kind === "lease_invalid") {
+						const { effects } = reduceGate(state, { type: "snapshot_record_invalid", reason: snapshotCheck.reason });
+						await executeGateEffects(ctx, effects);
+						persist();
+						updateStatus(ctx);
+						return;
+					}
+					if (snapshotCheck.kind === "plan_drift") {
+						const { effects } = reduceGate(state, { type: "snapshot_plan_drift", reason: snapshotCheck.reason });
+						await executeGateEffects(ctx, effects);
+						await refreshCanonicalPlanState(ctx, "mutation");
+						return;
+					}
 					await finishGateResult(undefined, true, ctx);
 					return;
 				}

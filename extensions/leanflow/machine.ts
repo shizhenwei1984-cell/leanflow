@@ -17,8 +17,23 @@ export type GateEvent =
 	| { type: "restore_reconcile"; now: number }
 	| { type: "repair_round_ready"; round: number; baselineCaptured: boolean }
 	| { type: "repair_round_failed"; reason: string }
+	| { type: "snapshot_evidence_invalid"; reason: string }
+	| { type: "snapshot_record_invalid"; reason: string }
+	| { type: "snapshot_plan_drift"; reason: string }
 	| { type: "human_continue"; now: number }
 	| { type: "human_finish_failed"; now: number };
+
+/**
+ * Classifies a failed Gate snapshot verification so the caller can pick a
+ * typed recovery path instead of one uniform operational retry.
+ */
+export type SnapshotFailureKind =
+	| "artifact_rebuildable"
+	| "record_invalid"
+	| "plan_drift"
+	| "lease_invalid"
+	| "snapshot_changed"
+	| "transport_error";
 
 export type Effect =
 	| { kind: "write_marker"; status: RunMarkerStatus }
@@ -53,6 +68,12 @@ export function reduceGate(state: LeanFlowState, event: GateEvent): { effects: E
 			return reduceRepairRoundReady(state, event as Extract<GateEvent, { type: "repair_round_ready" }>);
 		case "repair_round_failed":
 			return reduceRepairRoundFailed(state, event);
+		case "snapshot_evidence_invalid":
+			return reduceSnapshotEvidenceInvalid(state, event);
+		case "snapshot_record_invalid":
+			return reduceSnapshotRecordInvalid(state, event);
+		case "snapshot_plan_drift":
+			return reduceSnapshotPlanDrift(state);
 		case "human_continue":
 			return reduceHumanContinue(state);
 		case "human_finish_failed":
@@ -70,6 +91,7 @@ export function checkInvariants(state: LeanFlowState): string[] {
 	if (state.phase === "repair_preparing") {
 		if (state.gateRetryMode !== "repair") violations.push("repair_preparing phase requires gateRetryMode=repair");
 		if ((state.writtenArtifacts?.length ?? 0) !== 0) violations.push("repair_preparing phase requires no written artifacts");
+		if (!state.repairLease) violations.push("repair_preparing phase requires a repair lease");
 	}
 	if (state.phase === "awaiting_human" && state.terminalOutcome !== undefined) {
 		violations.push("awaiting_human phase must not have a terminal outcome");
@@ -248,10 +270,28 @@ function reduceRepairRoundReady(
 ): { effects: Effect[] } {
 	if (state.phase !== "repair_preparing") return { effects: [] };
 
+	if (state.repairLease && event.round !== state.repairLease.toRound) {
+		state.repairLease = undefined;
+		state.phase = "awaiting_human";
+		return {
+			effects: [
+				{ kind: "write_marker", status: "paused" },
+				{ kind: "notify", level: "warning", message: `Repair round mismatch: ${event.round} vs lease` },
+			],
+		};
+	}
+	state.gateAttempt = event.round - 1;
+	if (state.gateAttempt < 0) state.gateAttempt = 0;
+	state.gateRetryMode = "repair";
 	state.baselineCaptured = event.baselineCaptured;
 	state.phase = "building";
 	state.repairLease = undefined;
-	return { effects: [] };
+	return {
+		effects: [
+			{ kind: "write_marker", status: "building" },
+			{ kind: "notify", level: "info", message: "Human repair cycle started; rebuild and re-gate." },
+		],
+	};
 }
 
 function reduceRepairRoundFailed(
@@ -306,10 +346,65 @@ function reduceHumanContinue(state: LeanFlowState): { effects: Effect[] } {
 		effects: [
 			{ kind: "clear_artifacts" },
 			{ kind: "begin_repair_round" },
-			{ kind: "write_marker", status: "building" },
-			{ kind: "notify", level: "info", message: "Human repair cycle started; rebuild and re-gate." },
 		],
 	};
+}
+
+function reduceSnapshotEvidenceInvalid(
+	state: LeanFlowState,
+	event: Extract<GateEvent, { type: "snapshot_evidence_invalid" }>,
+): { effects: Effect[] } {
+	if (state.phase !== "gating") return { effects: [] };
+
+	state.gateLease = undefined;
+	state.gateRetryMode = "evidence";
+	state.writtenArtifacts = [];
+	resetConsecutiveGateErrors(state);
+	state.phase = "building";
+	return {
+		effects: [
+			{ kind: "notify", level: "warning", message: `Gate snapshot invalid: ${event.reason}; re-finalize evidence.` },
+		],
+	};
+}
+
+function reduceSnapshotRecordInvalid(
+	state: LeanFlowState,
+	event: Extract<GateEvent, { type: "snapshot_record_invalid" }>,
+): { effects: Effect[] } {
+	if (state.phase !== "gating") return { effects: [] };
+
+	state.gateLease = undefined;
+	state.repairLease = undefined;
+	state.gateRetryMode = undefined;
+	resetConsecutiveGateErrors(state);
+	state.phase = "awaiting_human";
+	return {
+		effects: [
+			{ kind: "write_marker", status: "paused" },
+			{ kind: "notify", level: "warning", message: `BUILD record invalid: ${event.reason}; use /flowcontinue or /flowcancel.` },
+		],
+	};
+}
+
+function reduceSnapshotPlanDrift(state: LeanFlowState): { effects: Effect[] } {
+	if (state.phase !== "gating") return { effects: [] };
+
+	// The approved plan changed under an in-flight Gate: discard the whole
+	// Gate cycle so re-approval starts from a fresh BUILD record round. The
+	// captured baseline and any repair lease belong to the invalidated cycle;
+	// keeping them would violate checkInvariants once the run leaves the
+	// build phases via refreshCanonicalPlanState.
+	state.gateLease = undefined;
+	state.repairLease = undefined;
+	state.baselineCaptured = false;
+	state.gateCalls = 0;
+	state.gateAttempt = 0;
+	state.gateDispatches = 0;
+	state.gateRetryMode = undefined;
+	state.writtenArtifacts = [];
+	resetConsecutiveGateErrors(state);
+	return { effects: [] };
 }
 
 function reduceHumanFinishFailed(state: LeanFlowState): { effects: Effect[] } {

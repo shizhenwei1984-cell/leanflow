@@ -263,6 +263,9 @@ function migrateLegacyGateState(
 	if (version >= STATE_VERSION) {
 		return { phase: rawPhase, gateCalls: rawGateCalls };
 	}
+	if (rawPhase === "repair_preparing") {
+		return { phase: "awaiting_human", gateCalls: rawGateCalls >= 2 ? 1 : rawGateCalls };
+	}
 	if (rawPhase === "gating") {
 		const repair = state.gateRetryMode === "repair";
 		return { phase: "building", gateCalls: repair ? 1 : 0 };
