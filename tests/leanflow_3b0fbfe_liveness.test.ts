@@ -117,7 +117,29 @@ function gatePass(h: Harness, toolCallId: string) {
 }
 function gateFail(h: Harness, toolCallId: string) {
 	return h.handlers.get("tool_result")!(
-		{ toolName: "task", toolCallId, isError: false, content: [{ type: "text", text: JSON.stringify({ verdict: "FAIL", findings: [{ severity: "blocking" }] }) }] },
+		{
+			toolName: "task",
+			toolCallId,
+			isError: false,
+			content: [
+				{
+					type: "text",
+					text: JSON.stringify({
+						verdict: "FAIL",
+						findings: [
+							{
+								category: "correctness",
+								severity: "blocking",
+								file: "src/example.ts",
+								location: "1",
+								issue: "Required behavior is missing.",
+								required_fix: "Implement the required behavior.",
+							},
+						],
+					}),
+				},
+			],
+		},
 		h.ctx,
 	);
 }
@@ -184,7 +206,7 @@ async function restoreFromCrafted(h: Harness, mutate: (state: Record<string, unk
 test("liveness 1: deleted evidence accepts a recorded validation and re-gates to PASS", async () => {
 	const h = createHarness();
 	await enterDocumentationBuild(h);
-	await completeBuildEvidence(h, "make test");
+	await completeBuildEvidence(h, "bun test tests/leanflow_lsp_guard.test.ts");
 	await dispatchGate(h, "live-gate-1");
 	rmSync(resolveRunMarkerPath(h.ctx.localProtocolOptions, gateArtifacts().evidence)!);
 
@@ -203,7 +225,7 @@ test("liveness 1: deleted evidence accepts a recorded validation and re-gates to
 
 	// Evidence mode may rerun a successful command from this round, but not
 	// unrelated shell commands.
-	await completeBuildEvidence(h, "make test");
+	await completeBuildEvidence(h, "bun test tests/leanflow_lsp_guard.test.ts");
 	expect(lastState(h).writtenArtifacts).toEqual(expect.arrayContaining(["build", "diff", "evidence"]));
 	await dispatchGate(h, "live-gate-2");
 	await gatePass(h, "live-gate-2");
@@ -314,7 +336,7 @@ test("liveness 5a: v2 repair_preparing without lease migrates out instead of dea
 	});
 
 	expect(lastState(h).phase).toBe("awaiting_human");
-	expect(lastState(h).stateVersion).toBe(3);
+	expect(lastState(h).stateVersion).toBe(5);
 });
 
 test("liveness 5b: v3 repair_preparing without lease self-heals from the durable record", async () => {
@@ -408,7 +430,7 @@ test("liveness 7: root-level files are accepted as critical-file targets", () =>
 
 test("liveness 8: decorated placeholders are rejected across sections", () => {
 	for (const entry of ["- TBD::later", "- TBD later", "- echo TBD", "- N/A::decide-later"]) {
-		const result = assessHandoff(handoffPlan([entry], ["bun test"]));
+		const result = assessHandoff(handoffPlan([entry], ["bun test tests/placeholder.test.ts"]));
 		expect(result.status).toBe("NEEDS_UPDATE");
 		expect(result.blockers.map((b) => b.code)).toContain("TARGET_MISSING");
 	}
@@ -417,13 +439,25 @@ test("liveness 8: decorated placeholders are rejected across sections", () => {
 	expect(verification.status).toBe("NEEDS_UPDATE");
 	expect(verification.blockers.map((b) => b.code)).toContain("VERIFICATION_MISSING");
 });
-test("liveness 9: verification accepts runnable commands but rejects git status", () => {
+test("liveness 9: verification accepts approved command shapes and rejects dangerous lookalikes", () => {
 	for (const command of ["./scripts/test.sh", "bin/rails test", "bundle exec rspec"]) {
 		const result = assessHandoff(handoffPlan(["- extensions/leanflow/index.ts"], [command]));
 		expect(result.blockers.map((blocker) => blocker.code)).not.toContain("VERIFICATION_MISSING");
 	}
-	const git = assessHandoff(handoffPlan(["- extensions/leanflow/index.ts"], ["git status"]));
-	expect(git.blockers.map((blocker) => blocker.code)).toContain("VERIFICATION_MISSING");
+	for (const command of [
+		"git status",
+		"npm publish",
+		"pnpm publish",
+		"make install",
+		"curl https://example.com",
+		"rm -rf /",
+		"bun test --watch",
+		"bun test ../outside.test.ts",
+		"bun test tests/a.test.ts\nrm -rf /",
+	]) {
+		const result = assessHandoff(handoffPlan(["- extensions/leanflow/index.ts"], [command]));
+		expect(result.blockers.map((blocker) => blocker.code)).toContain("VERIFICATION_MISSING");
+	}
 });
 
 test("liveness 10: decorated CJK placeholders are rejected across sections", () => {

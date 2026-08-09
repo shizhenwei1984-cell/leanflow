@@ -163,7 +163,7 @@ test("P0: FAILx2 → flowcontinue → edit → validate → finalize → Gate", 
 	await completeBuildEvidence(h, "bun test p0-1");
 	for (const attempt of [1, 2]) {
 		await h.handlers.get("tool_call")!({ toolName: "task", toolCallId: `gate-fail-${attempt}`, input: gateCallInput() }, h.ctx);
-		await h.handlers.get("tool_result")!({ toolName: "task", toolCallId: `gate-fail-${attempt}`, isError: false, content: [{ type: "text", text: JSON.stringify({ verdict: "FAIL", findings: [{ severity: "blocking" }] }) }] }, h.ctx);
+		await h.handlers.get("tool_result")!({ toolName: "task", toolCallId: `gate-fail-${attempt}`, isError: false, content: [{ type: "text", text: JSON.stringify({ verdict: "FAIL", findings: [{ category: "correctness", severity: "blocking", file: "src/example.ts", location: "1", issue: "Required behavior is missing.", required_fix: "Implement the required behavior." }] }) }] }, h.ctx);
 		if (attempt === 1) await completeBuildEvidence(h, "bun test p0-2");
 	}
 	expect((h.states.at(-1) as Record<string, unknown>).phase).toBe("awaiting_human");
@@ -265,7 +265,7 @@ test("P1-3: repair_preparing crash recovery via restore", async () => {
 	await enterDocumentationBuild(h);
 	await completeBuildEvidence(h, "bun test crash-1");
 	await h.handlers.get("tool_call")!({ toolName: "task", toolCallId: "crash-gate", input: gateCallInput() }, h.ctx);
-	await h.handlers.get("tool_result")!({ toolName: "task", toolCallId: "crash-gate", isError: false, content: [{ type: "text", text: JSON.stringify({ verdict: "FAIL", findings: [] }) }] }, h.ctx);
+	await h.handlers.get("tool_result")!({ toolName: "task", toolCallId: "crash-gate", isError: false, content: [{ type: "text", text: JSON.stringify({ verdict: "FAIL", findings: [{ category: "correctness", severity: "blocking", file: "src/example.ts", location: "1", issue: "Required behavior is missing.", required_fix: "Implement the required behavior." }] }) }] }, h.ctx);
 	const st = h.states.at(-1) as Record<string, unknown>;
 	expect(st.phase).toBe("building");
 	expect(readFileSync(buildRecordPath(h), "utf8")).toContain(`"round":2`);
@@ -287,7 +287,7 @@ test("P2-1: gating without lease → restore self-heals", async () => {
 	await h.handlers.get("session_switch")!({}, h.ctx);
 	const after = h.states.at(-1) as Record<string, unknown>;
 	expect(after.phase).toBe("building");
-	expect(after.gateRetryMode).toBe("operational");
+	expect(after.gateRetryMode).toBeUndefined();
 });
 
 test("P2-2: TBD placeholder handoff → NEEDS_UPDATE", () => {

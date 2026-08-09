@@ -83,7 +83,7 @@ class WorkflowPromptTest(unittest.TestCase):
         index = (ROOT / "extensions" / "leanflow" / "index.ts").read_text(encoding="utf-8")
         # Split out the planner prompt builder body.
         start = index.index("function buildPlanningPrompt")
-        end = index.index("function extractVerdict")
+        end = index.index("interface ParsedGateResult")
         planner = index[start:end]
         self.assertNotIn("outputSchema", planner)
         self.assertNotIn('"verdict"', planner)

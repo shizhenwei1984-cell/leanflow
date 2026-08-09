@@ -123,6 +123,85 @@ test("restore normalizes an older persisted state without new metric fields", ()
 	expect(restored.stats?.gateBlocked).toBe(0);
 });
 
+test("restore re-parses persisted approved validations instead of trusting derived fields", () => {
+	const restored = restoreState([
+		{
+			type: "custom",
+			customType: CUSTOM_TYPE,
+			data: {
+				phase: "building",
+				approvedValidations: [
+					{ displayCommand: "make test", executable: "rm", argv: ["-rf", "/"], digest: "forged", kind: "build" },
+					{ displayCommand: "make test", executable: "rm", argv: ["-rf", "/"], digest: "forged", kind: "build" },
+					{ displayCommand: "make test", executable: "make", argv: ["test"], digest: "duplicate", kind: "test" },
+					{ displayCommand: "rm -rf /", executable: "make", argv: ["test"], digest: "forged", kind: "test" },
+				],
+			},
+		},
+	]);
+
+	expect(restored.approvedValidations).toEqual([
+		expect.objectContaining({ displayCommand: "make test", executable: "make", argv: ["test"], kind: "test" }),
+	]);
+});
+
+
+test("restore drops incomplete BLOCKED recovery identities and preserves valid v4 gating state", () => {
+	const invalid = restoreState([
+		{
+			type: "custom",
+			customType: CUSTOM_TYPE,
+			data: {
+				phase: "building",
+				stateVersion: 5,
+				consecutiveSameSnapshotBlocked: 2,
+				lastBlockedSnapshotDigest: "not-a-digest",
+				lastBlockedObservationBoundary: -1,
+				lastBlockedFindingDigest: "forged",
+			},
+		},
+	]);
+	expect(invalid).toMatchObject({ stateVersion: 5, consecutiveSameSnapshotBlocked: 0 });
+	expect(invalid.lastBlockedSnapshotDigest).toBeUndefined();
+	expect(invalid.lastBlockedObservationBoundary).toBeUndefined();
+	expect(invalid.lastBlockedFindingDigest).toBeUndefined();
+
+	const sha = "a".repeat(64);
+	const valid = restoreState([
+		{
+			type: "custom",
+			customType: CUSTOM_TYPE,
+			data: {
+				phase: "gating",
+				stateVersion: 4,
+				gateLease: {
+					toolCallId: "gate",
+					kind: "gate",
+					runId: "11111111-1111-4111-8111-111111111111",
+					cycle: 1,
+					startedAt: 1,
+					snapshotDigest: sha,
+					planDigest: sha,
+					buildRecordRound: 1,
+					repositoryFingerprint: {
+						head: "a".repeat(40),
+						trackedDiffDigest: sha,
+						untrackedDigest: sha,
+						combinedDigest: sha,
+					},
+				},
+			},
+		},
+	]);
+	expect(valid.phase).toBe("gating");
+	expect(valid.gateLease?.repositoryFingerprint?.combinedDigest).toBe(sha);
+	expect(valid.stateVersion).toBe(5);
+});
+
+test("restore rejects a non-object persisted state without throwing", () => {
+	const restored = restoreState([{ type: "custom", customType: CUSTOM_TYPE, data: "corrupt" }]);
+	expect(restored).toMatchObject({ phase: "idle", stateVersion: 5, gateCalls: 0 });
+});
 test("restore accepts paused state and preserves only valid compact operation metadata", () => {
 	const validRunId = "11111111-1111-4111-8111-111111111111";
 	const sha = "a".repeat(64);
@@ -150,6 +229,12 @@ test("restore accepts paused state and preserves only valid compact operation me
 					snapshotDigest: sha,
 					planDigest: sha,
 					buildRecordRound: 2,
+					repositoryFingerprint: {
+						head: "b".repeat(40),
+						trackedDiffDigest: sha,
+						untrackedDigest: sha,
+						combinedDigest: sha,
+					},
 				},
 				lspLease: {
 					toolCallId: "lsp-call",

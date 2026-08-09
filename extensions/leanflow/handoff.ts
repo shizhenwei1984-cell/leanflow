@@ -1,4 +1,5 @@
 import type { HandoffStatus } from "./state";
+import { parseApprovedValidation, type ApprovedValidation } from "./validation";
 
 export type HandoffBlockerCode =
 	| "TARGET_MISSING"
@@ -17,8 +18,6 @@ export interface HandoffResult {
 	warnings: string[];
 }
 
-const TARGET_PATH =
-	/\b[\w.-]+\/[\w./-]+\.(?:ts|tsx|js|py|md|json|yml|yaml|pm|pl|go|rs|toml|lock|mk|mod|sum|gradle)\b|\bDockerfile\b|\bMakefile\b|\bgo\.mod\b|\bgo\.sum\b/i;
 const TARGET_PATH_OCCURRENCES =
 	/\b[\w.-]+\/[\w./-]+\.(?:ts|tsx|js|py|md|json|yml|yaml|pm|pl|go|rs|toml|lock|mk|mod|sum|gradle)\b|\bDockerfile\b|\bMakefile\b|\bgo\.mod\b|\bgo\.sum\b/gi;
 const BEHAVIOR_VERB =
@@ -32,8 +31,16 @@ const PLACEHOLDER_TOKENS =
 	/^(?:TBD|N\/A|\?|unknown|待定|待补充|none|nope|todo|fixme)$/i;
 const DECORATED_PLACEHOLDER = /^(?:TBD|N\/A|TODO|unknown)\b/i;
 const DECORATED_PLACEHOLDER_CJK = /^(?:待定|待补充)/;
-const EXECUTABLE_TOKENS = /^(?:bun|bunx|npm|npx|pnpm|yarn|pytest|python|python3|ruby|bundle|rake|rails|go|cargo|make|tsc)$/i;
-const PATH_EXECUTABLE = /^(?:\.{1,2}\/|bin\/|scripts\/)[\w./-]+$/;
+const ROOT_SPECIAL_FILES = new Set([
+	"package.json",
+	"README.md",
+	".gitignore",
+	"Dockerfile",
+	"Makefile",
+	"Gemfile",
+	"Cargo.toml",
+	"tsconfig.json",
+]);
 
 function normalizeEntry(line: string): string {
 	return line
@@ -56,12 +63,16 @@ function isDecoratedPlaceholder(value: string): boolean {
 	if (/^(?:echo|printf)\s+(?:TBD|N\/A|unknown|TODO)\b/i.test(n)) return true;
 	return false;
 }
-
 function isValidRepoPath(value: string): boolean {
 	const trimmed = value.trim();
-	if (!trimmed || trimmed.startsWith("/") || trimmed.includes("\0") || trimmed.includes("..")) return false;
+	if (!trimmed || trimmed === "." || trimmed === ".." || trimmed.startsWith("/") || trimmed.includes("\0") || trimmed.includes("..")) {
+		return false;
+	}
 	if (isDecoratedPlaceholder(trimmed)) return false;
-	return /^[\w.-]+(\/[\w./-]+)*$/.test(trimmed);
+	if (!/^[\w.-]+(\/[\w./-]+)*$/.test(trimmed)) return false;
+	if (!trimmed.includes("/")) return ROOT_SPECIAL_FILES.has(trimmed) || trimmed.includes(".");
+	const basename = trimmed.slice(trimmed.lastIndexOf("/") + 1);
+	return basename.includes(".");
 }
 
 function parseTarget(entry: string): { path: string; symbol?: string } | undefined {
@@ -122,45 +133,6 @@ function sliceSection(lines: string[], headingPattern: RegExp): string[] {
 	return [];
 }
 
-function parseArgvLoosely(command: string): string[] | undefined {
-	const trimmed = command.trim();
-	if (!trimmed || trimmed.startsWith("#")) return undefined;
-	const args: string[] = [];
-	let current = "";
-	let quote: string | undefined;
-	let escaped = false;
-	for (const ch of trimmed) {
-		if (escaped) {
-			current += ch;
-			escaped = false;
-			continue;
-		}
-		if (ch === "\\" && quote !== "'") {
-			escaped = true;
-			continue;
-		}
-		if (quote) {
-			if (ch === quote) quote = undefined;
-			else current += ch;
-			continue;
-		}
-		if (ch === '"' || ch === "'") {
-			quote = ch;
-			continue;
-		}
-		if (/\s/.test(ch)) {
-			if (current) {
-				args.push(current);
-				current = "";
-			}
-			continue;
-		}
-		current += ch;
-	}
-	if (quote || escaped) return undefined;
-	if (current) args.push(current);
-	return args.length > 0 ? args : undefined;
-}
 
 function hasVerificationEvidence(lines: string[]): boolean {
 	const section = sliceSection(lines, /verification|验证/i);
@@ -169,33 +141,25 @@ function hasVerificationEvidence(lines: string[]): boolean {
 	const fenceBlocks: string[] = [];
 	const fenceRe = /(```|~~~)[^\n]*\n([\s\S]*?)\n\1/g;
 	let match: RegExpExecArray | null;
-	while ((match = fenceRe.exec(text)) !== null) {
-		fenceBlocks.push(match[2] ?? "");
-	}
+	while ((match = fenceRe.exec(text)) !== null) fenceBlocks.push(match[2] ?? "");
+	let validFencedCommand = false;
 	for (const block of fenceBlocks) {
 		for (const rawLine of block.split(/\r?\n/)) {
 			const normalized = normalizeEntry(rawLine);
-			if (!normalized || isPlaceholder(normalized) || isDecoratedPlaceholder(normalized)) continue;
-			if (normalized.startsWith("#")) continue;
-			const args = parseArgvLoosely(normalized);
-			if (!args) continue;
-			if (isDecoratedPlaceholder(args[0]!) || isPlaceholder(args[0]!)) continue;
-			if (args.length === 1 && (isPlaceholder(args[0]!) || isDecoratedPlaceholder(args[0]!))) continue;
-			if (!EXECUTABLE_TOKENS.test(args[0]!) && !PATH_EXECUTABLE.test(args[0]!)) continue;
-			return true;
+			if (!normalized || normalized.startsWith("#")) continue;
+			if (isPlaceholder(normalized) || isDecoratedPlaceholder(normalized) || !parseApprovedValidation(normalized)) {
+				return false;
+			}
+			validFencedCommand = true;
 		}
 	}
+	if (validFencedCommand) return true;
 	for (const line of section) {
 		const inline = /`([^`]+)`/g;
-		let im: RegExpExecArray | null;
-		while ((im = inline.exec(line)) !== null) {
-			const normalized = normalizeEntry(im[1] ?? "");
-			if (!normalized || isPlaceholder(normalized) || isDecoratedPlaceholder(normalized)) continue;
-			const args = parseArgvLoosely(normalized);
-			if (!args) continue;
-			if (isDecoratedPlaceholder(args[0]!) || isPlaceholder(args[0]!)) continue;
-			if (!EXECUTABLE_TOKENS.test(args[0]!) && !PATH_EXECUTABLE.test(args[0]!)) continue;
-			return true;
+		let matchInline: RegExpExecArray | null;
+		while ((matchInline = inline.exec(line)) !== null) {
+			const normalized = normalizeEntry(matchInline[1] ?? "");
+			if (normalized && !isPlaceholder(normalized) && !isDecoratedPlaceholder(normalized) && parseApprovedValidation(normalized)) return true;
 		}
 	}
 	return false;
@@ -203,6 +167,7 @@ function hasVerificationEvidence(lines: string[]): boolean {
 
 function hasAcceptanceEvidence(lines: string[]): boolean {
 	const section = sliceSection(lines, /acceptance|验收/i);
+
 	if (section.length === 0) return false;
 	for (const line of section) {
 		const trimmed = line.trim();
@@ -218,6 +183,27 @@ function hasAcceptanceEvidence(lines: string[]): boolean {
 	}
 	return false;
 }
+/** Extracts the exact non-shell validation commands approved in a plan. */
+export function approvedValidationsFromPlan(content: string): ApprovedValidation[] {
+	const section = sliceSection(content.split(/\r?\n/), /verification|验证/i);
+	const candidates: string[] = [];
+	const text = section.join("\n");
+	const fenceRe = /(```|~~~)[^\n]*\n([\s\S]*?)\n\1/g;
+	let fence: RegExpExecArray | null;
+	while ((fence = fenceRe.exec(text)) !== null) candidates.push(...(fence[2] ?? "").split(/\r?\n/));
+	for (const line of section) {
+		const inline = /`([^`]+)`/g;
+		let match: RegExpExecArray | null;
+		while ((match = inline.exec(line)) !== null) candidates.push(match[1] ?? "");
+	}
+	const seen = new Set<string>();
+	return candidates.flatMap((candidate) => {
+		const parsed = parseApprovedValidation(normalizeEntry(candidate));
+		if (!parsed || seen.has(parsed.digest)) return [];
+		seen.add(parsed.digest);
+		return [parsed];
+	});
+}
 
 export function assessHandoff(planContent: string): HandoffResult {
 	const lines = planContent.split(/\r?\n/).filter((line) => !METADATA_LINE.test(line));
@@ -225,7 +211,7 @@ export function assessHandoff(planContent: string): HandoffResult {
 	const blockers: HandoffBlocker[] = [];
 	const warnings: string[] = [];
 
-	if (!TARGET_PATH.test(content) && !hasCriticalFilesEntries(lines)) {
+	if (!hasCriticalFilesEntries(lines)) {
 		blockers.push({
 			code: "TARGET_MISSING",
 			detail: "Plan has no repository-relative target path or populated Critical files section.",

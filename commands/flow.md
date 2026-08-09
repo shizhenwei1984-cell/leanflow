@@ -91,7 +91,7 @@ task({
 
 - `PASS`: is a settled verdict that consumes one of the two verdict attempts in the current repair cycle, then finishes. Do not create another reviewer or audit.
 - `FAIL`: consumes one of the two settled-verdict attempts in the current repair cycle. On the first `FAIL`, Main repairs, re-runs required validation, refreshes diff/build/evidence artifacts, then calls Gate once more. On the second `FAIL`, LeanFlow pauses in `awaiting_human`; do not create further agents. The user may run `/flowcontinue [note]` to begin a human repair cycle (the verdict budget resets) or `/flowfinishfailed` to mark the run failed and finalize it.
-- `BLOCKED`: required evidence is insufficient, inconsistent, unreadable, or does not match the run. It does not consume a verdict attempt and returns LeanFlow to BUILD to re-validate and re-finalize artifacts without source changes. Operational Gate errors likewise return to BUILD without consuming a verdict attempt.
+- `BLOCKED`: required evidence is insufficient, inconsistent, unreadable, or does not match the run. It does not consume a verdict attempt and returns LeanFlow to BUILD to run only exact approved Verification commands, add a new successful approved-validation observation, and re-finalize artifacts without source changes. Repeating the same BLOCKED finding with unchanged plan, repository fingerprint, and approved-validation evidence pauses in `awaiting_human` instead of looping; unrelated LSP observations do not count as progress. Operational Gate errors likewise return to BUILD without consuming a verdict attempt.
 - `/flowstatus` is read-only and shows the current phase, verdict budget, dispatches, blocked count, and Gate readiness.
 
 ## Limits

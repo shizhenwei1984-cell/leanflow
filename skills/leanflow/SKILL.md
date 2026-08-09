@@ -42,7 +42,7 @@ The `/flow` command initializes an extension state machine (`idle â†’ planning â
 
 ## Evidence
 
-Main writes only `local://<slug>-plan.md`. After the required initial LSP probe, `leanflow_capture_baseline({})` freezes HEAD/status in an extension-owned record. Main runs validations synchronously, then `leanflow_finalize_artifacts({ validationCommands: [...] })` mechanically generates and verifies `local://<slug>-build.md`, `local://<slug>-diff.md`, and `local://<slug>-evidence.md`; direct writes are blocked. Gate reads all four artifacts by reference and has no shell access. Repair rounds retain the original baseline, clear prior-round observations, rerun validations, and regenerate artifacts.
+Main writes only `local://<slug>-plan.md`. After the required initial LSP probe, `leanflow_capture_baseline({})` freezes HEAD/status in an extension-owned record. Main runs validations synchronously, then `leanflow_finalize_artifacts({ validationCommands: [...] })` mechanically generates and verifies `local://<slug>-build.md`, `local://<slug>-diff.md`, and `local://<slug>-evidence.md`; direct writes are blocked. Gate reads all four artifacts by reference and has no shell access. Repair rounds retain the original baseline, clear prior-round observations, rerun validations, and regenerate artifacts. Evidence recovery permits only exact commands parsed from the approved plan's Verification section; a new successful approved-validation observation resets the repeated-BLOCKED detector, while unchanged plan/repository/approved-validation evidence with the same BLOCKED finding pauses for human action. Unrelated LSP observations do not count as recovery progress.
 
 ## Model roles
 

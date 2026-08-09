@@ -1,3 +1,4 @@
+import { parseApprovedValidation, type ApprovedValidation } from "./validation";
 /**
  * LeanFlow state machine types and persistence.
  *
@@ -39,6 +40,13 @@ export type LspProbeStatus = "not_required" | "pending" | "completed";
 export type GateOutcome = "PASS" | "FAIL" | "BLOCKED";
 export type OperationLeaseKind = "gate" | "lsp";
 
+export interface RepositoryFingerprint {
+	head: string;
+	trackedDiffDigest: string;
+	untrackedDigest: string;
+	combinedDigest: string;
+}
+
 export interface OperationLease {
 	toolCallId: string;
 	kind: OperationLeaseKind;
@@ -52,6 +60,8 @@ export interface OperationLease {
 	planDigest?: string;
 	/** Durable BUILD record round validated at dispatch; gate leases only. */
 	buildRecordRound?: number;
+	/** Immutable repository state captured at Gate dispatch; gate leases only. */
+	repositoryFingerprint?: RepositoryFingerprint;
 	/** Diagnostics target; LSP leases only. */
 	lspTarget?: string;
 }
@@ -134,6 +144,8 @@ export interface LeanFlowState {
 	/** Structured handoff blocker codes, without human-readable details. */
 	handoffBlockers?: string[];
 	/** Branch index immediately after the exact proposal request was dispatched. */
+	/** Exact Verification commands approved with the canonical plan. */
+	approvedValidations?: ApprovedValidation[];
 	proposalBoundary?: number;
 	/** Canonical artifact named by the successful xd://propose request. */
 	proposedPlanArtifact?: string;
@@ -181,6 +193,13 @@ export interface LeanFlowState {
 	writtenArtifacts?: string[];
 	/** Per-cycle consecutive operational Gate errors used for the 4-error pause cap; reset on PASS/FAIL/BLOCKED and /flowcontinue. */
 	consecutiveGateErrors?: number;
+	/** Bounded evidence-recovery loop detector for repeated BLOCKED Gate outcomes. */
+	/** Digest of plan + repository fingerprint + successful approved validation evidence; excludes unrelated LSP observations. */
+	lastBlockedSnapshotDigest?: string;
+	/** Number of successful approved validation observations at the BLOCKED boundary. */
+	lastBlockedObservationBoundary?: number;
+	lastBlockedFindingDigest?: string;
+	consecutiveSameSnapshotBlocked?: number;
 	/** Persisted repair transaction lease for crash recovery. */
 	repairLease?: RepairLease;
 	/** Persisted workflow schema version; absence implies v1 (pre-7614368). */
@@ -220,6 +239,7 @@ export function defaultState(): LeanFlowState {
 		gateDispatches: 0,
 		gateAttempt: 0,
 		humanRepairCycles: 0,
+		consecutiveSameSnapshotBlocked: 0,
 		consecutiveGateErrors: 0,
 		stateVersion: STATE_VERSION,
 		lspProbeStatus: "pending",
@@ -243,24 +263,29 @@ export function hasPersistedState(branch: Iterable<BranchEntry>): boolean {
 
 /** Walk the session branch and restore the latest persisted state. */
 export function restoreState(branch: Iterable<BranchEntry>): LeanFlowState {
-	let latest: LeanFlowState | undefined;
+	let latest: unknown;
 	for (const entry of branch) {
 		if (entry.type === "custom" && entry.customType === CUSTOM_TYPE) {
-			latest = entry.data as LeanFlowState;
+			latest = entry.data;
 		}
 	}
 	return normalizeState(latest);
 }
 
-export const STATE_VERSION = 3;
+export const STATE_VERSION = 5;
 
 function migrateLegacyGateState(
 	state: LeanFlowState,
 	rawPhase: LeanFlowPhase,
 ): { phase: LeanFlowPhase; gateCalls: number } {
-	const version = typeof (state as Record<string, unknown>).stateVersion === "number" ? (state.stateVersion as number) : 1;
+	const version = typeof state.stateVersion === "number" ? state.stateVersion : 1;
 	const rawGateCalls = numberOr(state.gateCalls, 0);
-	if (version >= STATE_VERSION) {
+	if (version >= 4) return { phase: rawPhase, gateCalls: rawGateCalls };
+	if (version === 3) {
+		if (rawPhase === "gating") {
+			const repair = state.gateRetryMode === "repair";
+			return { phase: "building", gateCalls: repair ? 1 : 0 };
+		}
 		return { phase: rawPhase, gateCalls: rawGateCalls };
 	}
 	if (rawPhase === "repair_preparing") {
@@ -293,8 +318,66 @@ function normalizeRepairLease(value: unknown): RepairLease | undefined {
 	return { fromRound, toRound, reason: lease.reason, startedAt };
 }
 
-function normalizeState(value: LeanFlowState | undefined): LeanFlowState {
-	const state = value ?? defaultState();
+function normalizeApprovedValidations(value: unknown): ApprovedValidation[] | undefined {
+	if (!Array.isArray(value)) return undefined;
+	const seen = new Set<string>();
+	return value.flatMap((candidate) => {
+		if (
+			typeof candidate !== "object" ||
+			candidate === null ||
+			!("displayCommand" in candidate) ||
+			typeof candidate.displayCommand !== "string"
+		) {
+			return [];
+		}
+		const parsed = parseApprovedValidation(candidate.displayCommand);
+		if (!parsed || seen.has(parsed.digest)) return [];
+		seen.add(parsed.digest);
+		return [parsed];
+	});
+}
+
+function normalizeBlockedEvidenceRecovery(
+	state: LeanFlowState,
+): Pick<
+	LeanFlowState,
+	"lastBlockedSnapshotDigest" | "lastBlockedObservationBoundary" | "lastBlockedFindingDigest" | "consecutiveSameSnapshotBlocked"
+> {
+	const snapshot = state.lastBlockedSnapshotDigest;
+	const boundary = state.lastBlockedObservationBoundary;
+	const finding = state.lastBlockedFindingDigest;
+	const count = state.consecutiveSameSnapshotBlocked;
+	if (
+		typeof snapshot !== "string" ||
+		!/^[a-f0-9]{64}$/.test(snapshot) ||
+		typeof boundary !== "number" ||
+		!Number.isInteger(boundary) ||
+		boundary < 0 ||
+		typeof finding !== "string" ||
+		!/^finding-[a-f0-9]{64}$/.test(finding) ||
+		typeof count !== "number" ||
+		!Number.isInteger(count) ||
+		count < 1
+	) {
+		return { consecutiveSameSnapshotBlocked: 0 };
+	}
+	return {
+		lastBlockedSnapshotDigest: snapshot,
+		lastBlockedObservationBoundary: boundary,
+		lastBlockedFindingDigest: finding,
+		consecutiveSameSnapshotBlocked: Math.min(2, count),
+	};
+}
+function normalizeState(value: unknown): LeanFlowState {
+	const persistedVersion =
+		typeof value === "object" && value !== null && !Array.isArray(value) && "stateVersion" in value
+			? value.stateVersion
+			: undefined;
+	const state =
+		typeof value === "object" && value !== null && !Array.isArray(value)
+			? { ...defaultState(), ...value }
+			: defaultState();
+	state.stateVersion = typeof persistedVersion === "number" ? persistedVersion : undefined;
 	const rawPhase = isPhase(state.phase) ? state.phase : "idle";
 	const migrated = migrateLegacyGateState(state, rawPhase);
 	const phase = migrated.phase;
@@ -338,6 +421,7 @@ function normalizeState(value: LeanFlowState | undefined): LeanFlowState {
 			state.persistenceFailureStage === "pointer"
 				? state.persistenceFailureStage
 				: undefined,
+		approvedValidations: normalizeApprovedValidations(state.approvedValidations),
 		persistenceFailurePath:
 			typeof state.persistenceFailurePath === "string" ? state.persistenceFailurePath : undefined,
 		persistenceFailureCode:
@@ -370,7 +454,8 @@ function normalizeState(value: LeanFlowState | undefined): LeanFlowState {
 			typeof state.consecutiveGateErrors === "number" && Number.isFinite(state.consecutiveGateErrors) && state.consecutiveGateErrors >= 0
 				? Math.floor(state.consecutiveGateErrors)
 				: 0,
-		repairLease: normalizeRepairLease((state as Record<string, unknown>).repairLease),
+		...normalizeBlockedEvidenceRecovery(state),
+		repairLease: normalizeRepairLease(state.repairLease),
 		terminalOutcome:
 			state.terminalOutcome === "pass" ||
 			state.terminalOutcome === "fail_after_retry" ||
@@ -467,6 +552,7 @@ function normalizeOperationLease(value: unknown): OperationLease | undefined {
 		planDigest?: unknown;
 		buildRecordRound?: unknown;
 		lspTarget?: unknown;
+		repositoryFingerprint?: unknown;
 	};
 	const cycle = optionalNumber(lease.cycle);
 	const startedAt = optionalNumber(lease.startedAt);
@@ -485,6 +571,10 @@ function normalizeOperationLease(value: unknown): OperationLease | undefined {
 		const snapshotDigest = typeof lease.snapshotDigest === "string" && SHA256_PATTERN.test(lease.snapshotDigest) ? lease.snapshotDigest : undefined;
 		const planDigest = typeof lease.planDigest === "string" && SHA256_PATTERN.test(lease.planDigest) ? lease.planDigest : undefined;
 		const buildRecordRound = optionalNumber(lease.buildRecordRound);
+		const repositoryFingerprint = normalizeRepositoryFingerprint(lease.repositoryFingerprint);
+		if (!snapshotDigest || !planDigest || buildRecordRound === undefined || !Number.isInteger(buildRecordRound) || buildRecordRound < 1 || !repositoryFingerprint) {
+			return undefined;
+		}
 		return {
 			toolCallId: lease.toolCallId,
 			kind: lease.kind,
@@ -493,7 +583,8 @@ function normalizeOperationLease(value: unknown): OperationLease | undefined {
 			startedAt,
 			snapshotDigest,
 			planDigest,
-			buildRecordRound: buildRecordRound !== undefined && Number.isInteger(buildRecordRound) && buildRecordRound >= 1 ? buildRecordRound : undefined,
+			buildRecordRound,
+			repositoryFingerprint,
 		};
 	}
 	return {
@@ -505,6 +596,29 @@ function normalizeOperationLease(value: unknown): OperationLease | undefined {
 		lspTarget: typeof lease.lspTarget === "string" ? lease.lspTarget : undefined,
 	};
 }
+function normalizeRepositoryFingerprint(value: unknown): RepositoryFingerprint | undefined {
+	if (typeof value !== "object" || value === null) return undefined;
+	const fingerprint = value as Partial<RepositoryFingerprint>;
+	if (
+		typeof fingerprint.head !== "string" ||
+		!/^[0-9a-f]{40,64}$/i.test(fingerprint.head) ||
+		typeof fingerprint.trackedDiffDigest !== "string" ||
+		!SHA256_PATTERN.test(fingerprint.trackedDiffDigest) ||
+		typeof fingerprint.untrackedDigest !== "string" ||
+		!SHA256_PATTERN.test(fingerprint.untrackedDigest) ||
+		typeof fingerprint.combinedDigest !== "string" ||
+		!SHA256_PATTERN.test(fingerprint.combinedDigest)
+	) {
+		return undefined;
+	}
+	return {
+		head: fingerprint.head,
+		trackedDiffDigest: fingerprint.trackedDiffDigest,
+		untrackedDigest: fingerprint.untrackedDigest,
+		combinedDigest: fingerprint.combinedDigest,
+	};
+}
+
 function normalizeLspProbeStatus(state: LeanFlowState): LspProbeStatus {
 	if (state.lspProbeStatus === "not_required" || state.lspProbeStatus === "pending" || state.lspProbeStatus === "completed") {
 		return state.lspProbeStatus;

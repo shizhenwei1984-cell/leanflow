@@ -25,6 +25,15 @@ function sha64(char: string): string {
 	return char.repeat(64);
 }
 
+function repositoryFingerprint() {
+	return {
+		head: "c".repeat(40),
+		trackedDiffDigest: sha64("c"),
+		untrackedDigest: sha64("d"),
+		combinedDigest: sha64("e"),
+	};
+}
+
 function dispatch(state = buildingState(), toolCallId = "gate-1") {
 	const result = reduceGate(state, {
 		type: "gate_dispatch",
@@ -33,6 +42,7 @@ function dispatch(state = buildingState(), toolCallId = "gate-1") {
 		snapshotDigest: sha64("a"),
 		planDigest: sha64("b"),
 		buildRecordRound: 1,
+		repositoryFingerprint: repositoryFingerprint(),
 		now: 10,
 	});
 	expect(result.effects).toEqual([]);
@@ -55,6 +65,7 @@ test("dispatch records a persisted lease without consuming a Gate verdict", () =
 		snapshotDigest: sha64("a"),
 		planDigest: sha64("b"),
 		buildRecordRound: 1,
+		repositoryFingerprint: repositoryFingerprint(),
 	});
 	expect(checkInvariants(state)).toEqual([]);
 });
@@ -152,10 +163,12 @@ test("BLOCKED returns to BUILD without consuming a verdict", () => {
 	expect(state).toMatchObject({ phase: "building", gateCalls: 0, gateRetryMode: "evidence", gateLease: undefined });
 	expect(state.stats).toMatchObject({ gateBlocked: 1 });
 	expect(effects.map((effect) => effect.kind)).toEqual(["clear_artifacts", "notify"]);
+	expect(checkInvariants(state)).toEqual([]);
 });
 
 test("operational errors return to BUILD until the fourth error pauses the run", () => {
 	const state = buildingState();
+
 	state.baselineCaptured = true;
 	let effects: Effect[] = [];
 
@@ -175,6 +188,46 @@ test("operational errors return to BUILD until the fourth error pauses the run",
 	expect(state.stats).toMatchObject({ gateErrors: 4 });
 	expect(effects.map((effect) => effect.kind)).toEqual(["write_marker", "notify"]);
 	expect(effects[0]).toEqual({ kind: "write_marker", status: "paused" });
+});
+test("second identical BLOCKED pauses for human recovery, while new evidence resets the cap", () => {
+	const state = dispatch();
+	reduceGate(state, {
+		type: "gate_settled",
+		outcome: "BLOCKED",
+		findingsJson: '{"finding":"missing evidence"}',
+		snapshotDigest: sha64("a"),
+		observationBoundary: 3,
+	});
+	expect(state).toMatchObject({ phase: "building", consecutiveSameSnapshotBlocked: 1 });
+
+	dispatch(state, "gate-2");
+	const repeated = reduceGate(state, {
+		type: "gate_settled",
+		outcome: "BLOCKED",
+		findingsJson: '{"finding":"missing evidence"}',
+		snapshotDigest: sha64("a"),
+		observationBoundary: 3,
+	});
+	expect(state).toMatchObject({ phase: "awaiting_human", consecutiveSameSnapshotBlocked: 2, baselineCaptured: false });
+	expect(repeated.effects.map((effect) => effect.kind)).toEqual(["write_marker", "notify"]);
+
+	const reset = dispatch(buildingState(), "gate-3");
+	reduceGate(reset, {
+		type: "gate_settled",
+		outcome: "BLOCKED",
+		findingsJson: '{"finding":"missing evidence"}',
+		snapshotDigest: sha64("a"),
+		observationBoundary: 3,
+	});
+	dispatch(reset, "gate-4");
+	reduceGate(reset, {
+		type: "gate_settled",
+		outcome: "BLOCKED",
+		findingsJson: '{"finding":"missing evidence"}',
+		snapshotDigest: sha64("a"),
+		observationBoundary: 4,
+	});
+	expect(reset).toMatchObject({ phase: "building", consecutiveSameSnapshotBlocked: 1 });
 });
 
 test("restore reconciliation preserves gating lease; interruption is explicit", () => {
@@ -247,7 +300,18 @@ test("every event is a no-op when its transition is inapplicable", () => {
 		{ state: building, event: { type: "gate_error" } },
 		{ state: building, event: { type: "human_continue", now: 1 } },
 		{ state: building, event: { type: "human_finish_failed", now: 1 } },
-		{ state: gating, event: { type: "gate_dispatch", toolCallId: "ignored", runId: GATE_RUN_ID, snapshotDigest: "ignored", now: 1 } },
+		{
+			state: gating,
+			event: {
+				type: "gate_dispatch",
+				toolCallId: "ignored",
+				runId: GATE_RUN_ID,
+				snapshotDigest: "ignored",
+				planDigest: "ignored",
+				buildRecordRound: 1,
+				now: 1,
+			},
+		},
 		{ state: idle, event: { type: "restore_reconcile", now: 1 } },
 		...terminalInvalidEvents(0, 0).map((event) => ({ state: finalizing, event })),
 	];

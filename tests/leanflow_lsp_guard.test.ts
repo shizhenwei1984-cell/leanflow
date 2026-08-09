@@ -1440,7 +1440,7 @@ test("successful edits refresh all repair evidence artifacts", async () => {
 			toolName: "task",
 			toolCallId: "gate-1",
 			isError: false,
-			content: [{ type: "text", text: JSON.stringify({ verdict: "FAIL", findings: [] }) }],
+			content: [{ type: "text", text: '{"verdict":"FAIL","findings":[{"category":"correctness","severity":"blocking","file":"README.md","location":"1","issue":"Required documentation is missing.","required_fix":"Update the documentation."}]}' }],
 		},
 		harness.ctx,
 	);
@@ -1669,7 +1669,7 @@ test("repair record setup failure pauses for human recovery", async () => {
 			toolName: "task",
 			toolCallId: "repair-record-failure-gate",
 			isError: false,
-			content: [{ type: "text", text: JSON.stringify({ verdict: "FAIL", findings: [{ severity: "blocking" }] }) }],
+			content: [{ type: "text", text: '{"verdict":"FAIL","findings":[{"category":"correctness","severity":"blocking","file":"src/example.ts","location":"1","issue":"Required behavior is missing.","required_fix":"Implement the required behavior."}]}' }],
 		},
 		harness.ctx,
 	);
@@ -1755,7 +1755,7 @@ test("findings-first nested BLOCKED Gate result returns to evidence recovery wit
 			content: [
 				{
 					type: "text",
-					text: '{"findings":[{"category":"evidence","severity":"blocking"}],"verdict":"BLOCKED"}',
+					text: '{"findings":[{"category":"validation_failure","severity":"blocking","file":"local://example-evidence.md","location":"verification","issue":"Required validation evidence is missing.","required_fix":"Run the missing validation and finalize evidence again."}],"verdict":"BLOCKED"}',
 				},
 			],
 		},
@@ -1789,16 +1789,7 @@ test("findings-first nested BLOCKED Gate result returns to evidence recovery wit
 	});
 	expect(finalized.isError).not.toBe(true);
 
-	const allowedEvidenceValidationCommands = [
-		"bun test",
-		"bun test tests/leanflow_lsp_guard.test.ts",
-		"bun test tests/*.test.ts",
-		"bunx tsc --noEmit",
-		"python3 -m unittest discover -s tests -p 'test_*.py' -v",
-		'python -m unittest discover -s tests -p "test_*.py" -v',
-		"git diff --check",
-		"bun build extensions/leanflow/index.ts --target bun --outfile /tmp/leanflow-bundle.js",
-	];
+	const allowedEvidenceValidationCommands = ["bun test tests/leanflow_lsp_guard.test.ts"];
 	for (const [index, command] of allowedEvidenceValidationCommands.entries()) {
 		// This calls only the guard. A successful result is deliberately not
 		// fabricated: the allowlist decision must happen before Bash executes.
@@ -1811,16 +1802,16 @@ test("findings-first nested BLOCKED Gate result returns to evidence recovery wit
 	}
 
 	const rejectedEvidenceValidationCommands = [
+		"bun test",
 		"bun test --watch",
 		"bun test tests/../src/example.test.ts",
-		"bunx tsc --noEmit --pretty false",
-		"python3 -m unittest discover -s tests -p 'test_*.py' -v --failfast",
+		"bunx tsc --noEmit",
+		"python3 -m unittest discover -s tests -p 'test_*.py' -v",
+		"git diff --check",
 		"git diff --check --output=src/example.ts",
-		"git diff --check --output src/example.ts",
-		"git diff --check --stat",
-		"bun build extensions/leanflow/index.ts --target bun --outfile src/example.js",
-		"bun build extensions/leanflow/index.ts --target bun --outdir /tmp/leanflow-build",
-		"bun build extensions/leanflow/index.ts --target bun --outfile=/tmp/leanflow-bundle.js",
+		"bun build extensions/leanflow/index.ts --target bun --outfile /tmp/leanflow-bundle.js",
+		"npm publish",
+		"make install",
 		"git diff --check && printf 'export {};' > src/example.ts",
 	];
 	for (const [index, command] of rejectedEvidenceValidationCommands.entries()) {
@@ -1853,19 +1844,26 @@ test("evidence recovery accepts only command-only Bash validations while Gate is
 			toolName: "task",
 			toolCallId: "evidence-retry-blocked-gate",
 			isError: false,
-			content: [{ type: "text", text: '{"verdict":"BLOCKED","findings":[]}' }],
+			content: [{ type: "text", text: '{"verdict":"BLOCKED","findings":[{"category":"validation_failure","severity":"blocking","file":"local://example-evidence.md","location":"verification","issue":"Required validation evidence is missing.","required_fix":"Run the missing validation and finalize evidence again."}]}' }],
 		},
 		harness.ctx,
 	);
 	expect(harness.states.at(-1)).toMatchObject({ phase: "building", gateRetryMode: "evidence" });
+	const staleFinalized = await executeRegisteredTool(harness, "leanflow_finalize_artifacts", {
+		validationCommands: ["bun test evidence-retry-gate"],
+	});
+	expect(staleFinalized.isError).toBe(true);
+	expect(staleFinalized.content).toEqual([
+		expect.objectContaining({ text: expect.stringContaining("exact Verification commands") }),
+	]);
 
-	await recordSuccessfulValidation(harness, "git diff --check");
+	await recordSuccessfulValidation(harness, "bun test tests/leanflow_lsp_guard.test.ts");
 	const recordWithPlainValidation = JSON.parse(readFileSync(buildRecordPath(harness), "utf8"));
 	expect(recordWithPlainValidation.observations).toContainEqual(
-		expect.objectContaining({ toolName: "bash", command: "git diff --check" }),
+		expect.objectContaining({ toolName: "bash", command: "bun test tests/leanflow_lsp_guard.test.ts" }),
 	);
 	const finalized = await executeRegisteredTool(harness, "leanflow_finalize_artifacts", {
-		validationCommands: ["git diff --check"],
+		validationCommands: ["bun test tests/leanflow_lsp_guard.test.ts"],
 	});
 	expect(finalized.isError).not.toBe(true);
 
@@ -1893,12 +1891,61 @@ test("evidence recovery accepts only command-only Bash validations while Gate is
 			),
 		).toMatchObject({
 			block: true,
-			reason: expect.stringContaining("Gate evidence recovery must reuse the implementation unchanged"),
+			reason: expect.stringContaining("Gate snapshot is immutable"),
 		});
 		expect(harness.states).toHaveLength(stateCountBeforeDeniedCalls);
 		expect(JSON.stringify(harness.states.at(-1))).toBe(stateBeforeDeniedCalls);
 		expect(readFileSync(buildRecordPath(harness), "utf8")).toBe(recordBeforeDeniedCalls);
 	}
+});
+
+test("an unchanged second BLOCKED Gate result pauses instead of looping", async () => {
+	const harness = createHarness();
+	await enterDocumentationBuild(harness);
+	const approvedCommand = "bun test tests/leanflow_lsp_guard.test.ts";
+	await completeBuildEvidence(harness, approvedCommand);
+	const call = harness.handlers.get("tool_call")!;
+	const result = harness.handlers.get("tool_result")!;
+	const blockedContent = [
+		{
+			type: "text",
+			text: '{"verdict":"BLOCKED","findings":[{"category":"validation_failure","severity":"blocking","file":"local://example-evidence.md","location":"verification","issue":"Required validation evidence is missing.","required_fix":"Run the missing validation and finalize evidence again."}]}',
+		},
+	];
+
+	await call({ toolName: "task", toolCallId: "same-blocked-1", input: gateCallInput() }, harness.ctx);
+	await result({ toolName: "task", toolCallId: "same-blocked-1", isError: false, content: blockedContent }, harness.ctx);
+	expect(harness.states.at(-1)).toMatchObject({ phase: "building", consecutiveSameSnapshotBlocked: 1 });
+	await call(
+		{
+			toolName: "lsp",
+			toolCallId: "same-blocked-lsp",
+			input: { action: "diagnostics", file: "src/example.ts" },
+		},
+		harness.ctx,
+	);
+	await result(
+		{
+			toolName: "lsp",
+			toolCallId: "same-blocked-lsp",
+			isError: false,
+			content: [{ type: "text", text: "No diagnostics." }],
+		},
+		harness.ctx,
+	);
+	expect(harness.states.at(-1)).toMatchObject({ consecutiveSameSnapshotBlocked: 1 });
+
+	const finalized = await executeRegisteredTool(harness, "leanflow_finalize_artifacts", {
+		validationCommands: [approvedCommand],
+	});
+	expect(finalized.isError).not.toBe(true);
+	await call({ toolName: "task", toolCallId: "same-blocked-2", input: gateCallInput() }, harness.ctx);
+	await result({ toolName: "task", toolCallId: "same-blocked-2", isError: false, content: blockedContent }, harness.ctx);
+	expect(harness.states.at(-1)).toMatchObject({
+		phase: "awaiting_human",
+		consecutiveSameSnapshotBlocked: 2,
+		baselineCaptured: false,
+	});
 });
 
 test("findings-first nested FAIL Gate result settles as a verdict failure", async () => {
@@ -1916,7 +1963,7 @@ test("findings-first nested FAIL Gate result settles as a verdict failure", asyn
 			content: [
 				{
 					type: "text",
-					text: '{"findings":[{"category":"correctness","severity":"blocking"}],"verdict":"FAIL"}',
+					text: '{"findings":[{"category":"correctness","severity":"blocking","file":"src/example.ts","location":"1","issue":"Required behavior is missing.","required_fix":"Implement the required behavior."}],"verdict":"FAIL"}',
 				},
 			],
 		},
@@ -1927,7 +1974,7 @@ test("findings-first nested FAIL Gate result settles as a verdict failure", asyn
 		gateCalls: 1,
 		gateRetryMode: "repair",
 		gateLease: undefined,
-		lastGateFindings: '{"findings":[{"category":"correctness","severity":"blocking"}],"verdict":"FAIL"}',
+		lastGateFindings: '{"verdict":"FAIL","findings":[{"category":"correctness","severity":"blocking","file":"src/example.ts","location":"1","issue":"Required behavior is missing.","required_fix":"Implement the required behavior."}]}',
 		writtenArtifacts: [],
 		stats: { gateErrors: 0, gateVerdictFailures: 1 },
 	});
@@ -2663,7 +2710,7 @@ test("second Gate FAIL pauses the run and flowcontinue starts a human repair cyc
 				toolName: "task",
 				toolCallId: `gate-fail-${attempt}`,
 				isError: false,
-				content: [{ type: "text", text: JSON.stringify({ verdict: "FAIL", findings: [{ severity: "blocking" }] }) }],
+				content: [{ type: "text", text: JSON.stringify({ verdict: "FAIL", findings: [{ category: "correctness", severity: "blocking", file: "src/example.ts", location: "1", issue: "Required behavior is missing.", required_fix: "Implement the required behavior." }] }) }],
 			},
 			harness.ctx,
 		);
@@ -2672,7 +2719,7 @@ test("second Gate FAIL pauses the run and flowcontinue starts a human repair cyc
 	expect(harness.states.at(-1)).toMatchObject({
 		phase: "awaiting_human",
 		gateCalls: 2,
-		lastGateFindings: JSON.stringify({ verdict: "FAIL", findings: [{ severity: "blocking" }] }),
+		lastGateFindings: JSON.stringify({ verdict: "FAIL", findings: [{ category: "correctness", severity: "blocking", file: "src/example.ts", location: "1", issue: "Required behavior is missing.", required_fix: "Implement the required behavior." }] }),
 	});
 	expect(harness.states.at(-1)!.terminalOutcome).toBeUndefined();
 	const marker = JSON.parse(readFileSync(runMarkerPath(harness), "utf8"));
@@ -2712,7 +2759,7 @@ test("second Gate FAIL pauses the run and flowcontinue starts a human repair cyc
 	mkdirSync(repairRecordPath);
 	const preContinueNotifications = harness.notifications.length;
 	await harness.commands.get("flowcontinue")!.handler("repair the blocking finding", harness.ctx);
-	expect(harness.states.at(-1).phase).toBe("awaiting_human");
+	expect(harness.states.at(-1)!.phase).toBe("awaiting_human");
 	expect(harness.notifications.length).toBeGreaterThan(preContinueNotifications);
 	rmSync(repairRecordPath, { recursive: true });
 	writeFileSync(repairRecordPath, repairRecord);
@@ -2754,7 +2801,7 @@ test("flowfinishfailed explicitly finalizes a paused Gate failure", async () => 
 				toolName: "task",
 				toolCallId: `finish-failed-gate-${attempt}`,
 				isError: false,
-				content: [{ type: "text", text: JSON.stringify({ verdict: "FAIL", findings: [{ severity: "blocking" }] }) }],
+				content: [{ type: "text", text: JSON.stringify({ verdict: "FAIL", findings: [{ category: "correctness", severity: "blocking", file: "src/example.ts", location: "1", issue: "Required behavior is missing.", required_fix: "Implement the required behavior." }] }) }],
 			},
 			harness.ctx,
 		);
@@ -3231,7 +3278,7 @@ test("locked phases allow only explicit read-only LSP actions", async () => {
 	]) {
 		expect(await call(event, planning.ctx)).toMatchObject({
 			block: true,
-			reason: expect.stringContaining("not explicitly read-only"),
+			reason: expect.stringMatching(/unclassified tools|not explicitly read-only/),
 		});
 	}
 
