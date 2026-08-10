@@ -693,6 +693,13 @@ async function writeJsonAtomically(filePath: string, value: unknown): Promise<vo
 	await writeTextAtomically(filePath, JSON.stringify(value));
 }
 
+let buildPublicationStageHook: ((filePath: string) => Promise<void>) | undefined;
+
+/** Test-only seam: pauses after staging and before the final synchronous publication check. */
+export function setBuildPublicationStageHookForTest(hook: ((filePath: string) => Promise<void>) | undefined): void {
+	buildPublicationStageHook = hook;
+}
+
 export default function leanflow(pi: ExtensionAPI): void {
 	let state: LeanFlowState = defaultState();
 	let hasPersistedLeanFlowState = false;
@@ -702,20 +709,58 @@ export default function leanflow(pi: ExtensionAPI): void {
 	const pendingApprovalWrites = new Map<string, string>(); // toolCallId → exact plan artifact
 	const pendingGateCalls = new Set<string>(); // toolCallIds
 	const pendingGatePlanDigests = new Map<string, string>(); // toolCallId → dispatch-time canonical plan digest
+	type BuildOperationIdentity = Readonly<
+		BuildRecordIdentity & {
+			operationId: string;
+			activationEpoch: number;
+			sessionId: string;
+			branchId?: string;
+			recordPath: string;
+		}
+	>;
+	type FinalizationOperation = Readonly<
+		BuildOperationIdentity & {
+			planArtifact: string;
+			planPath: string;
+			finalizedSnapshotPath: string;
+			buildPath: string;
+			diffPath: string;
+			evidencePath: string;
+			validationContract: NonNullable<LeanFlowState["approvedValidationContract"]>;
+		}
+	>;
 	type PendingEvidenceObservation =
-		| { toolName: "bash"; command: string }
-		| { toolName: "lsp"; lspRequest: ParsedLspRequest };
+		| { identity: BuildOperationIdentity; toolName: "bash"; command: string }
+		| { identity: BuildOperationIdentity; toolName: "lsp"; lspRequest: ParsedLspRequest };
 	const pendingEvidenceObservations = new Map<string, PendingEvidenceObservation>();
-	let buildRecordLockTail = Promise.resolve();
+	const buildRecordLockTails = new Map<string, Promise<void>>();
+	const validationAbortControllers = new Map<string, AbortController>();
+	let activationEpoch = 1;
 
-	async function acquireBuildRecordLock(): Promise<() => void> {
-		const previous = buildRecordLockTail;
+	function queueKey(identity: BuildOperationIdentity): string {
+		return `${identity.sessionId}\u0000${identity.runId}\u0000${identity.round}\u0000${identity.activationEpoch}`;
+	}
+
+	async function acquireBuildRecordLock(identity: BuildOperationIdentity): Promise<() => void> {
+		const key = queueKey(identity);
+		const previous = buildRecordLockTails.get(key) ?? Promise.resolve();
 		let release!: () => void;
-		buildRecordLockTail = new Promise<void>((resolve) => {
+		const tail = new Promise<void>((resolve) => {
 			release = resolve;
 		});
+		buildRecordLockTails.set(key, tail);
 		await previous;
-		return release;
+		return () => {
+			release();
+			if (buildRecordLockTails.get(key) === tail) buildRecordLockTails.delete(key);
+		};
+	}
+
+	function advanceBuildActivation(): void {
+		activationEpoch += 1;
+		pendingEvidenceObservations.clear();
+		for (const controller of validationAbortControllers.values()) controller.abort();
+		validationAbortControllers.clear();
 	}
 
 	function persist(): void {
@@ -800,32 +845,158 @@ export default function leanflow(pi: ExtensionAPI): void {
 		};
 	}
 
-	function activeBuildRecordPath(ctx: ExtensionContext): string {
-		if (!ctx.localProtocolOptions || !state.runId) {
-			throw new Error("local protocol options or run ID are unavailable");
-		}
-		const artifact = buildRecordArtifact(state.runId);
+	function buildRecordPathFor(ctx: ExtensionContext, runId: string): string {
+		if (!ctx.localProtocolOptions) throw new Error("local protocol options are unavailable");
+		const artifact = buildRecordArtifact(runId);
 		const recordPath = resolveRunMarkerPath(ctx.localProtocolOptions, artifact);
 		if (!recordPath) throw new Error(`internal build record path cannot be resolved: ${artifact}`);
 		return recordPath;
 	}
 
-	function activeFinalizedSnapshotPath(ctx: ExtensionContext): string {
-		if (!ctx.localProtocolOptions || !state.runId) {
-			throw new Error("local protocol options or run ID are unavailable");
-		}
-		const artifact = finalizedSnapshotArtifact(state.runId);
+	function finalizedSnapshotPathFor(ctx: ExtensionContext, runId: string): string {
+		if (!ctx.localProtocolOptions) throw new Error("local protocol options are unavailable");
+		const artifact = finalizedSnapshotArtifact(runId);
 		const snapshotPath = resolveRunMarkerPath(ctx.localProtocolOptions, artifact);
 		if (!snapshotPath) throw new Error(`finalized Gate snapshot path cannot be resolved: ${artifact}`);
 		return snapshotPath;
 	}
 
-	async function readBuildRecordValue(ctx: ExtensionContext): Promise<unknown> {
+	function buildSessionId(ctx: ExtensionContext): string {
 		try {
-			return JSON.parse(await fs.readFile(activeBuildRecordPath(ctx), "utf8"));
+			const sessionId = (ctx.localProtocolOptions as { getSessionId?: () => unknown } | undefined)?.getSessionId?.();
+			return typeof sessionId === "string" && sessionId.length > 0 ? sessionId : `activation-${activationEpoch}`;
+		} catch {
+			return `activation-${activationEpoch}`;
+		}
+	}
+	function captureBuildOperationIdentity(ctx: ExtensionContext, round: number): BuildOperationIdentity {
+		const identity = activeBuildIdentity(round);
+		return Object.freeze({
+			...identity,
+			operationId: randomUUID(),
+			activationEpoch,
+			sessionId: buildSessionId(ctx),
+			recordPath: buildRecordPathFor(ctx, identity.runId),
+		});
+	}
+
+	function captureFinalizationOperation(ctx: ExtensionContext, round: number): FinalizationOperation {
+		const planArtifact = state.planArtifact;
+		const validationContract = state.approvedValidationContract;
+		if (!planArtifact || !validationContract) {
+			throw new Error("active plan artifact or approved validation contract is unavailable");
+		}
+		const identity = captureBuildOperationIdentity(ctx, round);
+		const artifacts = expectedGateArtifacts(state);
+		if (!artifacts || !ctx.localProtocolOptions) throw new Error("canonical Gate artifact identity is unavailable");
+		const buildPath = resolveRunMarkerPath(ctx.localProtocolOptions, artifacts.build);
+		const diffPath = resolveRunMarkerPath(ctx.localProtocolOptions, artifacts.diff);
+		const evidencePath = resolveRunMarkerPath(ctx.localProtocolOptions, artifacts.evidence);
+		const planPath = resolveRunMarkerPath(ctx.localProtocolOptions, planArtifact);
+		if (!buildPath || !diffPath || !evidencePath || !planPath) {
+			throw new Error("canonical plan or Gate artifact path cannot be resolved");
+		}
+		return Object.freeze({
+			...identity,
+			planArtifact,
+			planPath,
+			finalizedSnapshotPath: finalizedSnapshotPathFor(ctx, identity.runId),
+			buildPath,
+			diffPath,
+			evidencePath,
+			validationContract,
+		});
+	}
+
+	function isBuildOperationCurrent(ctx: ExtensionContext, identity: BuildOperationIdentity): boolean {
+		return (
+			identity.activationEpoch === activationEpoch &&
+			identity.sessionId === buildSessionId(ctx) &&
+			state.phase === "building" &&
+			state.runId === identity.runId &&
+			state.planSlug === identity.planSlug &&
+			state.planDigest === identity.planDigest &&
+			state.approvedValidationDigest === identity.approvedValidationDigest &&
+			state.currentBuildRound === identity.round
+		);
+	}
+
+	function discardedBuildOperation(kind: string) {
+		return {
+			content: [{ type: "text" as const, text: `LeanFlow ${kind} was discarded because BUILD authority changed.` }],
+		};
+	}
+
+	function activeBuildRecordPath(ctx: ExtensionContext): string {
+		if (!state.runId) throw new Error("run ID is unavailable");
+		return buildRecordPathFor(ctx, state.runId);
+	}
+
+	function activeFinalizedSnapshotPath(ctx: ExtensionContext): string {
+		if (!state.runId) throw new Error("run ID is unavailable");
+		return finalizedSnapshotPathFor(ctx, state.runId);
+	}
+
+	async function writeBuildTextAtomically(
+		ctx: ExtensionContext,
+		identity: BuildOperationIdentity,
+		filePath: string,
+		content: string,
+	): Promise<boolean> {
+		const temporary = `${filePath}.${identity.operationId}.tmp`;
+		try {
+			const handle = await fs.open(temporary, "w");
+			let staged = isBuildOperationCurrent(ctx, identity);
+			try {
+				if (staged) {
+					await handle.writeFile(content, "utf8");
+					staged = isBuildOperationCurrent(ctx, identity);
+				}
+				if (staged) {
+					await handle.sync();
+					staged = isBuildOperationCurrent(ctx, identity);
+				}
+			} finally {
+				await handle.close();
+			}
+			if (buildPublicationStageHook) await buildPublicationStageHook(filePath);
+			if (!staged || !isBuildOperationCurrent(ctx, identity)) {
+				await fs.rm(temporary, { force: true });
+				return false;
+			}
+			// The final authority check and rename are synchronous: no lifecycle
+			// activation can interleave and publish an operation after replacement.
+			fsSync.renameSync(temporary, filePath);
+			return true;
+		} catch (error) {
+			await fs.rm(temporary, { force: true });
+			throw error;
+		}
+	}
+
+	async function writeBuildJsonAtomically(
+		ctx: ExtensionContext,
+		identity: BuildOperationIdentity,
+		filePath: string,
+		value: unknown,
+	): Promise<boolean> {
+		return writeBuildTextAtomically(ctx, identity, filePath, JSON.stringify(value));
+	}
+
+	async function readBuildRecordValueAt(recordPath: string): Promise<unknown> {
+		try {
+			return JSON.parse(await fs.readFile(recordPath, "utf8"));
 		} catch (error) {
 			throw new Error(`internal build record is missing or unreadable: ${evidenceFailureMessage(error)}`);
 		}
+	}
+
+	async function loadBuildRecordForIdentity(identity: BuildOperationIdentity): Promise<BuildEvidenceRecordV2> {
+		return parseBuildEvidenceRecord(await readBuildRecordValueAt(identity.recordPath), identity);
+	}
+
+	async function readBuildRecordValue(ctx: ExtensionContext): Promise<unknown> {
+		return readBuildRecordValueAt(activeBuildRecordPath(ctx));
 	}
 
 	async function loadBuildRecord(ctx: ExtensionContext, round: number): Promise<BuildEvidenceRecordV2> {
@@ -1202,22 +1373,48 @@ export default function leanflow(pi: ExtensionAPI): void {
 
 	async function appendBuildObservationUnlocked(
 		ctx: ExtensionContext,
+		identity: BuildOperationIdentity,
 		observation: BuildEvidenceObservationV2,
-	): Promise<void> {
-		const record = await loadBuildRecord(ctx, expectedGateRoundForSnapshot());
+	): Promise<boolean> {
+		if (!isBuildOperationCurrent(ctx, identity)) return false;
+		const record = await loadBuildRecordForIdentity(identity);
+		if (!isBuildOperationCurrent(ctx, identity)) return false;
 		record.observations.push(observation);
-		await writeJsonAtomically(activeBuildRecordPath(ctx), record);
+		if (!isBuildOperationCurrent(ctx, identity)) return false;
+		return writeBuildJsonAtomically(ctx, identity, identity.recordPath, record);
 	}
+
 	async function appendBuildObservation(
 		ctx: ExtensionContext,
+		identity: BuildOperationIdentity,
 		observation: BuildEvidenceObservationV2,
-	): Promise<void> {
-		const release = await acquireBuildRecordLock();
+	): Promise<boolean> {
+		const release = await acquireBuildRecordLock(identity);
 		try {
-			await appendBuildObservationUnlocked(ctx, observation);
+			if (!isBuildOperationCurrent(ctx, identity)) return false;
+			return await appendBuildObservationUnlocked(ctx, identity, observation);
 		} finally {
 			release();
 		}
+	}
+
+	function combineValidationSignals(
+		callerSignal: AbortSignal | undefined,
+		authorityController: AbortController,
+	): { signal: AbortSignal; cleanup: () => void } {
+		if (!callerSignal) return { signal: authorityController.signal, cleanup: () => undefined };
+		const combined = new AbortController();
+		const abortCombined = () => combined.abort();
+		callerSignal.addEventListener("abort", abortCombined, { once: true });
+		authorityController.signal.addEventListener("abort", abortCombined, { once: true });
+		if (callerSignal.aborted || authorityController.signal.aborted) combined.abort();
+		return {
+			signal: combined.signal,
+			cleanup: () => {
+				callerSignal.removeEventListener("abort", abortCombined);
+				authorityController.signal.removeEventListener("abort", abortCombined);
+			},
+		};
 	}
 
 	function flattenTextContent(content: unknown): string {
@@ -1694,6 +1891,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 				// The locked repair prompt will require restoring the canonical plan.
 			}
 		}
+		advanceBuildActivation();
 		state = {
 			...defaultState(),
 			phase: "planning",
@@ -1740,6 +1938,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 		}
 		const marker = lookup.marker;
 
+		advanceBuildActivation();
 		const now = Date.now();
 		state = restoreState([
 			{
@@ -2068,6 +2267,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 	}
 
 	const restoreSessionState = async (_event: unknown, ctx: ExtensionContext): Promise<void> => {
+		advanceBuildActivation();
 		const branch = ctx.sessionManager.getBranch();
 		hasPersistedLeanFlowState = hasPersistedState(branch);
 		const rawBeforeRestore = (() => {
@@ -2301,6 +2501,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 	pi.on("session_branch", restoreSessionState);
 	pi.on("session_tree", restoreSessionState);
 	pi.on("session_shutdown", async () => {
+		advanceBuildActivation();
 		pendingEvidenceObservations.clear();
 	});
 
@@ -2342,6 +2543,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 
 			// Initialize state machine and the first observable phase.
 			const now = Date.now();
+			advanceBuildActivation();
 			state = {
 				...defaultState(),
 				phase: "planning",
@@ -2373,12 +2575,12 @@ export default function leanflow(pi: ExtensionAPI): void {
 		})
 		.strict();
 	const finalizeArtifactsParameters = z.object({}).strict();
-	const approvedValidationInstructions = (): string =>
+	const approvedValidationInstructions = (
+		contract: LeanFlowState["approvedValidationContract"] = state.approvedValidationContract,
+	): string =>
 		[
 			"Approved validation IDs (execute each with leanflow_run_validation):",
-			...(state.approvedValidationContract?.validations ?? []).map(
-				(validation) => `- ${validation.id}: ${validation.displayCommand}`,
-			),
+			...(contract?.validations ?? []).map((validation) => `- ${validation.id}: ${validation.displayCommand}`),
 		].join("\n");
 
 	pi.registerTool<typeof captureBaselineParameters>({
@@ -2388,46 +2590,48 @@ export default function leanflow(pi: ExtensionAPI): void {
 		parameters: captureBaselineParameters,
 		strict: true,
 		async execute(_toolCallId, _params, signal, _onUpdate, ctx) {
-			const release = await acquireBuildRecordLock();
-			try {
 			const fail = (message: string) => ({
 				content: [{ type: "text" as const, text: `LeanFlow baseline capture failed: ${message}` }],
 				isError: true,
 			});
-			if (state.phase !== "building") return fail("the workflow is not in BUILD.");
-			if (state.lspProbeStatus === "pending") return fail("complete the required initial LSP diagnostics probe first.");
-			if (pendingEvidenceObservations.size > 0) {
-				return fail("a BUILD observation is still unpersisted; run /flowcancel and start a new run.");
-			}
-			if (state.baselineCaptured === true) return fail("the immutable BUILD baseline is already captured.");
-			if (state.buildMutationObserved === true) {
-				return fail("a repository mutation was already authorized; run /flowcancel and start a new run.");
-			}
+			let identity: BuildOperationIdentity;
+			let validationInstructions: string;
 			try {
-				const activeRound = state.repairLease ? state.repairLease.toRound : expectedGateRoundForSnapshot();
-				let record: BuildEvidenceRecordV2;
-				try {
-					record = await loadBuildRecord(ctx, activeRound);
-				} catch {
-					record = await readBuildRecordForReconciliation(ctx);
-					if (record.baseline) {
-						state.baselineCaptured = true;
-						persist();
-						return {
-							content: [{ type: "text" as const, text: `LeanFlow immutable BUILD baseline already captured at ${record.baseline.head}.\n${approvedValidationInstructions()}` }],
-						};
-					}
-					throw new Error(`BUILD record round ${record.round} does not match expected ${activeRound}`);
+				const round = state.repairLease ? state.repairLease.toRound : expectedGateRoundForSnapshot();
+				identity = captureBuildOperationIdentity(ctx, round);
+				validationInstructions = approvedValidationInstructions(state.approvedValidationContract);
+			} catch (error) {
+				return fail(evidenceFailureMessage(error));
+			}
+			const release = await acquireBuildRecordLock(identity);
+			try {
+				if (!isBuildOperationCurrent(ctx, identity)) return discardedBuildOperation("baseline capture");
+				if (state.lspProbeStatus === "pending") return fail("complete the required initial LSP diagnostics probe first.");
+				if (pendingEvidenceObservations.size > 0) {
+					return fail("a BUILD observation is still unpersisted; run /flowcancel and start a new run.");
 				}
+				if (state.baselineCaptured === true) return fail("the immutable BUILD baseline is already captured.");
+				if (state.buildMutationObserved === true) {
+					return fail("a repository mutation was already authorized; run /flowcancel and start a new run.");
+				}
+				const record = await loadBuildRecordForIdentity(identity);
+				if (!isBuildOperationCurrent(ctx, identity)) return discardedBuildOperation("baseline capture");
 				if (record.baseline) {
 					state.baselineCaptured = true;
 					persist();
 					return {
-						content: [{ type: "text" as const, text: `LeanFlow immutable BUILD baseline already captured at ${record.baseline.head}.\n${approvedValidationInstructions()}` }],
+						content: [
+							{
+								type: "text" as const,
+								text: `LeanFlow immutable BUILD baseline already captured at ${record.baseline.head}.\n${validationInstructions}`,
+							},
+						],
 					};
 				}
 				const headResult = await runGit(ctx, ["rev-parse", "HEAD"], signal);
+				if (!isBuildOperationCurrent(ctx, identity)) return discardedBuildOperation("baseline capture");
 				const statusResult = await runGit(ctx, ["status", "--short", "--untracked-files=all"], signal);
+				if (!isBuildOperationCurrent(ctx, identity)) return discardedBuildOperation("baseline capture");
 				const head = headResult.stdout.trim();
 				if (!head || head.includes("\n")) throw new Error("git rev-parse HEAD returned an invalid commit identity");
 				record.baseline = {
@@ -2435,20 +2639,23 @@ export default function leanflow(pi: ExtensionAPI): void {
 					status: statusResult.stdout.trimEnd(),
 					capturedAt: Date.now(),
 				};
-				await writeJsonAtomically(activeBuildRecordPath(ctx), record);
+				if (!(await writeBuildJsonAtomically(ctx, identity, identity.recordPath, record))) {
+					return discardedBuildOperation("baseline capture");
+				}
+				if (!isBuildOperationCurrent(ctx, identity)) return discardedBuildOperation("baseline capture");
 				state.baselineCaptured = true;
 				persist();
 				return {
 					content: [
 						{
 							type: "text" as const,
-							text: `LeanFlow immutable BUILD baseline captured at ${head}.\n${approvedValidationInstructions()}`,
+							text: `LeanFlow immutable BUILD baseline captured at ${head}.\n${validationInstructions}`,
 						},
 					],
 				};
 			} catch (error) {
+				if (!isBuildOperationCurrent(ctx, identity)) return discardedBuildOperation("baseline capture");
 				return fail(evidenceFailureMessage(error));
-			}
 			} finally {
 				release();
 			}
@@ -2462,109 +2669,142 @@ export default function leanflow(pi: ExtensionAPI): void {
 		parameters: runValidationParameters,
 		strict: true,
 		async execute(toolCallId, params, signal, _onUpdate, ctx) {
-			const release = await acquireBuildRecordLock();
-			try {
 			const fail = (message: string) => ({
 				content: [{ type: "text" as const, text: `LeanFlow validation failed: ${message}` }],
 				isError: true,
 			});
-			if (state.phase !== "building") return fail("the workflow is not in BUILD.");
-			if (state.gateRetryMode === "operational") {
-				return fail("operational recovery may only redispatch the already-finalized snapshot.");
+			let identity: BuildOperationIdentity;
+			let validation: NonNullable<LeanFlowState["approvedValidationContract"]>["validations"][number] | undefined;
+			try {
+				identity = captureBuildOperationIdentity(ctx, expectedGateRoundForSnapshot());
+				validation = state.approvedValidationContract?.validations.find((candidate) => candidate.id === params.validationId);
+			} catch (error) {
+				return fail(evidenceFailureMessage(error));
 			}
-			if (state.baselineCaptured !== true) return fail("capture the immutable BUILD baseline first.");
-			const validation = state.approvedValidationContract?.validations.find(
-				(candidate) => candidate.id === params.validationId,
-			);
 			if (!validation) return fail(`validation ID ${JSON.stringify(params.validationId)} is not approved.`);
-			if (
-				state.finalizedGateSnapshot ||
-				state.operationalRetrySnapshot ||
-				(state.writtenArtifacts?.length ?? 0) > 0
-			) {
-				state.finalizedGateSnapshot = undefined;
-				state.operationalRetrySnapshot = undefined;
-				state.writtenArtifacts = [];
+			const authorityController = new AbortController();
+			validationAbortControllers.set(identity.operationId, authorityController);
+			const combined = combineValidationSignals(signal, authorityController);
+			const cwd = ctx.cwd;
+			const release = await acquireBuildRecordLock(identity);
+			try {
+				if (!isBuildOperationCurrent(ctx, identity)) return discardedBuildOperation("validation");
+				if (state.gateRetryMode === "operational") {
+					return fail("operational recovery may only redispatch the already-finalized snapshot.");
+				}
+				if (state.baselineCaptured !== true) return fail("capture the immutable BUILD baseline first.");
+				if (
+					state.finalizedGateSnapshot ||
+					state.operationalRetrySnapshot ||
+					(state.writtenArtifacts?.length ?? 0) > 0
+				) {
+					state.finalizedGateSnapshot = undefined;
+					state.operationalRetrySnapshot = undefined;
+					state.writtenArtifacts = [];
+					try {
+						persist();
+					} catch (error) {
+						return fail(`prior Gate authority could not be invalidated: ${evidenceFailureMessage(error)}`);
+					}
+				}
+				const startedAt = Date.now();
+				let before: RepositoryFingerprint;
 				try {
-					persist();
+					before = await captureRepositoryFingerprint(ctx, combined.signal);
 				} catch (error) {
+					if (!isBuildOperationCurrent(ctx, identity) || authorityController.signal.aborted) {
+						return discardedBuildOperation("validation");
+					}
+					return fail(`repository fingerprint before validation is unavailable: ${evidenceFailureMessage(error)}`);
+				}
+				if (!isBuildOperationCurrent(ctx, identity) || authorityController.signal.aborted) {
+					return discardedBuildOperation("validation");
+				}
+				const execution = await pi.exec(validation.executable, validation.argv, { cwd, signal: combined.signal }).then(
+					(result) => ({ ok: true as const, result }),
+					(error: unknown) => ({ ok: false as const, error }),
+				);
+				if (!isBuildOperationCurrent(ctx, identity) || authorityController.signal.aborted) {
+					return discardedBuildOperation("validation");
+				}
+				if (!execution.ok) return fail(`execution could not start: ${evidenceFailureMessage(execution.error)}`);
+				const result = execution.result;
+				const finishedAt = Date.now();
+				let after: RepositoryFingerprint | undefined;
+				let fingerprintError: string | undefined;
+				try {
+					after = await captureRepositoryFingerprint(ctx, combined.signal);
+				} catch (error) {
+					if (!isBuildOperationCurrent(ctx, identity) || authorityController.signal.aborted) {
+						return discardedBuildOperation("validation");
+					}
+					fingerprintError = evidenceFailureMessage(error);
+				}
+				if (!isBuildOperationCurrent(ctx, identity) || authorityController.signal.aborted) {
+					return discardedBuildOperation("validation");
+				}
+				const observation: BuildEvidenceObservationV2 = {
+					toolCallId,
+					operationId: identity.operationId,
+					runId: identity.runId,
+					round: identity.round,
+					planDigest: identity.planDigest,
+					approvedValidationDigest: identity.approvedValidationDigest,
+					toolName: "validation",
+					validationId: validation.id,
+					command: validation.displayCommand,
+					executable: validation.executable,
+					argv: [...validation.argv],
+					repositoryFingerprintBefore: before.combinedDigest,
+					repositoryFingerprintAfter: after?.combinedDigest,
+					startedAt,
+					finishedAt,
+					isError: result.code !== 0 || result.killed || fingerprintError !== undefined,
+					exitCode: result.code,
+					timedOut: result.killed,
+					text: combinedExecOutput(result.stdout, result.stderr),
+				};
+				try {
+					if (!(await appendBuildObservationUnlocked(ctx, identity, observation))) {
+						return discardedBuildOperation("validation");
+					}
+				} catch (error) {
+					if (!isBuildOperationCurrent(ctx, identity)) return discardedBuildOperation("validation");
+					return fail(`result could not be committed to the BUILD record: ${evidenceFailureMessage(error)}`);
+				}
+				if (!isBuildOperationCurrent(ctx, identity)) return discardedBuildOperation("validation");
+				state.finalizedGateSnapshot = undefined;
+				state.writtenArtifacts = [];
+				if (!after || before.combinedDigest !== after.combinedDigest) {
+					state.buildMutationObserved = true;
+					if (state.gateRetryMode === "evidence") {
+						state.gateRetryMode = undefined;
+						resetBlockedRecovery(state);
+					}
+				}
+				persist();
+				if (fingerprintError) {
+					return fail(`repository fingerprint after validation is unavailable: ${fingerprintError}`);
+				}
+				if (before.combinedDigest !== after!.combinedDigest) {
+					return fail("the approved validation mutated repository state; its evidence is stale.");
+				}
+				if (result.code !== 0 || result.killed) {
 					return fail(
-						`prior Gate authority could not be invalidated: ${evidenceFailureMessage(error)}`,
+						`${validation.displayCommand} exited ${result.code}${result.killed ? " after interruption" : ""}:\n${observation.text ?? ""}`,
 					);
 				}
-			}
-			const startedAt = Date.now();
-			let before: RepositoryFingerprint;
-			try {
-				before = await captureRepositoryFingerprint(ctx, signal);
-			} catch (error) {
-				return fail(`repository fingerprint before validation is unavailable: ${evidenceFailureMessage(error)}`);
-			}
-			const execution = await pi.exec(validation.executable, validation.argv, { cwd: ctx.cwd, signal }).then(
-				(result) => ({ ok: true as const, result }),
-				(error: unknown) => ({ ok: false as const, error }),
-			);
-			if (!execution.ok) return fail(`execution could not start: ${evidenceFailureMessage(execution.error)}`);
-			const result = execution.result;
-			const finishedAt = Date.now();
-			let after: RepositoryFingerprint | undefined;
-			let fingerprintError: string | undefined;
-			try {
-				after = await captureRepositoryFingerprint(ctx, signal);
-			} catch (error) {
-				fingerprintError = evidenceFailureMessage(error);
-			}
-			const observation: BuildEvidenceObservationV2 = {
-				toolCallId,
-				toolName: "validation",
-				validationId: validation.id,
-				command: validation.displayCommand,
-				executable: validation.executable,
-				argv: [...validation.argv],
-				repositoryFingerprintBefore: before.combinedDigest,
-				repositoryFingerprintAfter: after?.combinedDigest,
-				startedAt,
-				finishedAt,
-				isError: result.code !== 0 || result.killed || fingerprintError !== undefined,
-				exitCode: result.code,
-				timedOut: result.killed,
-				text: combinedExecOutput(result.stdout, result.stderr),
-			};
-			try {
-				await appendBuildObservationUnlocked(ctx, observation);
-			} catch (error) {
-				return fail(`result could not be committed to the BUILD record: ${evidenceFailureMessage(error)}`);
-			}
-			state.finalizedGateSnapshot = undefined;
-			state.writtenArtifacts = [];
-			if (!after || before.combinedDigest !== after.combinedDigest) {
-				state.buildMutationObserved = true;
-				if (state.gateRetryMode === "evidence") {
-					state.gateRetryMode = undefined;
-					resetBlockedRecovery(state);
-				}
-			}
-			persist();
-			if (fingerprintError) {
-				return fail(`repository fingerprint after validation is unavailable: ${fingerprintError}`);
-			}
-			if (before.combinedDigest !== after!.combinedDigest) {
-				return fail("the approved validation mutated repository state; its evidence is stale.");
-			}
-			if (result.code !== 0 || result.killed) {
-				return fail(
-					`${validation.displayCommand} exited ${result.code}${result.killed ? " after interruption" : ""}:\n${observation.text ?? ""}`,
-				);
-			}
-			return {
-				content: [
-					{
-						type: "text" as const,
-						text: `LeanFlow validation ${validation.id} passed without repository mutation.\n${observation.text ?? ""}`,
-					},
-				],
-			};
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: `LeanFlow validation ${validation.id} passed without repository mutation.\n${observation.text ?? ""}`,
+						},
+					],
+				};
 			} finally {
+				combined.cleanup();
+				validationAbortControllers.delete(identity.operationId);
 				release();
 			}
 		},
@@ -2579,45 +2819,40 @@ export default function leanflow(pi: ExtensionAPI): void {
 		parameters: finalizeArtifactsParameters,
 		strict: true,
 		async execute(_toolCallId, _params, signal, _onUpdate, ctx) {
-			const release = await acquireBuildRecordLock();
-			try {
 			const fail = (message: string) => ({
 				content: [{ type: "text" as const, text: `LeanFlow artifact finalization failed: ${message}` }],
 				isError: true,
 			});
-			if (state.phase !== "building") return fail("the workflow is not in BUILD.");
-			if (state.gateRetryMode === "operational") {
-				return fail("an operational Gate retry must reuse the existing finalized manifest unchanged.");
-			}
-			if (state.lspProbeStatus === "pending") return fail("the required LSP diagnostics probe is incomplete.");
-			if (state.baselineCaptured !== true) return fail("capture the immutable BUILD baseline first.");
-			if (pendingEvidenceObservations.size > 0) {
-				return fail("one or more BUILD observations are still unpersisted.");
-			}
+			let operation: FinalizationOperation;
 			try {
-				if (
-					!state.planArtifact ||
-					!state.runId ||
-					!state.planDigest ||
-					!state.approvedValidationContract ||
-					!state.approvedValidationDigest ||
-					!ctx.localProtocolOptions
-				) {
-					throw new Error("active plan identity, validation contract, or local protocol options are incomplete");
+				operation = captureFinalizationOperation(ctx, expectedGateRoundForSnapshot());
+			} catch (error) {
+				return fail(evidenceFailureMessage(error));
+			}
+			const release = await acquireBuildRecordLock(operation);
+			try {
+				if (!isBuildOperationCurrent(ctx, operation)) return discardedBuildOperation("artifact finalization");
+				if (state.gateRetryMode === "operational") {
+					return fail("an operational Gate retry must reuse the existing finalized manifest unchanged.");
 				}
-				const planPath = resolveRunMarkerPath(ctx.localProtocolOptions, state.planArtifact);
-				if (!planPath) throw new Error("canonical plan path cannot be resolved");
-				const planContent = await fs.readFile(planPath, "utf8");
+				if (state.lspProbeStatus === "pending") return fail("the required LSP diagnostics probe is incomplete.");
+				if (state.baselineCaptured !== true) return fail("capture the immutable BUILD baseline first.");
+				if (pendingEvidenceObservations.size > 0) {
+					return fail("one or more BUILD observations are still unpersisted.");
+				}
+
+				const planContent = await fs.readFile(operation.planPath, "utf8");
+				if (!isBuildOperationCurrent(ctx, operation)) return discardedBuildOperation("artifact finalization");
 				if (
-					runIdFromPlan(planContent) !== state.runId ||
-					planDigest(planContent) !== state.planDigest ||
-					parseValidationContract(planContent, state.planDigest).contract?.digest !== state.approvedValidationDigest
+					runIdFromPlan(planContent) !== operation.runId ||
+					planDigest(planContent) !== operation.planDigest ||
+					parseValidationContract(planContent, operation.planDigest).contract?.digest !== operation.approvedValidationDigest
 				) {
 					throw new Error("canonical plan or approved validation contract changed after approval");
 				}
 
-				const recordRound = expectedGateRoundForSnapshot();
-				const record = await loadBuildRecord(ctx, recordRound);
+				const record = await loadBuildRecordForIdentity(operation);
+				if (!isBuildOperationCurrent(ctx, operation)) return discardedBuildOperation("artifact finalization");
 				if (!record.baseline) throw new Error("the internal BUILD record has no immutable baseline");
 				const gitEvidence: GitCommandEvidence[] = [
 					{
@@ -2635,6 +2870,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 				];
 
 				const finalHeadResult = await runGit(ctx, ["rev-parse", "HEAD"], signal, [0], "Final HEAD");
+				if (!isBuildOperationCurrent(ctx, operation)) return discardedBuildOperation("artifact finalization");
 				gitEvidence.push(finalHeadResult.evidence);
 				const finalHead = finalHeadResult.stdout.trim();
 				if (finalHead !== record.baseline.head) {
@@ -2647,6 +2883,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 					[0],
 					"Final status",
 				);
+				if (!isBuildOperationCurrent(ctx, operation)) return discardedBuildOperation("artifact finalization");
 				gitEvidence.push(finalStatusResult.evidence);
 				const finalStatus = finalStatusResult.stdout.trimEnd();
 				const trackedDiffResult = await runGit(
@@ -2656,6 +2893,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 					[0],
 					"Tracked complete binary diff",
 				);
+				if (!isBuildOperationCurrent(ctx, operation)) return discardedBuildOperation("artifact finalization");
 				gitEvidence.push(trackedDiffResult.evidence);
 				const trackedNamesResult = await runGit(
 					ctx,
@@ -2664,6 +2902,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 					[0],
 					"Tracked changed paths",
 				);
+				if (!isBuildOperationCurrent(ctx, operation)) return discardedBuildOperation("artifact finalization");
 				const trackedPaths = parseNulList(trackedNamesResult.stdout, trackedNamesResult.evidence.command);
 				gitEvidence.push({
 					...trackedNamesResult.evidence,
@@ -2676,6 +2915,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 					[0],
 					"Sorted untracked paths",
 				);
+				if (!isBuildOperationCurrent(ctx, operation)) return discardedBuildOperation("artifact finalization");
 				const untrackedPaths = parseNulList(untrackedResult.stdout, untrackedResult.evidence.command)
 					.filter((relative) => !isLeanFlowInternalRepositoryPath(relative))
 					.sort((left, right) => Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8")));
@@ -2688,6 +2928,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 				const emptyUntrackedFiles: string[] = [];
 				for (const relative of untrackedPaths) {
 					const { size } = await validateUntrackedPath(ctx, relative);
+					if (!isBuildOperationCurrent(ctx, operation)) return discardedBuildOperation("artifact finalization");
 					if (size === 0) {
 						emptyUntrackedFiles.push(relative);
 						continue;
@@ -2699,15 +2940,17 @@ export default function leanflow(pi: ExtensionAPI): void {
 						[1],
 						`Untracked binary diff: ${relative}`,
 					);
+					if (!isBuildOperationCurrent(ctx, operation)) return discardedBuildOperation("artifact finalization");
 					untrackedPatches.push({ path: relative, patch: patchResult.stdout });
 					gitEvidence.push(patchResult.evidence);
 				}
 
 				const completeDiff = composeCompleteDiff(trackedDiffResult.stdout, untrackedPatches, emptyUntrackedFiles);
 				const repositoryFingerprint = await captureRepositoryFingerprint(ctx, signal);
+				if (!isBuildOperationCurrent(ctx, operation)) return discardedBuildOperation("artifact finalization");
 				const validationStates = validationSemanticStates(
 					record,
-					state.approvedValidationContract,
+					operation.validationContract,
 					repositoryFingerprint.combinedDigest,
 				);
 				const incomplete = validationStates.filter((validation) => validation.status !== "passed");
@@ -2718,12 +2961,12 @@ export default function leanflow(pi: ExtensionAPI): void {
 				}
 				const validations = selectValidationObservations(
 					record,
-					state.approvedValidationContract,
+					operation.validationContract,
 					repositoryFingerprint.combinedDigest,
 				);
 				const changedPaths = [...new Set([...trackedPaths, ...untrackedPaths])];
 				const rendered = renderBuildArtifacts({
-					planArtifact: state.planArtifact,
+					planArtifact: operation.planArtifact,
 					record,
 					finalHead,
 					finalStatus,
@@ -2732,30 +2975,25 @@ export default function leanflow(pi: ExtensionAPI): void {
 					gitCommands: gitEvidence,
 					completeDiff,
 				});
-				const artifacts = expectedGateArtifacts(state);
-				if (!artifacts) throw new Error("canonical Gate artifact identity is unavailable");
 				const outputs = [
-					{ kind: "build", artifact: artifacts.build, content: rendered.build },
-					{ kind: "diff", artifact: artifacts.diff, content: rendered.diff },
-					{ kind: "evidence", artifact: artifacts.evidence, content: rendered.evidence },
+					{ kind: "build", filePath: operation.buildPath, content: rendered.build },
+					{ kind: "diff", filePath: operation.diffPath, content: rendered.diff },
+					{ kind: "evidence", filePath: operation.evidencePath, content: rendered.evidence },
 				] as const;
 
+				if (!isBuildOperationCurrent(ctx, operation)) return discardedBuildOperation("artifact finalization");
 				state.writtenArtifacts = [];
 				state.finalizedGateSnapshot = undefined;
 				persist();
-				try {
-					await fs.unlink(activeFinalizedSnapshotPath(ctx));
-				} catch (error) {
-					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-				}
 
 				const verified: string[] = [];
 				const artifactDigests = new Map<string, string>();
 				for (const output of outputs) {
-					const filePath = resolveRunMarkerPath(ctx.localProtocolOptions, output.artifact);
-					if (!filePath) throw new Error(`canonical ${output.kind} artifact path cannot be resolved`);
-					await writeTextAtomically(filePath, output.content);
-					const persisted = await fs.readFile(filePath, "utf8");
+					if (!(await writeBuildTextAtomically(ctx, operation, output.filePath, output.content))) {
+						return discardedBuildOperation("artifact finalization");
+					}
+					const persisted = await fs.readFile(output.filePath, "utf8");
+					if (!isBuildOperationCurrent(ctx, operation)) return discardedBuildOperation("artifact finalization");
 					const expectedBytes = Buffer.byteLength(output.content, "utf8");
 					const actualBytes = Buffer.byteLength(persisted, "utf8");
 					const expectedDigest = sha256Hex(output.content);
@@ -2767,14 +3005,15 @@ export default function leanflow(pi: ExtensionAPI): void {
 					verified.push(`${output.kind}.md ${actualBytes} bytes sha256:${actualDigest}`);
 				}
 
-				const recordText = await fs.readFile(activeBuildRecordPath(ctx), "utf8");
-				parseBuildEvidenceRecord(JSON.parse(recordText), activeBuildIdentity(recordRound));
+				const recordText = await fs.readFile(operation.recordPath, "utf8");
+				if (!isBuildOperationCurrent(ctx, operation)) return discardedBuildOperation("artifact finalization");
+				parseBuildEvidenceRecord(JSON.parse(recordText), operation);
 				const manifest = createFinalizedGateSnapshot({
-					runId: state.runId,
-					planSlug: state.planSlug!,
-					planDigest: state.planDigest,
-					approvedValidationDigest: state.approvedValidationDigest,
-					buildRecordRound: recordRound,
+					runId: operation.runId,
+					planSlug: operation.planSlug,
+					planDigest: operation.planDigest,
+					approvedValidationDigest: operation.approvedValidationDigest,
+					buildRecordRound: operation.round,
 					buildRecordDigest: sha256Hex(recordText),
 					buildArtifactDigest: artifactDigests.get("build")!,
 					diffArtifactDigest: artifactDigests.get("diff")!,
@@ -2782,10 +3021,13 @@ export default function leanflow(pi: ExtensionAPI): void {
 					repositoryFingerprint,
 					validationStates,
 				});
-				await writeJsonAtomically(activeFinalizedSnapshotPath(ctx), manifest);
+				if (!(await writeBuildJsonAtomically(ctx, operation, operation.finalizedSnapshotPath, manifest))) {
+					return discardedBuildOperation("artifact finalization");
+				}
 				const persistedManifest = parseFinalizedGateSnapshot(
-					JSON.parse(await fs.readFile(activeFinalizedSnapshotPath(ctx), "utf8")),
+					JSON.parse(await fs.readFile(operation.finalizedSnapshotPath, "utf8")),
 				);
+				if (!isBuildOperationCurrent(ctx, operation)) return discardedBuildOperation("artifact finalization");
 				if (!persistedManifest || finalizedGateSnapshotDigest(persistedManifest) !== finalizedGateSnapshotDigest(manifest)) {
 					throw new Error("finalized Gate manifest failed atomic persistence verification");
 				}
@@ -2802,8 +3044,8 @@ export default function leanflow(pi: ExtensionAPI): void {
 					],
 				};
 			} catch (error) {
+				if (!isBuildOperationCurrent(ctx, operation)) return discardedBuildOperation("artifact finalization");
 				return fail(evidenceFailureMessage(error));
-			}
 			} finally {
 				release();
 			}
@@ -2821,6 +3063,15 @@ export default function leanflow(pi: ExtensionAPI): void {
 				block: true,
 				reason: "LeanFlow: no tools are allowed while producing the terminal response.",
 			};
+		}
+
+		let scheduledObservationIdentity: BuildOperationIdentity | undefined;
+		if (state.phase === "building" && state.gateRetryMode !== "operational") {
+			try {
+				scheduledObservationIdentity = captureBuildOperationIdentity(ctx, expectedGateRoundForSnapshot());
+			} catch {
+				// Calls without a complete immutable BUILD identity cannot produce evidence.
+			}
 		}
 
 		if (event.toolName === "task" && !isTaskToolCall(event)) {
@@ -3101,15 +3352,30 @@ export default function leanflow(pi: ExtensionAPI): void {
 			persist();
 		}
 		if (state.phase === "building" && state.gateRetryMode !== "operational") {
-			if (event.toolName === "bash" && typeof event.input.command === "string" && event.input.command.trim()) {
+			if (
+				scheduledObservationIdentity &&
+				isBuildOperationCurrent(ctx, scheduledObservationIdentity) &&
+				event.toolName === "bash" &&
+				typeof event.input.command === "string" &&
+				event.input.command.trim()
+			) {
 				pendingEvidenceObservations.set(event.toolCallId, {
+					identity: scheduledObservationIdentity,
 					toolName: "bash",
 					command: event.input.command,
 				});
-			} else if (effect === "read_only") {
+			} else if (
+				scheduledObservationIdentity &&
+				isBuildOperationCurrent(ctx, scheduledObservationIdentity) &&
+				effect === "read_only"
+			) {
 				const lspRequest = parseLspObservationRequest(event);
 				if (lspRequest) {
-					pendingEvidenceObservations.set(event.toolCallId, { toolName: "lsp", lspRequest });
+					pendingEvidenceObservations.set(event.toolCallId, {
+						identity: scheduledObservationIdentity,
+						toolName: "lsp",
+						lspRequest,
+					});
 				}
 			}
 		}
@@ -3140,6 +3406,11 @@ export default function leanflow(pi: ExtensionAPI): void {
 					: explicitExitCode;
 			const observation: BuildEvidenceObservationV2 = {
 				toolCallId: event.toolCallId,
+				operationId: pendingObservation.identity.operationId,
+				runId: pendingObservation.identity.runId,
+				round: pendingObservation.identity.round,
+				planDigest: pendingObservation.identity.planDigest,
+				approvedValidationDigest: pendingObservation.identity.approvedValidationDigest,
 				toolName: pendingObservation.toolName,
 				...(pendingObservation.toolName === "bash"
 					? { command: pendingObservation.command }
@@ -3150,9 +3421,16 @@ export default function leanflow(pi: ExtensionAPI): void {
 				text: flattenTextContent(event.content),
 			};
 			try {
-				await appendBuildObservation(ctx, observation);
-				pendingEvidenceObservations.delete(event.toolCallId);
+				const appended = await appendBuildObservation(ctx, pendingObservation.identity, observation);
+				if (pendingEvidenceObservations.get(event.toolCallId) === pendingObservation) {
+					pendingEvidenceObservations.delete(event.toolCallId);
+				}
+				if (!appended) return;
 			} catch (error) {
+				if (pendingEvidenceObservations.get(event.toolCallId) === pendingObservation) {
+					pendingEvidenceObservations.delete(event.toolCallId);
+				}
+				if (!isBuildOperationCurrent(ctx, pendingObservation.identity)) return;
 				state.baselineCaptured = false;
 				state.buildMutationObserved = true;
 				state.writtenArtifacts = [];
@@ -3317,6 +3595,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 			) {
 				await writeRunMarker(ctx, "abandoned");
 			}
+			advanceBuildActivation();
 			pendingEvidenceObservations.clear();
 			state.baselineCaptured = false;
 			state.buildMutationObserved = false;

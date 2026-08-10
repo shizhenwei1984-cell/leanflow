@@ -47,6 +47,11 @@ function successfulObservation(
 ): BuildEvidenceObservationV2 {
 	return {
 		toolCallId,
+		operationId: `operation-${toolCallId}`,
+		runId: identity.runId,
+		round: identity.round,
+		planDigest: identity.planDigest,
+		approvedValidationDigest: identity.approvedValidationDigest,
 		toolName: "validation",
 		validationId: approved.id,
 		command: approved.displayCommand,
@@ -156,6 +161,26 @@ test("validation selection uses the approved tuple and current repository finger
 		exitCode: 1,
 	});
 	expect(() => selectValidationObservations(record, contract, repositoryFingerprint)).toThrow("failed");
+});
+
+test("legacy validation observations parse as history but cannot authorize the current record", () => {
+	const record = createBuildEvidenceRecord(identity);
+	const historical = successfulObservation();
+	delete historical.operationId;
+	delete historical.runId;
+	delete historical.round;
+	delete historical.planDigest;
+	delete historical.approvedValidationDigest;
+	record.observations.push(historical);
+	expect(parseBuildEvidenceRecord(record, identity)).toBe(record);
+	expect(validationSemanticStates(record, contract, repositoryFingerprint)).toEqual([{ id: approved.id, status: "missing" }]);
+	expect(() => selectValidationObservations(record, contract, repositoryFingerprint)).toThrow("missing");
+
+	record.observations.push({
+		...successfulObservation("mismatched record provenance", "validation-mismatch"),
+		runId: "3f414c4c-8f8f-4dca-8df3-9e0fabada555",
+	});
+	expect(() => parseBuildEvidenceRecord(record, identity)).toThrow("provenance does not match");
 });
 
 test("failed validation can become passed progress while unapproved history grants no authority", () => {

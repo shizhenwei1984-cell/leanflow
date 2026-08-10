@@ -6,7 +6,7 @@ import { expect, test } from "bun:test";
 import { z } from "zod";
 import { canonicalGateTask } from "../extensions/leanflow/guard";
 import { assessHandoff, formatHandoffNotification } from "../extensions/leanflow/handoff";
-import leanflow, { resolveRunMarkerPath } from "../extensions/leanflow/index";
+import leanflow, { resolveRunMarkerPath, setBuildPublicationStageHookForTest } from "../extensions/leanflow/index";
 import { finalizedGateSnapshotDigest, type FinalizedGateSnapshot } from "../extensions/leanflow/provenance";
 
 type TestContext = {
@@ -27,6 +27,7 @@ type TestContext = {
 type CommandDefinition = { handler: (args: string, ctx: TestContext) => Promise<void> };
 type ToolHandler = (event: Record<string, unknown>, ctx: TestContext) => Promise<unknown>;
 type ExecResult = { stdout: string; stderr: string; code: number; killed: boolean };
+type ExecCall = { command: string; args: string[]; signal?: AbortSignal };
 type RegisteredTool = {
 	execute: (
 		toolCallId: string,
@@ -86,11 +87,16 @@ type Harness = {
 	handlers: Map<string, ToolHandler>;
 	states: PersistedState[];
 	tools: Map<string, RegisteredTool>;
-	execCalls: { command: string; args: string[] }[];
+	execCalls: ExecCall[];
 	execResults: ExecResult[];
 };
 
-function createHarness(options: { execResults?: ExecResult[] } = {}): Harness {
+type HarnessOptions = {
+	execResults?: ExecResult[];
+	exec?: (call: ExecCall) => ExecResult | Promise<ExecResult> | undefined;
+};
+
+function createHarness(options: HarnessOptions = {}): Harness {
 	const handlers = new Map<string, ToolHandler>();
 	const commands = new Map<string, CommandDefinition>();
 	const tools = new Map<string, RegisteredTool>();
@@ -98,8 +104,9 @@ function createHarness(options: { execResults?: ExecResult[] } = {}): Harness {
 	const states: PersistedState[] = [];
 	const editorTexts: string[] = [];
 	const notifications: string[] = [];
-	const execCalls: { command: string; args: string[] }[] = [];
+	const execCalls: ExecCall[] = [];
 	const execResults = [...(options.execResults ?? [])];
+	let sessionId = "session-a";
 	const artifactsDir = mkdtempSync(join(tmpdir(), "leanflow-test-"));
 	mkdirSync(join(artifactsDir, "local"), { recursive: true });
 	mkdirSync(join(artifactsDir, "work", "src"), { recursive: true });
@@ -116,7 +123,7 @@ function createHarness(options: { execResults?: ExecResult[] } = {}): Harness {
 			setStatus: () => undefined,
 		},
 		sessionManager: { getBranch: () => branch },
-		localProtocolOptions: { getArtifactsDir: () => artifactsDir },
+		localProtocolOptions: { getArtifactsDir: () => artifactsDir, getSessionId: () => sessionId },
 	};
 	const defaultExec = (command: string, args: string[]): ExecResult => {
 		if (command !== "git") {
@@ -139,9 +146,10 @@ function createHarness(options: { execResults?: ExecResult[] } = {}): Harness {
 		on: (event: string, handler: ToolHandler) => handlers.set(event, handler),
 		registerCommand: (name: string, definition: CommandDefinition) => commands.set(name, definition),
 		registerTool: (definition: RegisteredTool & { name: string }) => tools.set(definition.name, definition),
-		exec: async (command: string, args: string[]) => {
-			execCalls.push({ command, args: [...args] });
-			return execResults.shift() ?? defaultExec(command, args);
+		exec: async (command: string, args: string[], execOptions?: { signal?: AbortSignal }) => {
+			const call = { command, args: [...args], ...(execOptions?.signal ? { signal: execOptions.signal } : {}) };
+			execCalls.push(call);
+			return (await options.exec?.(call)) ?? execResults.shift() ?? defaultExec(command, args);
 		},
 		appendEntry: (customType: string, state: PersistedState) => {
 			const snapshot = structuredClone(state);
@@ -162,6 +170,14 @@ function createHarness(options: { execResults?: ExecResult[] } = {}): Harness {
 		states,
 		tools,
 	};
+}
+
+function createDeferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+	let resolve!: (value: T) => void;
+	const promise = new Promise<T>((complete) => {
+		resolve = complete;
+	});
+	return { promise, resolve };
 }
 
 const EXAMPLE_TASK = "example";
@@ -3796,6 +3812,261 @@ test("parallel baseline capture and validations serialize before finalization", 
 	expect(validationIds).toEqual(contract!.validations.map((validation) => validation.id).sort());
 	expect(record.baseline?.head).toBe("a".repeat(40));
 	expect(harness.states.at(-1)?.finalizedGateSnapshot).toBeDefined();
+	expect(
+		existsSync(
+			resolveRunMarkerPath(
+				harness.ctx.localProtocolOptions,
+				`local://.leanflow/runs/${harness.states.at(-1)!.runId}-finalized-gate.json`,
+			)!,
+		),
+	).toBe(true);
+});
+
+test("a delayed validation from run A is discarded and cannot authorize run B", async () => {
+	const delayed = createDeferred<ExecResult>();
+	const started = createDeferred<void>();
+	let delayValidation = true;
+	let delayedSignal: AbortSignal | undefined;
+	const harness = createHarness({
+		exec: (call) => {
+			if (delayValidation && call.command !== "git") {
+				delayValidation = false;
+				delayedSignal = call.signal;
+				started.resolve();
+				return delayed.promise;
+			}
+			return undefined;
+		},
+	});
+	await enterDocumentationBuild(harness);
+	await executeRegisteredTool(harness, "leanflow_capture_baseline", {}, "run-a-baseline");
+	const runA = harness.states.at(-1)!.runId!;
+	const validationA = (harness.states.at(-1) as PersistedState & {
+		approvedValidationContract: { validations: Array<{ id: string }> };
+	}).approvedValidationContract.validations[0]!.id;
+	const delayedValidation = harness.tools
+		.get("leanflow_run_validation")!
+		.execute("run-a-validation", { validationId: validationA }, undefined, undefined, harness.ctx);
+	await started.promise;
+
+	await enterDocumentationBuild(harness);
+	const runB = harness.states.at(-1)!.runId!;
+	expect(runB).not.toBe(runA);
+	await executeRegisteredTool(harness, "leanflow_capture_baseline", {}, "run-b-baseline");
+	const missingOwnValidation = await executeRegisteredTool(harness, "leanflow_finalize_artifacts", {}, "run-b-incomplete");
+	expect(missingOwnValidation.isError).toBe(true);
+	expect(JSON.stringify(missingOwnValidation.content)).toContain("incomplete");
+	await recordSuccessfulValidation(harness, "bun test tests/leanflow_lsp_guard.test.ts");
+	const finalizedB = await executeRegisteredTool(harness, "leanflow_finalize_artifacts", {}, "run-b-finalize");
+	expect(finalizedB.isError).not.toBe(true);
+	const recordBefore = readFileSync(buildRecordPath(harness), "utf8");
+	expect(delayedSignal?.aborted).toBe(true);
+
+	delayed.resolve({ stdout: "1 pass\n0 fail\n", stderr: "", code: 0, killed: false });
+	const discarded = await delayedValidation;
+	expect(JSON.stringify(discarded.content)).toContain("discarded");
+	expect(readFileSync(buildRecordPath(harness), "utf8")).toBe(recordBefore);
+	const record = JSON.parse(recordBefore) as { observations: Array<{ toolName: string; runId?: string }> };
+	expect(record.observations.filter((observation) => observation.toolName === "validation")).toEqual([
+		expect.objectContaining({ runId: runB }),
+	]);
+});
+
+test("a delayed baseline from run A cannot set or write run B's baseline", async () => {
+	const delayed = createDeferred<ExecResult>();
+	const started = createDeferred<void>();
+	let delayBaseline = true;
+	const harness = createHarness({
+		exec: (call) => {
+			if (delayBaseline && call.command === "git" && call.args[0] === "rev-parse") {
+				delayBaseline = false;
+				started.resolve();
+				return delayed.promise;
+			}
+			return undefined;
+		},
+	});
+	await enterDocumentationBuild(harness);
+	const captureA = harness.tools
+		.get("leanflow_capture_baseline")!
+		.execute("run-a-baseline-delayed", {}, undefined, undefined, harness.ctx);
+	await started.promise;
+
+	await enterDocumentationBuild(harness);
+	const runB = harness.states.at(-1)!.runId!;
+	const capturedB = await executeRegisteredTool(harness, "leanflow_capture_baseline", {}, "run-b-baseline");
+	expect(capturedB.isError).not.toBe(true);
+	const recordBefore = readFileSync(buildRecordPath(harness), "utf8");
+	expect(JSON.parse(recordBefore).baseline.head).toBe("a".repeat(40));
+
+	delayed.resolve({ stdout: `${"b".repeat(40)}\n`, stderr: "", code: 0, killed: false });
+	const discarded = await captureA;
+	expect(JSON.stringify(discarded.content)).toContain("discarded");
+	expect(harness.states.at(-1)).toMatchObject({ runId: runB, baselineCaptured: true });
+	expect(readFileSync(buildRecordPath(harness), "utf8")).toBe(recordBefore);
+});
+
+test("a delayed finalization from run A cannot publish or overwrite run B's manifest", async () => {
+	const delayed = createDeferred<ExecResult>();
+	const started = createDeferred<void>();
+	let delayFinalization = false;
+	const harness = createHarness({
+		exec: (call) => {
+			if (delayFinalization && call.command === "git" && call.args[0] === "rev-parse") {
+				delayFinalization = false;
+				started.resolve();
+				return delayed.promise;
+			}
+			return undefined;
+		},
+	});
+	await enterDocumentationBuild(harness);
+	await executeRegisteredTool(harness, "leanflow_capture_baseline", {}, "run-a-baseline");
+	await recordSuccessfulValidation(harness, "bun test tests/leanflow_lsp_guard.test.ts");
+	delayFinalization = true;
+	const finalizeA = harness.tools
+		.get("leanflow_finalize_artifacts")!
+		.execute("run-a-finalize", {}, undefined, undefined, harness.ctx);
+	await started.promise;
+
+	await enterDocumentationBuild(harness);
+	const runB = harness.states.at(-1)!.runId!;
+	await completeBuildEvidence(harness);
+	const manifestPath = resolveRunMarkerPath(
+		harness.ctx.localProtocolOptions,
+		`local://.leanflow/runs/${runB}-finalized-gate.json`,
+	)!;
+	const manifestBefore = readFileSync(manifestPath, "utf8");
+	const buildPath = resolveRunMarkerPath(harness.ctx.localProtocolOptions, gateArtifacts().build)!;
+	const buildBefore = readFileSync(buildPath, "utf8");
+
+	delayed.resolve({ stdout: `${"b".repeat(40)}\n`, stderr: "", code: 0, killed: false });
+	const discarded = await finalizeA;
+	expect(JSON.stringify(discarded.content)).toContain("discarded");
+	expect(harness.states.at(-1)).toMatchObject({ runId: runB, finalizedGateSnapshot: expect.any(Object) });
+	expect(readFileSync(manifestPath, "utf8")).toBe(manifestBefore);
+	expect(readFileSync(buildPath, "utf8")).toBe(buildBefore);
+});
+
+test("a staged stale finalization leaves run-B publications byte-identical", async () => {
+	const staged = createDeferred<void>();
+	const stagedReached = createDeferred<void>();
+	try {
+		const harness = createHarness();
+		await enterDocumentationBuild(harness);
+		await executeRegisteredTool(harness, "leanflow_capture_baseline", {}, "staged-a-baseline");
+		await recordSuccessfulValidation(harness, "bun test tests/leanflow_lsp_guard.test.ts");
+		let holdFirstPublication = true;
+		setBuildPublicationStageHookForTest(async () => {
+			if (!holdFirstPublication) return;
+			holdFirstPublication = false;
+			stagedReached.resolve();
+			await staged.promise;
+		});
+		const finalizeA = harness.tools
+			.get("leanflow_finalize_artifacts")!
+			.execute("staged-a-finalize", {}, undefined, undefined, harness.ctx);
+		await stagedReached.promise;
+
+		await enterDocumentationBuild(harness);
+		const runB = harness.states.at(-1)!.runId!;
+		await completeBuildEvidence(harness);
+		const publicationPaths = [
+			gateArtifacts().build,
+			gateArtifacts().diff,
+			gateArtifacts().evidence,
+			`local://.leanflow/runs/${runB}-finalized-gate.json`,
+		].map((artifact) => resolveRunMarkerPath(harness.ctx.localProtocolOptions, artifact)!);
+		publicationPaths.push(buildRecordPath(harness));
+		const publishedBytes = publicationPaths.map((filePath) => readFileSync(filePath, "utf8"));
+
+		staged.resolve();
+		const discarded = await finalizeA;
+		expect(JSON.stringify(discarded.content)).toContain("discarded");
+		expect(publicationPaths.map((filePath) => readFileSync(filePath, "utf8"))).toEqual(publishedBytes);
+	} finally {
+		staged.resolve();
+		setBuildPublicationStageHookForTest(undefined);
+	}
+});
+
+test("a hung run-A validation does not block run-B baseline, validation, or finalization", async () => {
+	const delayed = createDeferred<ExecResult>();
+	const started = createDeferred<void>();
+	let hangRunA = true;
+	const harness = createHarness({
+		exec: (call) => {
+			if (hangRunA && call.command !== "git") {
+				hangRunA = false;
+				started.resolve();
+				return delayed.promise;
+			}
+			return undefined;
+		},
+	});
+	await enterDocumentationBuild(harness);
+	await executeRegisteredTool(harness, "leanflow_capture_baseline", {}, "hung-a-baseline");
+	const validationA = (harness.states.at(-1) as PersistedState & {
+		approvedValidationContract: { validations: Array<{ id: string }> };
+	}).approvedValidationContract.validations[0]!.id;
+	const hung = harness.tools
+		.get("leanflow_run_validation")!
+		.execute("hung-a-validation", { validationId: validationA }, undefined, undefined, harness.ctx);
+	await started.promise;
+
+	await enterDocumentationBuild(harness);
+	const runB = harness.states.at(-1)!.runId!;
+	await completeBuildEvidence(harness);
+	expect(harness.states.at(-1)).toMatchObject({
+		runId: runB,
+		baselineCaptured: true,
+		finalizedGateSnapshot: expect.any(Object),
+	});
+
+	delayed.resolve({ stdout: "1 pass\n0 fail\n", stderr: "", code: 0, killed: false });
+	const discarded = await hung;
+	expect(JSON.stringify(discarded.content)).toContain("discarded");
+	expect(harness.states.at(-1)).toMatchObject({ runId: runB, finalizedGateSnapshot: expect.any(Object) });
+});
+
+test("same-run session restoration does not wait behind a suspended old-epoch validation", async () => {
+	const delayed = createDeferred<ExecResult>();
+	const started = createDeferred<void>();
+	let suspendOldValidation = true;
+	let oldSignal: AbortSignal | undefined;
+	const harness = createHarness({
+		exec: (call) => {
+			if (suspendOldValidation && call.command !== "git") {
+				suspendOldValidation = false;
+				oldSignal = call.signal;
+				started.resolve();
+				return delayed.promise;
+			}
+			return undefined;
+		},
+	});
+	await enterDocumentationBuild(harness);
+	await executeRegisteredTool(harness, "leanflow_capture_baseline", {}, "same-run-baseline");
+	const runId = harness.states.at(-1)!.runId!;
+	const validationId = (harness.states.at(-1) as PersistedState & {
+		approvedValidationContract: { validations: Array<{ id: string }> };
+	}).approvedValidationContract.validations[0]!.id;
+	const suspended = harness.tools
+		.get("leanflow_run_validation")!
+		.execute("same-run-old-validation", { validationId }, undefined, undefined, harness.ctx);
+	await started.promise;
+
+	await harness.handlers.get("session_switch")!({}, harness.ctx);
+	expect(harness.states.at(-1)).toMatchObject({ runId, phase: "building", baselineCaptured: true });
+	await recordSuccessfulValidation(harness, "bun test tests/leanflow_lsp_guard.test.ts");
+	const finalized = await executeRegisteredTool(harness, "leanflow_finalize_artifacts", {}, "same-run-finalize");
+	expect(finalized.isError).not.toBe(true);
+	expect(oldSignal?.aborted).toBe(true);
+
+	delayed.resolve({ stdout: "1 pass\n0 fail\n", stderr: "", code: 0, killed: false });
+	const discarded = await suspended;
+	expect(JSON.stringify(discarded.content)).toContain("discarded");
+	expect(harness.states.at(-1)).toMatchObject({ runId, finalizedGateSnapshot: expect.any(Object) });
 });
 
 

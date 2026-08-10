@@ -23,6 +23,12 @@ export interface ParsedLspRequest {
 
 export interface BuildEvidenceObservationV2 {
 	toolCallId: string;
+	/** Immutable operation provenance; absent only on historical observations. */
+	operationId?: string;
+	runId?: string;
+	round?: number;
+	planDigest?: string;
+	approvedValidationDigest?: string;
 	toolName: "bash" | "lsp" | "validation";
 	command?: string;
 	validationId?: string;
@@ -124,6 +130,11 @@ const LEGACY_RECORD_KEYS = ["version", "runId", "planSlug", "planDigest", "round
 const BASELINE_KEYS = ["head", "status", "capturedAt"] as const;
 const OBSERVATION_KEYS = [
 	"toolCallId",
+	"operationId",
+	"runId",
+	"round",
+	"planDigest",
+	"approvedValidationDigest",
 	"toolName",
 	"command",
 	"validationId",
@@ -148,6 +159,13 @@ const LEGACY_OBSERVATION_KEYS = [
 	"exitCode",
 	"timedOut",
 	"text",
+] as const;
+const OBSERVATION_PROVENANCE_KEYS = [
+	"operationId",
+	"runId",
+	"round",
+	"planDigest",
+	"approvedValidationDigest",
 ] as const;
 const LSP_REQUEST_KEYS = ["action", "file", "line", "symbol", "query", "new_name", "apply", "timeout", "payload"] as const;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
@@ -208,7 +226,7 @@ function assertParsedLspRequest(value: unknown): asserts value is ParsedLspReque
 	}
 }
 
-function assertObservation(value: unknown): asserts value is BuildEvidenceObservationV2 {
+function assertObservation(value: unknown, expected?: BuildRecordIdentity): asserts value is BuildEvidenceObservationV2 {
 	if (!isPlainRecord(value) || !hasOnlyKeys(value, OBSERVATION_KEYS)) {
 		throw new BuildEvidenceError("Build record contains an invalid observation object.");
 	}
@@ -220,6 +238,7 @@ function assertObservation(value: unknown): asserts value is BuildEvidenceObserv
 	) {
 		throw new BuildEvidenceError("Build record observation is missing required fields.");
 	}
+	assertObservationProvenance(value, expected);
 	if (value.exitCode !== undefined && !finiteInteger(value.exitCode)) {
 		throw new BuildEvidenceError("Build record observation has an invalid exit code.");
 	}
@@ -280,6 +299,35 @@ function assertObservation(value: unknown): asserts value is BuildEvidenceObserv
 	}
 }
 
+function assertObservationProvenance(value: Record<string, unknown>, expected?: BuildRecordIdentity): void {
+	const supplied = OBSERVATION_PROVENANCE_KEYS.filter((key) => value[key] !== undefined);
+	if (supplied.length === 0) return; // Parsed as historical evidence only.
+	if (supplied.length !== OBSERVATION_PROVENANCE_KEYS.length) {
+		throw new BuildEvidenceError("Build record observation has incomplete operation provenance.");
+	}
+	if (
+		!nonEmptyString(value.operationId) ||
+		!nonEmptyString(value.runId) ||
+		!finiteInteger(value.round) ||
+		(value.round as number) < 1 ||
+		typeof value.planDigest !== "string" ||
+		!SHA256_PATTERN.test(value.planDigest) ||
+		typeof value.approvedValidationDigest !== "string" ||
+		!SHA256_PATTERN.test(value.approvedValidationDigest)
+	) {
+		throw new BuildEvidenceError("Build record observation has invalid operation provenance.");
+	}
+	if (
+		expected &&
+		(value.runId !== expected.runId ||
+			value.round !== expected.round ||
+			value.planDigest !== expected.planDigest ||
+			value.approvedValidationDigest !== expected.approvedValidationDigest)
+	) {
+		throw new BuildEvidenceError("Build record observation provenance does not match the record identity.");
+	}
+}
+
 export function createBuildEvidenceRecord(identity: BuildRecordIdentity): BuildEvidenceRecordV2 {
 	assertIdentity(identity);
 	return {
@@ -310,7 +358,7 @@ export function parseBuildEvidenceRecord(value: unknown, expected: BuildRecordId
 		throw new BuildEvidenceError("Internal build record identity does not match the active LeanFlow run.");
 	}
 	if (value.baseline !== undefined) assertBaseline(value.baseline);
-	for (const observation of value.observations) assertObservation(observation);
+	for (const observation of value.observations) assertObservation(observation, expected);
 	return value as unknown as BuildEvidenceRecordV2;
 }
 
@@ -335,7 +383,14 @@ export function parseBuildEvidenceRecordWithoutRound(
 		throw new BuildEvidenceError("Internal build record has an invalid round.");
 	}
 	if (value.baseline !== undefined) assertBaseline(value.baseline);
-	for (const observation of value.observations) assertObservation(observation);
+	const recordIdentity: BuildRecordIdentity = {
+		runId: expected.runId,
+		planSlug: expected.planSlug,
+		planDigest: expected.planDigest,
+		approvedValidationDigest: expected.approvedValidationDigest,
+		round: value.round as number,
+	};
+	for (const observation of value.observations) assertObservation(observation, recordIdentity);
 	return value as unknown as BuildEvidenceRecordV2;
 }
 
@@ -392,6 +447,21 @@ function assertIdentity(identity: BuildRecordIdentity): void {
 	}
 }
 
+/** Historical observations may remain readable, but cannot authorize a current BUILD validation. */
+export function hasAuthoritativeObservationProvenance(
+	observation: BuildEvidenceObservationV2,
+	record: BuildEvidenceRecordV2,
+): boolean {
+	return (
+		typeof observation.operationId === "string" &&
+		observation.operationId.length > 0 &&
+		observation.runId === record.runId &&
+		observation.round === record.round &&
+		observation.planDigest === record.planDigest &&
+		observation.approvedValidationDigest === record.approvedValidationDigest
+	);
+}
+
 export function validationSemanticStates(
 	record: BuildEvidenceRecordV2,
 	contract: ApprovedValidationContract,
@@ -402,7 +472,7 @@ export function validationSemanticStates(
 	}
 	const approvedById = new Map(contract.validations.map((validation) => [validation.id, validation]));
 	for (const observation of record.observations) {
-		if (observation.toolName !== "validation") continue;
+		if (observation.toolName !== "validation" || !hasAuthoritativeObservationProvenance(observation, record)) continue;
 		const approved = approvedById.get(observation.validationId!);
 		if (
 			!approved ||
@@ -418,6 +488,7 @@ export function validationSemanticStates(
 			.filter(
 				(candidate) =>
 					candidate.toolName === "validation" &&
+					hasAuthoritativeObservationProvenance(candidate, record) &&
 					candidate.validationId === validation.id &&
 					candidate.command === validation.displayCommand &&
 					candidate.executable === validation.executable &&
@@ -477,6 +548,7 @@ export function selectValidationObservations(
 			.filter(
 				(candidate) =>
 					candidate.toolName === "validation" &&
+					hasAuthoritativeObservationProvenance(candidate, record) &&
 					candidate.validationId === validation.id &&
 					candidate.command === validation.displayCommand &&
 					candidate.executable === validation.executable &&
