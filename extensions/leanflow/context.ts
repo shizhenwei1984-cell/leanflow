@@ -138,7 +138,7 @@ function buildBuilderPreamble(state: LeanFlowState): string {
 		}
 		lines.push(
 			"For each changed source path served by LSP, attempt diagnostics before and after edits; a new file has no pre-edit baseline and is checked after creation. Attempt references before exported-symbol edits. Repair all introduced errors and warnings; a completed no-server/error probe is a fallback, never a substitute for compiler checks, executable tests, or runtime smoke validation.",
-			"Run every planned validation synchronously with bash. Then call leanflow_finalize_artifacts({ validationCommands: [\"<exact command already run>\"] }); list every selected command exactly once.",
+			"For every approved validation ID listed by leanflow_capture_baseline, call leanflow_run_validation({ validationId: \"<validation-id>\" }). Then call leanflow_finalize_artifacts({}); the extension executes the immutable approved command tuples and requires a current pass for every required ID.",
 			`Do not write or edit ${prefix}-build.md, ${prefix}-diff.md, or ${prefix}-evidence.md directly. The extension records results and generates all three artifacts mechanically.`,
 		);
 	}

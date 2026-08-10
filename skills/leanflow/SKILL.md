@@ -10,7 +10,7 @@ LeanFlow uses a minimum-agent architecture with an extension-driven control laye
 - **Planner (`@plan`)** — Main Session plan mode. Understands the request, investigates, decides feasibility and acceptance coverage, writes the canonical plan, and requests approval.
 - **Scout (`@smol`)** — Optional cheap factual investigation. Finds repository facts, call paths, tests, official documentation, and external facts. It never plans, writes, reviews, returns PASS/FAIL, or spawns agents.
 - **Builder (`@default`)** — The same Main Session after approval. It is the only writer.
-- **Gate (`@slow`)** — The one independent final reviewer. It checks plan, diff, and validation evidence and returns PASS or FAIL.
+- **Gate (`@slow`)** — The one independent final reviewer. It checks plan, diff, and validation evidence and returns PASS, FAIL, or structured BLOCKED.
 
 ```text
 Main Session
@@ -42,7 +42,7 @@ The `/flow` command initializes an extension state machine (`idle → planning �
 
 ## Evidence
 
-Main writes only `local://<slug>-plan.md`. After the required initial LSP probe, `leanflow_capture_baseline({})` freezes HEAD/status in an extension-owned record. Main runs validations synchronously, then `leanflow_finalize_artifacts({ validationCommands: [...] })` mechanically generates and verifies `local://<slug>-build.md`, `local://<slug>-diff.md`, and `local://<slug>-evidence.md`; direct writes are blocked. Gate reads all four artifacts by reference and has no shell access. Repair rounds retain the original baseline, clear prior-round observations, rerun validations, and regenerate artifacts. Evidence recovery permits only exact commands parsed from the approved plan's Verification section; a new successful approved-validation observation resets the repeated-BLOCKED detector, while unchanged plan/repository/approved-validation evidence with the same BLOCKED finding pauses for human action. Unrelated LSP observations do not count as recovery progress.
+Main writes only `local://<slug>-plan.md`. After the required initial LSP probe, `leanflow_capture_baseline({})` freezes HEAD/status in an extension-owned record and lists the immutable approved validation IDs. Main calls `leanflow_run_validation({ validationId })` for each required entry; the extension executes the approved executable/argv directly, captures repository fingerprints before/after, and rejects mutating or stale evidence. `leanflow_finalize_artifacts({})` mechanically generates `build.md`, `diff.md`, and `evidence.md`, then atomically commits a digest-bound finalized manifest; direct writes are blocked. Gate reads the plan and generated artifacts by reference and has no shell access. Repair rounds keep the baseline but use a new explicit BUILD round and fresh observations. Evidence recovery permits only affected approved validation IDs plus re-finalization, while operational recovery permits only unchanged-manifest Gate redispatch.
 
 ## Model roles
 

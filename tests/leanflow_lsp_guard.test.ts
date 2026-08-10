@@ -7,6 +7,7 @@ import { z } from "zod";
 import { canonicalGateTask } from "../extensions/leanflow/guard";
 import { assessHandoff, formatHandoffNotification } from "../extensions/leanflow/handoff";
 import leanflow, { resolveRunMarkerPath } from "../extensions/leanflow/index";
+import { finalizedGateSnapshotDigest, type FinalizedGateSnapshot } from "../extensions/leanflow/provenance";
 
 type TestContext = {
 	hasUI: boolean;
@@ -39,6 +40,7 @@ type PersistedState = {
 	phase: string;
 	gateCalls: number;
 	gateAttempt: number;
+	currentBuildRound?: number;
 	handoffStatus?: string;
 	handoffWarnings?: string[];
 	handoffBlockers?: string[];
@@ -67,6 +69,7 @@ type PersistedState = {
 	persistenceFailureCode?: string;
 	persistenceFailureMessage?: string;
 	writtenArtifacts?: string[];
+	finalizedGateSnapshot?: unknown;
 	gateRetryMode?: "repair" | "operational" | "evidence";
 	humanRepairCycles?: number;
 	lastGateFindings?: string;
@@ -116,7 +119,9 @@ function createHarness(options: { execResults?: ExecResult[] } = {}): Harness {
 		localProtocolOptions: { getArtifactsDir: () => artifactsDir },
 	};
 	const defaultExec = (command: string, args: string[]): ExecResult => {
-		if (command !== "git") return { stdout: "", stderr: `unexpected executable: ${command}`, code: 127, killed: false };
+		if (command !== "git") {
+			return { stdout: "1 pass\n0 fail\n2 expect() calls\nRan 1 test across 1 file.\n", stderr: "", code: 0, killed: false };
+		}
 		if (args[0] === "rev-parse") {
 			return { stdout: `${"a".repeat(40)}\n`, stderr: "", code: 0, killed: false };
 		}
@@ -187,6 +192,35 @@ function gateCallInput(options: { batch?: boolean; slug?: string } = {}): Record
 	};
 	return options.batch === false ? item : { context: "LeanFlow Gate", tasks: [item] };
 }
+function blockedGateText(
+	harness: Harness,
+	options: {
+		reasonCode?: string;
+		issue?: string;
+		requiredFix?: string;
+	} = {},
+): string {
+	const state = harness.states.at(-1) as PersistedState & {
+		approvedValidationContract?: { validations: Array<{ id: string }> };
+	};
+	const evidenceId = state.approvedValidationContract?.validations[0]?.id;
+	if (!evidenceId) throw new Error("approved validation evidence ID is unavailable");
+	return JSON.stringify({
+		verdict: "BLOCKED",
+		findings: [
+			{
+				category: "validation_failure",
+				severity: "blocking",
+				file: "local://example-evidence.md",
+				location: "verification",
+				issue: options.issue ?? "Required validation evidence is missing.",
+				required_fix: options.requiredFix ?? "Run the missing validation and finalize evidence again.",
+			},
+		],
+		reason_code: options.reasonCode ?? "missing_validation",
+		evidence_ids: [evidenceId],
+	});
+}
 
 function buildRecordPath(harness: Harness): string {
 	const runId = harness.states.at(-1)!.runId!;
@@ -198,7 +232,7 @@ function buildRecordPath(harness: Harness): string {
 
 async function executeRegisteredTool(
 	harness: Harness,
-	name: "leanflow_capture_baseline" | "leanflow_finalize_artifacts",
+	name: "leanflow_capture_baseline" | "leanflow_run_validation" | "leanflow_finalize_artifacts",
 	params: Record<string, unknown>,
 	toolCallId = `${name}-${harness.states.length}`,
 ) {
@@ -222,50 +256,45 @@ async function executeRegisteredTool(
 async function recordSuccessfulValidation(
 	harness: Harness,
 	command: string,
-	output = "1 pass\n0 fail\n2 expect() calls\nRan 1 test across 1 file.",
 ): Promise<void> {
-	const toolCallId = `validation-${harness.states.length}`;
-	const callResult = await harness.handlers.get("tool_call")!(
-		{ toolName: "bash", toolCallId, input: { command } },
-		harness.ctx,
+	const state = harness.states.at(-1)! as PersistedState & {
+		approvedValidationContract?: { validations: Array<{ id: string; displayCommand: string }> };
+	};
+	const validation =
+		state.approvedValidationContract?.validations.find((candidate) => candidate.displayCommand === command) ??
+		state.approvedValidationContract?.validations[0];
+	if (!validation) throw new Error(`approved validation not found: ${command}`);
+	const result = await executeRegisteredTool(
+		harness,
+		"leanflow_run_validation",
+		{ validationId: validation.id },
+		`validation-${harness.states.length}`,
 	);
-	if (
-		callResult &&
-		typeof callResult === "object" &&
-		"block" in callResult &&
-		callResult.block === true
-	) {
-		throw new Error(`validation blocked: ${JSON.stringify(callResult)}`);
-	}
-	await harness.handlers.get("tool_result")!(
-		{
-			toolName: "bash",
-			toolCallId,
-			isError: false,
-			details: {},
-			content: [{ type: "text", text: output }],
-		},
-		harness.ctx,
-	);
+	if (result.isError) throw new Error(`validation failed: ${JSON.stringify(result.content)}`);
 }
 
 async function completeBuildEvidence(
 	harness: Harness,
-	command = "bun test tests/*.test.ts",
+	command = "bun test tests/leanflow_lsp_guard.test.ts",
 ): Promise<void> {
 	if (harness.states.at(-1)!.baselineCaptured !== true) {
 		const capture = await executeRegisteredTool(harness, "leanflow_capture_baseline", {});
 		if (capture.isError) throw new Error(`baseline capture failed: ${JSON.stringify(capture.content)}`);
 	}
 	await recordSuccessfulValidation(harness, command);
-	const finalized = await executeRegisteredTool(harness, "leanflow_finalize_artifacts", {
-		validationCommands: [command],
-	});
+	const finalized = await executeRegisteredTool(harness, "leanflow_finalize_artifacts", {});
 	if (finalized.isError) throw new Error(`artifact finalization failed: ${JSON.stringify(finalized.content)}`);
 }
 
-async function enterDocumentationBuild(harness: Harness): Promise<void> {
-	await writeInitialPlan(harness, "Update docs only.\nLSP applicability: not_required");
+async function enterDocumentationBuild(
+	harness: Harness,
+	validationCommands?: readonly string[],
+): Promise<void> {
+	await writeInitialPlan(
+		harness,
+		"Update docs only.\nLSP applicability: not_required",
+		validationCommands,
+	);
 	const call = harness.handlers.get("tool_call")!;
 	const result = harness.handlers.get("tool_result")!;
 	await call(
@@ -361,6 +390,7 @@ function writeFreshArtifacts(
 async function writeInitialPlan(
 	harness: Harness,
 	content = "Update src/example.ts with the requested behavior and run focused tests.\nLSP applicability: required",
+	validationCommands: readonly string[] = ["bun test tests/leanflow_lsp_guard.test.ts"],
 ): Promise<void> {
 	await harness.commands.get("flow")!.handler(EXAMPLE_TASK, harness.ctx);
 	const latest = harness.states.at(-1)!;
@@ -371,7 +401,7 @@ async function writeInitialPlan(
 		"## Acceptance",
 		"- [ ] Expected behavior must remain observable.",
 		"## Verification",
-		"`bun test tests/leanflow_lsp_guard.test.ts`",
+		...validationCommands.map((command) => `\`${command}\``),
 		"Consider edge cases.",
 		`LeanFlow run ID: ${latest.runId}`,
 	].join("\n");
@@ -1092,7 +1122,7 @@ test("admits strict xd-routed extension tools without recording repository mutat
 		});
 	}
 
-	const validationCommands = ["bun test tests/leanflow_lsp_guard.test.ts"];
+	const validationCommand = "bun test tests/leanflow_lsp_guard.test.ts";
 	expect(
 		await call(
 			{
@@ -1100,7 +1130,7 @@ test("admits strict xd-routed extension tools without recording repository mutat
 				toolCallId: "routed-finalize-before-baseline",
 				input: {
 					path: "xd://leanflow_finalize_artifacts",
-					content: JSON.stringify({ validationCommands }),
+					content: "{}",
 				},
 			},
 			harness.ctx,
@@ -1127,9 +1157,32 @@ test("admits strict xd-routed extension tools without recording repository mutat
 		.execute(captureToolCallId, {}, undefined, undefined, harness.ctx);
 	expect(capture.isError).not.toBe(true);
 
-	await recordSuccessfulValidation(harness, validationCommands[0]!);
+	const validation = (
+		harness.states.at(-1) as PersistedState & {
+			approvedValidationContract: { validations: Array<{ id: string; displayCommand: string }> };
+		}
+	).approvedValidationContract.validations.find((candidate) => candidate.displayCommand === validationCommand)!;
+	const validationToolCallId = "routed-validation";
+	expect(
+		await call(
+			{
+				toolName: "write",
+				toolCallId: validationToolCallId,
+				input: {
+					path: "xd://leanflow_run_validation",
+					content: JSON.stringify({ validationId: validation.id }),
+				},
+			},
+			harness.ctx,
+		),
+	).toBeUndefined();
+	const validationResult = await harness.tools
+		.get("leanflow_run_validation")!
+		.execute(validationToolCallId, { validationId: validation.id }, undefined, undefined, harness.ctx);
+	expect(validationResult.isError).not.toBe(true);
+
 	const finalizeToolCallId = "routed-finalize";
-	const finalizeParams = { validationCommands };
+	const finalizeParams = {};
 	const stateCountBeforeFinalize = harness.states.length;
 	expect(
 		await call(
@@ -1138,7 +1191,7 @@ test("admits strict xd-routed extension tools without recording repository mutat
 				toolCallId: finalizeToolCallId,
 				input: {
 					path: "xd://leanflow_finalize_artifacts",
-					content: JSON.stringify(finalizeParams),
+					content: "{}",
 				},
 			},
 			harness.ctx,
@@ -1535,15 +1588,11 @@ test("accepts one strict Gate call with canonical artifact references", async ()
 			),
 
 		).toBeUndefined();
-		const artifacts = gateArtifacts();
-		const readArtifact = (artifact: string) =>
-			readFileSync(resolveRunMarkerPath(harness.ctx.localProtocolOptions, artifact)!, "utf8");
-		const expectedSnapshot = createHash("sha256")
-			.update(
-				`${harness.states.at(-1)!.planDigest}\n${readArtifact(artifacts.build)}\n${readArtifact(artifacts.diff)}\n${readArtifact(artifacts.evidence)}`,
-				"utf8",
-			)
-			.digest("hex");
+		const finalizedSnapshot = (
+			harness.states.at(-1) as PersistedState & { finalizedGateSnapshot?: FinalizedGateSnapshot }
+		).finalizedGateSnapshot;
+		if (!finalizedSnapshot) throw new Error("finalized Gate snapshot is unavailable");
+		const expectedSnapshot = finalizedGateSnapshotDigest(finalizedSnapshot);
 		expect(harness.states.at(-1)).toMatchObject({
 			phase: "gating",
 			gateCalls: 0,
@@ -1628,7 +1677,7 @@ test("snapshot preflight rejects a stale canonical plan without consuming Gate b
 		),
 	).toMatchObject({
 		block: true,
-		reason: expect.stringContaining("canonical plan digest does not match the approved plan"),
+		reason: expect.stringContaining("canonical plan digest changed after finalization"),
 	});
 	expect(harness.states.at(-1)).toMatchObject({ phase: "building", gateCalls: 0, gateAttempt: 0 });
 });
@@ -1648,7 +1697,7 @@ test("snapshot preflight rejects a mismatched BUILD record without dispatching G
 		),
 	).toMatchObject({
 		block: true,
-		reason: expect.stringContaining("BUILD record validation failed"),
+		reason: expect.stringContaining("BUILD record digest does not match the finalized manifest"),
 	});
 	expect(harness.states.at(-1)).toMatchObject({ phase: "building", gateCalls: 0, gateAttempt: 0 });
 });
@@ -1720,6 +1769,8 @@ test("session restoration reconciles an interrupted Gate as an interruption", as
 	expect(afterSwitch.gateLease).toBeUndefined();
 	expect(afterSwitch.gateRetryMode).toBe("operational");
 	expect(afterSwitch.stats!.gateErrors).toBe(0);
+	expect(afterSwitch.gateAttempt).toBe(1);
+	expect(afterSwitch.currentBuildRound).toBe(1);
 	const stateCountAfterRestore = harness.states.length;
 
 	await result(
@@ -1755,7 +1806,7 @@ test("findings-first nested BLOCKED Gate result returns to evidence recovery wit
 			content: [
 				{
 					type: "text",
-					text: '{"findings":[{"category":"validation_failure","severity":"blocking","file":"local://example-evidence.md","location":"verification","issue":"Required validation evidence is missing.","required_fix":"Run the missing validation and finalize evidence again."}],"verdict":"BLOCKED"}',
+					text: blockedGateText(harness),
 				},
 			],
 		},
@@ -1784,24 +1835,12 @@ test("findings-first nested BLOCKED Gate result returns to evidence recovery wit
 		),
 	).toMatchObject({ block: true });
 	await recordSuccessfulValidation(harness, "bun test tests/leanflow_lsp_guard.test.ts");
-	const finalized = await executeRegisteredTool(harness, "leanflow_finalize_artifacts", {
-		validationCommands: ["bun test tests/leanflow_lsp_guard.test.ts"],
-	});
+	const finalized = await executeRegisteredTool(harness, "leanflow_finalize_artifacts", {});
 	expect(finalized.isError).not.toBe(true);
 
-	const allowedEvidenceValidationCommands = ["bun test tests/leanflow_lsp_guard.test.ts"];
-	for (const [index, command] of allowedEvidenceValidationCommands.entries()) {
-		// This calls only the guard. A successful result is deliberately not
-		// fabricated: the allowlist decision must happen before Bash executes.
-		expect(
-			await call(
-				{ toolName: "bash", toolCallId: `allowed-evidence-validation-${index}`, input: { command } },
-				harness.ctx,
-			),
-		).toBeUndefined();
-	}
 
 	const rejectedEvidenceValidationCommands = [
+		"bun test tests/leanflow_lsp_guard.test.ts",
 		"bun test",
 		"bun test --watch",
 		"bun test tests/../src/example.test.ts",
@@ -1824,14 +1863,14 @@ test("findings-first nested BLOCKED Gate result returns to evidence recovery wit
 			),
 		).toMatchObject({
 			block: true,
-			reason: expect.stringContaining("Gate evidence recovery must reuse the implementation unchanged"),
+			reason: expect.stringContaining("approved validation IDs"),
 		});
 		expect(harness.states).toHaveLength(stateCountBefore);
 		expect(JSON.stringify(harness.states.at(-1))).toBe(stateBefore);
 	}
 });
 
-test("evidence recovery accepts only command-only Bash validations while Gate is in flight", async () => {
+test("evidence recovery accepts only approved validation IDs while Gate is in flight", async () => {
 	const harness = createHarness();
 	await enterDocumentationBuild(harness);
 	await completeBuildEvidence(harness, "bun test evidence-retry-gate");
@@ -1844,27 +1883,25 @@ test("evidence recovery accepts only command-only Bash validations while Gate is
 			toolName: "task",
 			toolCallId: "evidence-retry-blocked-gate",
 			isError: false,
-			content: [{ type: "text", text: '{"verdict":"BLOCKED","findings":[{"category":"validation_failure","severity":"blocking","file":"local://example-evidence.md","location":"verification","issue":"Required validation evidence is missing.","required_fix":"Run the missing validation and finalize evidence again."}]}' }],
+			content: [{ type: "text", text: blockedGateText(harness) }],
 		},
 		harness.ctx,
 	);
 	expect(harness.states.at(-1)).toMatchObject({ phase: "building", gateRetryMode: "evidence" });
-	const staleFinalized = await executeRegisteredTool(harness, "leanflow_finalize_artifacts", {
-		validationCommands: ["bun test evidence-retry-gate"],
-	});
-	expect(staleFinalized.isError).toBe(true);
-	expect(staleFinalized.content).toEqual([
-		expect.objectContaining({ text: expect.stringContaining("exact Verification commands") }),
-	]);
+	const staleFinalized = await executeRegisteredTool(harness, "leanflow_finalize_artifacts", {});
+	expect(staleFinalized.isError).not.toBe(true);
+	harness.execResults.push(
+		...fingerprintExecResults(),
+		{ stdout: "2 pass\n0 fail\nChanged evidence output.\n", stderr: "", code: 0, killed: false },
+		...fingerprintExecResults(),
+	);
 
 	await recordSuccessfulValidation(harness, "bun test tests/leanflow_lsp_guard.test.ts");
-	const recordWithPlainValidation = JSON.parse(readFileSync(buildRecordPath(harness), "utf8"));
-	expect(recordWithPlainValidation.observations).toContainEqual(
-		expect.objectContaining({ toolName: "bash", command: "bun test tests/leanflow_lsp_guard.test.ts" }),
+	const recordWithApprovedValidation = JSON.parse(readFileSync(buildRecordPath(harness), "utf8"));
+	expect(recordWithApprovedValidation.observations).toContainEqual(
+		expect.objectContaining({ toolName: "validation", command: "bun test tests/leanflow_lsp_guard.test.ts" }),
 	);
-	const finalized = await executeRegisteredTool(harness, "leanflow_finalize_artifacts", {
-		validationCommands: ["bun test tests/leanflow_lsp_guard.test.ts"],
-	});
+	const finalized = await executeRegisteredTool(harness, "leanflow_finalize_artifacts", {});
 	expect(finalized.isError).not.toBe(true);
 
 	expect(
@@ -1897,6 +1934,16 @@ test("evidence recovery accepts only command-only Bash validations while Gate is
 		expect(JSON.stringify(harness.states.at(-1))).toBe(stateBeforeDeniedCalls);
 		expect(readFileSync(buildRecordPath(harness), "utf8")).toBe(recordBeforeDeniedCalls);
 	}
+	await result(
+		{
+			toolName: "task",
+			toolCallId: "evidence-retry-inflight-gate",
+			isError: false,
+			content: [{ type: "text", text: JSON.stringify({ verdict: "PASS", findings: [] }) }],
+		},
+		harness.ctx,
+	);
+	expect(harness.states.at(-1)).toMatchObject({ phase: "finalizing", terminalOutcome: "pass" });
 });
 
 test("an unchanged second BLOCKED Gate result pauses instead of looping", async () => {
@@ -1909,13 +1956,16 @@ test("an unchanged second BLOCKED Gate result pauses instead of looping", async 
 	const blockedContent = [
 		{
 			type: "text",
-			text: '{"verdict":"BLOCKED","findings":[{"category":"validation_failure","severity":"blocking","file":"local://example-evidence.md","location":"verification","issue":"Required validation evidence is missing.","required_fix":"Run the missing validation and finalize evidence again."}]}',
+			text: blockedGateText(harness),
 		},
 	];
 
 	await call({ toolName: "task", toolCallId: "same-blocked-1", input: gateCallInput() }, harness.ctx);
 	await result({ toolName: "task", toolCallId: "same-blocked-1", isError: false, content: blockedContent }, harness.ctx);
-	expect(harness.states.at(-1)).toMatchObject({ phase: "building", consecutiveSameSnapshotBlocked: 1 });
+	expect(harness.states.at(-1)).toMatchObject({
+		phase: "building",
+		blockedRecovery: { consecutiveEquivalentBlocked: 1 },
+	});
 	await call(
 		{
 			toolName: "lsp",
@@ -1933,20 +1983,106 @@ test("an unchanged second BLOCKED Gate result pauses instead of looping", async 
 		},
 		harness.ctx,
 	);
-	expect(harness.states.at(-1)).toMatchObject({ consecutiveSameSnapshotBlocked: 1 });
-
-	const finalized = await executeRegisteredTool(harness, "leanflow_finalize_artifacts", {
-		validationCommands: [approvedCommand],
+	expect(harness.states.at(-1)).toMatchObject({
+		blockedRecovery: { consecutiveEquivalentBlocked: 1 },
 	});
+	await recordSuccessfulValidation(harness, approvedCommand);
+
+	const finalized = await executeRegisteredTool(harness, "leanflow_finalize_artifacts", {});
 	expect(finalized.isError).not.toBe(true);
-	await call({ toolName: "task", toolCallId: "same-blocked-2", input: gateCallInput() }, harness.ctx);
-	await result({ toolName: "task", toolCallId: "same-blocked-2", isError: false, content: blockedContent }, harness.ctx);
+	const stalled = await call({ toolName: "task", toolCallId: "same-blocked-2", input: gateCallInput() }, harness.ctx);
+	expect(stalled).toMatchObject({ block: true, reason: expect.stringContaining("no affected validation") });
 	expect(harness.states.at(-1)).toMatchObject({
 		phase: "awaiting_human",
-		consecutiveSameSnapshotBlocked: 2,
+		blockedRecovery: { consecutiveEquivalentBlocked: 2 },
 		baselineCaptured: false,
 	});
 });
+test("evidence recovery ignores changed output from an unaffected validation ID", async () => {
+	const harness = createHarness();
+	const affected = "bun test tests/affected.test.ts";
+	const unrelated = "bun test tests/unrelated.test.ts";
+	await enterDocumentationBuild(harness, [affected, unrelated]);
+	await executeRegisteredTool(harness, "leanflow_capture_baseline", {});
+	await recordSuccessfulValidation(harness, affected);
+	await recordSuccessfulValidation(harness, unrelated);
+	await executeRegisteredTool(harness, "leanflow_finalize_artifacts", {});
+
+	const call = harness.handlers.get("tool_call")!;
+	const result = harness.handlers.get("tool_result")!;
+	await call({ toolName: "task", toolCallId: "affected-blocked-1", input: gateCallInput() }, harness.ctx);
+	await result(
+		{
+			toolName: "task",
+			toolCallId: "affected-blocked-1",
+			isError: false,
+			content: [{ type: "text", text: blockedGateText(harness) }],
+		},
+		harness.ctx,
+	);
+	harness.execResults.push(
+		...fingerprintExecResults(),
+		{ stdout: "2 pass\n0 fail\nUnrelated output changed.\n", stderr: "", code: 0, killed: false },
+		...fingerprintExecResults(),
+	);
+	await recordSuccessfulValidation(harness, unrelated);
+	await executeRegisteredTool(harness, "leanflow_finalize_artifacts", {});
+
+	expect(
+		await call({ toolName: "task", toolCallId: "affected-blocked-2", input: gateCallInput() }, harness.ctx),
+	).toMatchObject({ block: true, reason: expect.stringContaining("no affected validation") });
+	expect(harness.states.at(-1)).toMatchObject({
+		phase: "awaiting_human",
+		baselineCaptured: false,
+	});
+});
+
+test("evidence recovery accepts fingerprint-only progress for the affected validation ID", async () => {
+	const harness = createHarness();
+	await enterDocumentationBuild(harness);
+	await completeBuildEvidence(harness);
+	const call = harness.handlers.get("tool_call")!;
+	const result = harness.handlers.get("tool_result")!;
+	await call({ toolName: "task", toolCallId: "fingerprint-blocked-1", input: gateCallInput() }, harness.ctx);
+	await result(
+		{
+			toolName: "task",
+			toolCallId: "fingerprint-blocked-1",
+			isError: false,
+			content: [{ type: "text", text: blockedGateText(harness) }],
+		},
+		harness.ctx,
+	);
+
+	const changedDiff = "diff --git a/src/example.ts b/src/example.ts\n";
+	harness.execResults.push(
+		...fingerprintExecResults(changedDiff),
+		{
+			stdout: "1 pass\n0 fail\n2 expect() calls\nRan 1 test across 1 file.\n",
+			stderr: "",
+			code: 0,
+			killed: false,
+		},
+		...fingerprintExecResults(changedDiff),
+	);
+	await recordSuccessfulValidation(harness, "bun test tests/leanflow_lsp_guard.test.ts");
+	harness.execResults.push(
+		{ stdout: `${"a".repeat(40)}\n`, stderr: "", code: 0, killed: false },
+		{ stdout: " M src/example.ts\n", stderr: "", code: 0, killed: false },
+		{ stdout: changedDiff, stderr: "", code: 0, killed: false },
+		{ stdout: "src/example.ts\0", stderr: "", code: 0, killed: false },
+		{ stdout: "", stderr: "", code: 0, killed: false },
+		...fingerprintExecResults(changedDiff),
+	);
+	const finalized = await executeRegisteredTool(harness, "leanflow_finalize_artifacts", {});
+	expect(finalized.isError).not.toBe(true);
+	harness.execResults.push(...fingerprintExecResults(changedDiff));
+	expect(
+		await call({ toolName: "task", toolCallId: "fingerprint-blocked-2", input: gateCallInput() }, harness.ctx),
+	).toBeUndefined();
+	expect(harness.states.at(-1)).toMatchObject({ phase: "gating", gateRetryMode: "evidence" });
+});
+
 
 test("findings-first nested FAIL Gate result settles as a verdict failure", async () => {
 	const harness = createHarness();
@@ -2041,14 +2177,12 @@ test("BUILD sequence reaches batch Gate through generated artifacts", async () =
 		harness.ctx,
 	);
 	await recordSuccessfulValidation(harness, "bun test smoke");
-	const finalized = await executeRegisteredTool(harness, "leanflow_finalize_artifacts", {
-		validationCommands: ["bun test smoke"],
-	});
+	const finalized = await executeRegisteredTool(harness, "leanflow_finalize_artifacts", {});
 	expect(finalized.isError).not.toBe(true);
 	const build = readFileSync(resolveRunMarkerPath(harness.ctx.localProtocolOptions, EXAMPLE_BUILD_ARTIFACT)!, "utf8");
 	expect(build).toContain("### LSP 1: diagnostics");
 	expect(build).toContain("### LSP 2: diagnostics");
-	expect(build).toContain("### Validation 1: bun test smoke");
+	expect(build).toContain("### Validation 1: bun test tests/leanflow_lsp_guard.test.ts");
 	expect(
 		await call({ toolName: "task", toolCallId: "smoke-batch-gate", input: gateCallInput() }, harness.ctx),
 	).toBeUndefined();
@@ -2208,9 +2342,7 @@ test("partial artifact writes never mark Gate evidence ready", async () => {
 	const diffPath = resolveRunMarkerPath(harness.ctx.localProtocolOptions, EXAMPLE_DIFF_ARTIFACT)!;
 	mkdirSync(diffPath, { recursive: true });
 
-	const finalized = await executeRegisteredTool(harness, "leanflow_finalize_artifacts", {
-		validationCommands: ["bun test partial-write"],
-	});
+	const finalized = await executeRegisteredTool(harness, "leanflow_finalize_artifacts", {});
 	expect(finalized.isError).toBe(true);
 	expect(harness.states.at(-1)!.writtenArtifacts).toEqual([]);
 	expect(existsSync(resolveRunMarkerPath(harness.ctx.localProtocolOptions, EXAMPLE_BUILD_ARTIFACT)!)).toBe(true);
@@ -2309,7 +2441,7 @@ test("flowstatus is read-only in every phase and reports deep Gate readiness", a
 			"- Written artifacts: 0/3 (none / build, diff, evidence)",
 			"- LSP probe: pending",
 			"- Human repair cycles: 0",
-			"- Gate readiness: BLOCKED: missing artifact marks: build.md, diff.md, evidence.md",
+			"- Gate readiness: BLOCKED: active run identity or validation contract is incomplete",
 		].join("\n"),
 	);
 
@@ -2485,7 +2617,7 @@ test("Gate operational errors preserve evidence and do not enter repair", async 
 	expect(JSON.stringify(retryContext)).not.toContain("implement it");
 	expect(
 		await call({ toolName: "edit", toolCallId: "operational-edit", input: { path: "README.md" } }, harness.ctx),
-	).toMatchObject({ block: true, reason: expect.stringContaining("unchanged") });
+	).toMatchObject({ block: true, reason: expect.stringContaining("read-only inspection") });
 	expect(readFileSync(buildRecordPath(harness), "utf8")).toBe(recordBeforeRetry);
 	expect(
 		await call({ toolName: "task", toolCallId: "gate-retry", input: gateCallInput() }, harness.ctx),
@@ -2517,7 +2649,7 @@ test("four consecutive Gate operational errors pause instead of looping indefini
 	expect(harness.states.at(-1)).toMatchObject({
 		phase: "awaiting_human",
 		gateCalls: 0,
-		gateRetryMode: "operational",
+		gateRetryMode: undefined,
 		stats: { gateErrors: 4 },
 	});
 	expect(JSON.parse(readFileSync(runMarkerPath(harness), "utf8")).status).toBe("paused");
@@ -2741,7 +2873,7 @@ test("second Gate FAIL pauses the run and flowcontinue starts a human repair cyc
 				toolCallId: "paused-finalize",
 				input: {
 					path: "xd://leanflow_finalize_artifacts",
-					content: JSON.stringify({ validationCommands: ["bun test tests/leanflow_lsp_guard.test.ts"] }),
+					content: "{}",
 				},
 			},
 			harness.ctx,
@@ -3518,4 +3650,401 @@ test("expired orphan markers do not claim ordinary native approvals", async () =
 	});
 	expect(await harness.handlers.get("context")!({ messages: legacyApprovalMessages }, harness.ctx)).toBeUndefined();
 	expect(harness.states).toHaveLength(0);
+});
+
+function fingerprintExecResults(
+	trackedDiff = "",
+	untrackedPaths = "",
+	head = "a".repeat(40),
+): ExecResult[] {
+	return [
+		{ stdout: `${head}\n`, stderr: "", code: 0, killed: false },
+		{ stdout: trackedDiff, stderr: "", code: 0, killed: false },
+		{ stdout: untrackedPaths, stderr: "", code: 0, killed: false },
+	];
+}
+
+function finalizedManifestPath(harness: Harness): string {
+	const runId = harness.states.at(-1)!.runId;
+	if (!runId) throw new Error("run ID is unavailable");
+	return resolveRunMarkerPath(
+		harness.ctx.localProtocolOptions,
+		`local://.leanflow/runs/${runId}-finalized-gate.json`,
+	)!;
+}
+
+test("artifact finalization publishes no manifest when the atomic commit fails", async () => {
+	const harness = createHarness();
+	await enterDocumentationBuild(harness);
+	expect((await executeRegisteredTool(harness, "leanflow_capture_baseline", {})).isError).not.toBe(true);
+	await recordSuccessfulValidation(harness, "bun test tests/leanflow_lsp_guard.test.ts");
+	mkdirSync(finalizedManifestPath(harness), { recursive: true });
+
+	const finalized = await executeRegisteredTool(harness, "leanflow_finalize_artifacts", {});
+	expect(finalized.isError).toBe(true);
+	expect(harness.states.at(-1)).toMatchObject({
+		phase: "building",
+		writtenArtifacts: [],
+		finalizedGateSnapshot: undefined,
+	});
+});
+test("validation reruns invalidate prior Gate authority before execution or record commit", async () => {
+	const harness = createHarness();
+	await enterDocumentationBuild(harness);
+	await completeBuildEvidence(harness);
+	expect(harness.states.at(-1)?.finalizedGateSnapshot).toBeDefined();
+	const validationId = (
+		harness.states.at(-1) as PersistedState & {
+			approvedValidationContract?: { validations: Array<{ id: string }> };
+		}
+	).approvedValidationContract?.validations[0]?.id;
+	if (!validationId) throw new Error("approved validation ID is unavailable");
+	const recordPath = buildRecordPath(harness);
+	rmSync(recordPath);
+	mkdirSync(recordPath);
+
+	const rerun = await executeRegisteredTool(harness, "leanflow_run_validation", { validationId });
+	expect(rerun.isError).toBe(true);
+	expect(harness.states.at(-1)).toMatchObject({
+		phase: "building",
+		finalizedGateSnapshot: undefined,
+		writtenArtifacts: [],
+	});
+	expect(
+		await harness.handlers.get("tool_call")!(
+			{ toolName: "task", toolCallId: "stale-authority-gate", input: gateCallInput() },
+			harness.ctx,
+		),
+	).toMatchObject({ block: true, reason: expect.stringContaining("does not match state") });
+});
+
+
+test("finalization requires every approved validation and rejects unapproved IDs", async () => {
+	const harness = createHarness();
+	const commands = [
+		"bun test tests/leanflow_lsp_guard.test.ts",
+		"python3 -m unittest discover -s tests -p 'test_*.py' -v",
+	];
+	await enterDocumentationBuild(harness, commands);
+	expect((await executeRegisteredTool(harness, "leanflow_capture_baseline", {})).isError).not.toBe(true);
+	const execCount = harness.execCalls.length;
+	const unapproved = await executeRegisteredTool(
+		harness,
+		"leanflow_run_validation",
+		{ validationId: `validation-${"f".repeat(64)}` },
+		"unapproved-validation",
+	);
+	expect(unapproved.isError).toBe(true);
+	expect(harness.execCalls).toHaveLength(execCount);
+
+	await recordSuccessfulValidation(harness, commands[0]!);
+	const incomplete = await executeRegisteredTool(harness, "leanflow_finalize_artifacts", {});
+	expect(incomplete.isError).toBe(true);
+	expect(JSON.stringify(incomplete.content)).toContain("incomplete");
+
+	await recordSuccessfulValidation(harness, commands[1]!);
+	const complete = await executeRegisteredTool(harness, "leanflow_finalize_artifacts", {});
+	expect(complete.isError).not.toBe(true);
+	expect(harness.states.at(-1)!.writtenArtifacts).toEqual(["build", "diff", "evidence"]);
+});
+test("parallel baseline capture and validations serialize before finalization", async () => {
+	const harness = createHarness();
+	const commands = [
+		"bun test tests/parallel-validation.test.ts",
+		"python3 -m unittest discover -s tests -p 'test_parallel.py' -v",
+	];
+	await enterDocumentationBuild(harness, commands);
+	const contract = (
+		harness.states.at(-1) as PersistedState & {
+			approvedValidationContract?: { validations: Array<{ id: string }> };
+		}
+	).approvedValidationContract;
+	expect(contract?.validations).toHaveLength(2);
+	const captureTool = harness.tools.get("leanflow_capture_baseline")!;
+	const validationTool = harness.tools.get("leanflow_run_validation")!;
+	const finalizationTool = harness.tools.get("leanflow_finalize_artifacts")!;
+	const [captured, first, second, finalized] = await Promise.all([
+		captureTool.execute("parallel-baseline", {}, undefined, undefined, harness.ctx),
+		validationTool.execute(
+			"parallel-validation-1",
+			{ validationId: contract!.validations[0]!.id },
+			undefined,
+			undefined,
+			harness.ctx,
+		),
+		validationTool.execute(
+			"parallel-validation-2",
+			{ validationId: contract!.validations[1]!.id },
+			undefined,
+			undefined,
+			harness.ctx,
+		),
+		finalizationTool.execute("parallel-finalization", {}, undefined, undefined, harness.ctx),
+	]);
+	expect(captured.isError).not.toBe(true);
+	expect(first.isError).not.toBe(true);
+	expect(second.isError).not.toBe(true);
+	expect(finalized.isError).not.toBe(true);
+	const record = JSON.parse(readFileSync(buildRecordPath(harness), "utf8")) as {
+		observations: Array<{ toolName: string; validationId?: string }>;
+		baseline?: { head: string };
+	};
+	const validationIds = record.observations
+		.filter((observation) => observation.toolName === "validation")
+		.map((observation) => observation.validationId)
+		.sort();
+	expect(validationIds).toEqual(contract!.validations.map((validation) => validation.id).sort());
+	expect(record.baseline?.head).toBe("a".repeat(40));
+	expect(harness.states.at(-1)?.finalizedGateSnapshot).toBeDefined();
+});
+
+
+test("repository drift after finalization blocks Gate while internal LeanFlow paths do not", async () => {
+	const drifted = createHarness();
+	await enterDocumentationBuild(drifted);
+	await completeBuildEvidence(drifted);
+	drifted.execResults.push(...fingerprintExecResults("diff --git a/src/example.ts b/src/example.ts\n"));
+	expect(
+		await drifted.handlers.get("tool_call")!(
+			{ toolName: "task", toolCallId: "post-finalize-repository-drift", input: gateCallInput() },
+			drifted.ctx,
+		),
+	).toMatchObject({ block: true, reason: expect.stringContaining("repository state changed after artifact finalization") });
+	expect(drifted.states.at(-1)).toMatchObject({ phase: "building", gateDispatches: 0 });
+
+	const internalOnly = createHarness();
+	await enterDocumentationBuild(internalOnly);
+	await completeBuildEvidence(internalOnly);
+	internalOnly.execResults.push(...fingerprintExecResults("", ".leanflow/runs/internal.json\0"));
+	expect(
+		await internalOnly.handlers.get("tool_call")!(
+			{ toolName: "task", toolCallId: "internal-path-excluded", input: gateCallInput() },
+			internalOnly.ctx,
+		),
+	).toBeUndefined();
+	expect(internalOnly.states.at(-1)).toMatchObject({ phase: "gating", gateDispatches: 1 });
+});
+
+test("Gate errors route repository and plan drift to their safe recovery phases", async () => {
+	const repository = createHarness();
+	await enterDocumentationBuild(repository);
+	await completeBuildEvidence(repository);
+	const repositoryCall = repository.handlers.get("tool_call")!;
+	const repositoryResult = repository.handlers.get("tool_result")!;
+	await repositoryCall(
+		{ toolName: "task", toolCallId: "gate-error-repository-drift", input: gateCallInput() },
+		repository.ctx,
+	);
+	repository.execResults.push(...fingerprintExecResults("changed tracked diff"));
+	await repositoryResult(
+		{ toolName: "task", toolCallId: "gate-error-repository-drift", isError: true, content: [] },
+		repository.ctx,
+	);
+	expect(repository.states.at(-1)).toMatchObject({
+		phase: "building",
+		gateRetryMode: undefined,
+		buildMutationObserved: true,
+		finalizedGateSnapshot: undefined,
+	});
+
+	const plan = createHarness();
+	await enterDocumentationBuild(plan);
+	await completeBuildEvidence(plan);
+	const planCall = plan.handlers.get("tool_call")!;
+	const planResult = plan.handlers.get("tool_result")!;
+	await planCall({ toolName: "task", toolCallId: "gate-error-plan-drift", input: gateCallInput() }, plan.ctx);
+	const planPath = resolveRunMarkerPath(plan.ctx.localProtocolOptions, EXAMPLE_PLAN_ARTIFACT)!;
+	writeFileSync(planPath, `${readFileSync(planPath, "utf8")}\nPlan changed after dispatch.`);
+	await planResult(
+		{ toolName: "task", toolCallId: "gate-error-plan-drift", isError: true, content: [] },
+		plan.ctx,
+	);
+	expect(plan.states.at(-1)).toMatchObject({
+		phase: "awaiting_approval",
+		approvedPlanArtifact: undefined,
+	});
+});
+
+test("session interruption routes repository and plan drift without retrying stale identity", async () => {
+	const repository = createHarness();
+	await enterDocumentationBuild(repository);
+	await completeBuildEvidence(repository);
+	await repository.handlers.get("tool_call")!(
+		{ toolName: "task", toolCallId: "interruption-repository-drift", input: gateCallInput() },
+		repository.ctx,
+	);
+	repository.execResults.push(...fingerprintExecResults("changed tracked diff"));
+	await repository.handlers.get("session_switch")!({}, repository.ctx);
+	expect(repository.states.at(-1)).toMatchObject({
+		phase: "building",
+		gateRetryMode: undefined,
+		buildMutationObserved: true,
+		gateLease: undefined,
+	});
+
+	const plan = createHarness();
+	await enterDocumentationBuild(plan);
+	await completeBuildEvidence(plan);
+	await plan.handlers.get("tool_call")!(
+		{ toolName: "task", toolCallId: "interruption-plan-drift", input: gateCallInput() },
+		plan.ctx,
+	);
+	const planPath = resolveRunMarkerPath(plan.ctx.localProtocolOptions, EXAMPLE_PLAN_ARTIFACT)!;
+	writeFileSync(planPath, `${readFileSync(planPath, "utf8")}\nPlan changed during interruption.`);
+	await plan.handlers.get("session_switch")!({}, plan.ctx);
+	expect(plan.states.at(-1)).toMatchObject({
+		phase: "awaiting_approval",
+		approvedPlanArtifact: undefined,
+		gateLease: undefined,
+	});
+});
+
+test("a mutating approved validation exits evidence recovery for normal BUILD repair", async () => {
+	const harness = createHarness();
+	await enterDocumentationBuild(harness);
+	await completeBuildEvidence(harness);
+	const call = harness.handlers.get("tool_call")!;
+	const result = harness.handlers.get("tool_result")!;
+	await call({ toolName: "task", toolCallId: "mutating-validation-blocked", input: gateCallInput() }, harness.ctx);
+	await result(
+		{
+			toolName: "task",
+			toolCallId: "mutating-validation-blocked",
+			isError: false,
+			content: [{ type: "text", text: blockedGateText(harness) }],
+		},
+		harness.ctx,
+	);
+	const validationId = (
+		harness.states.at(-1) as PersistedState & {
+			approvedValidationContract?: { validations: Array<{ id: string }> };
+		}
+	).approvedValidationContract?.validations[0]?.id;
+	if (!validationId) throw new Error("approved validation ID is unavailable");
+	harness.execResults.push(
+		...fingerprintExecResults(),
+		{ stdout: "1 pass\n0 fail\n", stderr: "", code: 0, killed: false },
+		...fingerprintExecResults("validation changed tracked files"),
+	);
+	const validation = await executeRegisteredTool(
+		harness,
+		"leanflow_run_validation",
+		{ validationId },
+		"mutating-approved-validation",
+	);
+	expect(validation.isError).toBe(true);
+	expect(harness.states.at(-1)).toMatchObject({
+		phase: "building",
+		gateRetryMode: undefined,
+		buildMutationObserved: true,
+		blockedRecovery: undefined,
+	});
+	expect(
+		await call({ toolName: "edit", toolCallId: "post-mutating-validation-edit", input: { path: "src/example.ts" } }, harness.ctx),
+	).toBeUndefined();
+});
+
+test("legacy Gate-ready state invalidates missing manifest authority on restore", async () => {
+	const harness = createHarness();
+	await enterDocumentationBuild(harness);
+	await completeBuildEvidence(harness);
+	await harness.handlers.get("tool_call")!(
+		{ toolName: "task", toolCallId: "legacy-manifest-gate", input: gateCallInput() },
+		harness.ctx,
+	);
+	const legacy = structuredClone(harness.states.at(-1)) as PersistedState & Record<string, unknown>;
+	legacy.stateVersion = 5;
+	delete legacy.finalizedGateSnapshot;
+	harness.branch.push({ type: "custom", customType: "leanflow-state", data: legacy });
+	await harness.handlers.get("session_switch")!({}, harness.ctx);
+	expect(harness.states.at(-1)).toMatchObject({
+		phase: "building",
+		gateRetryMode: "evidence",
+		gateLease: undefined,
+		writtenArtifacts: [],
+	});
+});
+
+test("new runs persist the current state schema version", async () => {
+	const harness = createHarness();
+	await harness.commands.get("flow")!.handler("schema version", harness.ctx);
+	expect(harness.states.at(-1)).toMatchObject({ phase: "planning", stateVersion: 6 });
+	const persisted = harness.branch.at(-1) as { customType: string; data: Record<string, unknown> };
+	expect(persisted.customType).toBe("leanflow-state");
+	expect(persisted.data.stateVersion).toBe(6);
+});
+
+test("structured BLOCKED run mismatch does not depend on finding prose keywords", async () => {
+	const harness = createHarness();
+	await enterDocumentationBuild(harness);
+	await completeBuildEvidence(harness);
+	const call = harness.handlers.get("tool_call")!;
+	const result = harness.handlers.get("tool_result")!;
+	await call({ toolName: "task", toolCallId: "structured-run-mismatch", input: gateCallInput() }, harness.ctx);
+	await result(
+		{
+			toolName: "task",
+			toolCallId: "structured-run-mismatch",
+			isError: false,
+			content: [
+				{
+					type: "text",
+					text: blockedGateText(harness, {
+						reasonCode: "run_mismatch",
+						issue: "The observed identity diverges from the expected identity.",
+						requiredFix: "Reconcile the identities before review.",
+					}),
+				},
+			],
+		},
+		harness.ctx,
+	);
+	expect(harness.states.at(-1)).toMatchObject({
+		phase: "building",
+		gateRetryMode: "evidence",
+		blockedRecovery: {
+			reasonCode: "run_mismatch",
+			consecutiveEquivalentBlocked: 1,
+			validationStates: [expect.objectContaining({ status: "stale" })],
+		},
+		stats: { gateBlocked: 1, gateErrors: 0 },
+	});
+});
+
+test("Gate errors classify artifact drift for evidence recovery and record drift for human recovery", async () => {
+	const artifact = createHarness();
+	await enterDocumentationBuild(artifact);
+	await completeBuildEvidence(artifact);
+	const artifactCall = artifact.handlers.get("tool_call")!;
+	const artifactResult = artifact.handlers.get("tool_result")!;
+	await artifactCall({ toolName: "task", toolCallId: "gate-error-artifact-drift", input: gateCallInput() }, artifact.ctx);
+	rmSync(resolveRunMarkerPath(artifact.ctx.localProtocolOptions, EXAMPLE_EVIDENCE_ARTIFACT)!);
+	await artifactResult(
+		{ toolName: "task", toolCallId: "gate-error-artifact-drift", isError: true, content: [] },
+		artifact.ctx,
+	);
+	expect(artifact.states.at(-1)).toMatchObject({
+		phase: "building",
+		gateRetryMode: "evidence",
+		finalizedGateSnapshot: undefined,
+		writtenArtifacts: [],
+	});
+
+	const record = createHarness();
+	await enterDocumentationBuild(record);
+	await completeBuildEvidence(record);
+	const recordCall = record.handlers.get("tool_call")!;
+	const recordResult = record.handlers.get("tool_result")!;
+	await recordCall({ toolName: "task", toolCallId: "gate-error-record-drift", input: gateCallInput() }, record.ctx);
+	writeFileSync(buildRecordPath(record), "{}");
+	await recordResult(
+		{ toolName: "task", toolCallId: "gate-error-record-drift", isError: true, content: [] },
+		record.ctx,
+	);
+	expect(record.states.at(-1)).toMatchObject({
+		phase: "awaiting_human",
+		gateRetryMode: undefined,
+		baselineCaptured: false,
+		finalizedGateSnapshot: undefined,
+	});
 });

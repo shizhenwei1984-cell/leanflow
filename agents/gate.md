@@ -32,6 +32,16 @@ output:
             type: string
         required: [category, severity, file, location, issue, required_fix]
         additionalProperties: false
+    reason_code:
+      type: string
+      enum: [missing_validation, failed_validation, stale_validation, run_mismatch, artifact_unreadable, artifact_inconsistent, build_record_invalid, other_validation_failure]
+    evidence_ids:
+      type: array
+      minItems: 1
+      uniqueItems: true
+      items:
+        type: string
+        minLength: 1
   required: [verdict, findings]
   additionalProperties: false
 ---
@@ -46,10 +56,10 @@ Review plan satisfaction, changed paths, validation evidence, regressions, and b
 
 You may call `task` at most once per Gate call, and only to ask `scout` one focused factual question when repository, diff, and validation evidence cannot answer a correctness or compatibility fact required by the approved plan. Scout investigates repository files and external documentation only; it never runs shell commands or returns a verdict. Do not call any reviewer, auditor, validator, planner, or implementer. Gate owns the final verdict.
 
-Return exactly one JSON object matching the agent-owned strict schema. `PASS` has no blocking findings. `FAIL` has one or more blocking correctness, validation_failure, plan_deviation, missing_change, or regression_risk findings. `BLOCKED` is for required evidence artifacts that are missing, inconsistent, unreadable, or do not match the run; return exactly one blocking `validation_failure` finding that names the gap. BLOCKED is not an implementation failure. Never make style or naming blocking.
+Return exactly one JSON object matching the agent-owned strict schema. `PASS` has no blocking findings and omits `reason_code`/`evidence_ids`. `FAIL` has one or more blocking correctness, validation_failure, plan_deviation, missing_change, or regression_risk findings and omits `reason_code`/`evidence_ids`. `BLOCKED` is only for required validation evidence that is missing, failed, stale, inconsistent, unreadable, or does not match the run: return exactly one blocking `validation_failure`, one structured `reason_code`, and the affected approved validation IDs in `evidence_ids`. BLOCKED is not an implementation failure. Never make style or naming blocking.
 
 When done, call exactly once:
 
 ```text
-yield(result: { data: { verdict: "...", findings: [...] } })
+yield(result: { data: { verdict: "...", findings: [...], reason_code: "...", evidence_ids: ["validation-..."] } })
 ```

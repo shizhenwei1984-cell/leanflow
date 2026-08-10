@@ -1,7 +1,13 @@
 import { expect, test } from "bun:test";
 
 import { checkInvariants, reduceGate, type Effect, type GateEvent } from "../extensions/leanflow/machine";
+import {
+	createFinalizedGateSnapshot,
+	createOperationalRetrySnapshot,
+	finalizedGateSnapshotDigest,
+} from "../extensions/leanflow/provenance";
 import { defaultState, type LeanFlowPhase, type LeanFlowState } from "../extensions/leanflow/state";
+import { createApprovedValidationContract, parseApprovedValidation } from "../extensions/leanflow/validation";
 
 const GATE_RUN_ID = "f8e46687-2719-4fa1-8b6f-f5bb9a4e1f42";
 const LEGAL_PHASES: readonly LeanFlowPhase[] = [
@@ -15,9 +21,19 @@ const LEGAL_PHASES: readonly LeanFlowPhase[] = [
 	"finalizing",
 ];
 
+const planDigest = sha64("b");
+const approvedValidation = parseApprovedValidation("bun test")!;
+const validationContract = createApprovedValidationContract(planDigest, [approvedValidation]);
+
 function buildingState() {
 	const state = defaultState();
 	state.phase = "building";
+	state.runId = GATE_RUN_ID;
+	state.planSlug = "test";
+	state.planDigest = planDigest;
+	state.approvedValidationContract = validationContract;
+	state.approvedValidationDigest = validationContract.digest;
+	state.currentBuildRound = 1;
 	return state;
 }
 
@@ -33,16 +49,83 @@ function repositoryFingerprint() {
 		combinedDigest: sha64("e"),
 	};
 }
+function attachFinalizedSnapshot(state: LeanFlowState): void {
+	if (state.gateRetryMode === "operational" && state.finalizedGateSnapshot) return;
+	const round = state.currentBuildRound ?? Math.max(1, state.gateAttempt + 1);
+	state.currentBuildRound = round;
+	state.finalizedGateSnapshot = createFinalizedGateSnapshot({
+		runId: state.runId ?? GATE_RUN_ID,
+		planSlug: state.planSlug ?? "test",
+		planDigest: state.planDigest ?? planDigest,
+		approvedValidationDigest: state.approvedValidationDigest ?? validationContract.digest,
+		buildRecordRound: round,
+		buildRecordDigest: sha64("1"),
+		buildArtifactDigest: sha64("2"),
+		diffArtifactDigest: sha64("3"),
+		evidenceArtifactDigest: sha64("4"),
+		repositoryFingerprint: repositoryFingerprint(),
+		validationStates: [
+			{
+				id: approvedValidation.id,
+				status: "passed",
+				observationId: `validation-${round}`,
+				normalizedOutputDigest: sha64("5"),
+				repositoryFingerprintAfter: repositoryFingerprint().combinedDigest,
+			},
+		],
+	});
+}
+
+function operationalEvent(state: LeanFlowState, type: "gate_error" | "gate_interrupted"): GateEvent {
+	if (!state.gateLease || !state.finalizedGateSnapshot) throw new Error("Gate provenance is unavailable");
+	return {
+		type,
+		operationalRetrySnapshot: createOperationalRetrySnapshot(
+			state.gateLease,
+			state.finalizedGateSnapshot,
+			type === "gate_error" ? "tool_error" : "session_switch",
+		),
+	};
+}
+function blockedEvent(semanticEvidenceDigest = sha64("9")): GateEvent {
+	return {
+		type: "gate_settled",
+		outcome: "BLOCKED",
+		findingsJson: '{"finding":"missing evidence"}',
+		reasonCode: "stale_validation",
+		evidenceIds: [approvedValidation.id],
+		validationStates: [
+			{
+				id: approvedValidation.id,
+				status: "stale",
+				observationId: "validation-1",
+				normalizedOutputDigest: sha64("5"),
+				repositoryFingerprintAfter: repositoryFingerprint().combinedDigest,
+			},
+		],
+		semanticEvidenceDigest,
+	};
+}
+function detachedOperationalEvent(type: "gate_error" | "gate_interrupted"): GateEvent {
+	const state = dispatch(buildingState(), `fixture-${type}`);
+	return operationalEvent(state, type);
+}
+
+
+
 
 function dispatch(state = buildingState(), toolCallId = "gate-1") {
+	attachFinalizedSnapshot(state);
+	const snapshot = state.finalizedGateSnapshot!;
 	const result = reduceGate(state, {
 		type: "gate_dispatch",
 		toolCallId,
 		runId: GATE_RUN_ID,
-		snapshotDigest: sha64("a"),
-		planDigest: sha64("b"),
-		buildRecordRound: 1,
+		snapshotDigest: finalizedGateSnapshotDigest(snapshot),
+		planDigest,
+		buildRecordRound: state.currentBuildRound!,
 		repositoryFingerprint: repositoryFingerprint(),
+		reuseCycle: state.gateRetryMode === "operational" || state.gateRetryMode === "evidence",
 		now: 10,
 	});
 	expect(result.effects).toEqual([]);
@@ -62,7 +145,7 @@ test("dispatch records a persisted lease without consuming a Gate verdict", () =
 		runId: GATE_RUN_ID,
 		cycle: 1,
 		startedAt: 10,
-		snapshotDigest: sha64("a"),
+		snapshotDigest: finalizedGateSnapshotDigest(state.finalizedGateSnapshot!),
 		planDigest: sha64("b"),
 		buildRecordRound: 1,
 		repositoryFingerprint: repositoryFingerprint(),
@@ -108,7 +191,7 @@ test("first FAIL starts a repair round with artifacts cleared before initializat
 	expect(state.consecutiveGateErrors).toBe(0);
 	expect(effects.map((effect) => effect.kind)).toEqual(["clear_artifacts", "notify", "begin_repair_round"]);
 	expect(checkInvariants(state)).toEqual([]);
-	const ready = reduceGate(state, { type: "repair_round_ready", round: 2, baselineCaptured: true });
+	const ready = reduceGate(state, { type: "repair_round_ready", round: 2, baselineCaptured: true, freshRecord: false, lspEvidencePresent: true });
 	expect(state.phase).toBe("building");
 	expect(state.baselineCaptured).toBe(true);
 	expect(ready.effects.map((e) => e.kind)).toEqual(["write_marker", "notify"]);
@@ -121,7 +204,7 @@ test("first FAIL starts a repair round with artifacts cleared before initializat
 	human.phase = "awaiting_human";
 	human.gateAttempt = 1;
 	reduceGate(human, { type: "human_continue", now: 10 });
-	const humanReady = reduceGate(human, { type: "repair_round_ready", round: 2, baselineCaptured: false });
+	const humanReady = reduceGate(human, { type: "repair_round_ready", round: 2, baselineCaptured: false, freshRecord: false, lspEvidencePresent: true });
 	expect(humanReady.effects[1]).toEqual({
 		kind: "notify",
 		level: "info",
@@ -134,11 +217,41 @@ test("first FAIL starts a repair round with artifacts cleared before initializat
 	expect(failEffects.effects.map((e) => e.kind)).toEqual(["write_marker", "notify"]);
 });
 
+test("fresh repair records require a new durable LSP probe when the plan requires LSP", () => {
+	const state = buildingState();
+	state.phase = "repair_preparing";
+	state.gateAttempt = 1;
+	state.currentBuildRound = 1;
+	state.gateRetryMode = "repair";
+	state.repairLease = { fromRound: 1, toRound: 2, reason: "human_continue", startedAt: 10 };
+	state.lspProbeStatus = "completed";
+	state.lspProbeTarget = "src/example.ts";
+	state.buildMutationObserved = true;
+
+	reduceGate(state, {
+		type: "repair_round_ready",
+		round: 2,
+		baselineCaptured: false,
+		freshRecord: true,
+		lspEvidencePresent: false,
+	});
+	expect(state).toMatchObject({
+		phase: "building",
+		currentBuildRound: 2,
+		gateAttempt: 1,
+		lspProbeStatus: "pending",
+		lspProbeTarget: undefined,
+		buildMutationObserved: false,
+		baselineCaptured: false,
+	});
+	expect(checkInvariants(state)).toEqual([]);
+});
+
 test("second FAIL pauses for a human without setting a terminal outcome", () => {
 	const state = dispatch();
 	state.baselineCaptured = true;
 	reduceGate(state, { type: "gate_settled", outcome: "FAIL" });
-	reduceGate(state, { type: "repair_round_ready", round: 2, baselineCaptured: true });
+	reduceGate(state, { type: "repair_round_ready", round: 2, baselineCaptured: true, freshRecord: false, lspEvidencePresent: true });
 	dispatch(state, "gate-2");
 
 	const { effects } = reduceGate(state, { type: "gate_settled", outcome: "FAIL", findingsJson: "x".repeat(4_001) });
@@ -158,7 +271,7 @@ test("second FAIL pauses for a human without setting a terminal outcome", () => 
 
 test("BLOCKED returns to BUILD without consuming a verdict", () => {
 	const state = dispatch();
-	const { effects } = reduceGate(state, { type: "gate_settled", outcome: "BLOCKED" });
+	const { effects } = reduceGate(state, blockedEvent());
 
 	expect(state).toMatchObject({ phase: "building", gateCalls: 0, gateRetryMode: "evidence", gateLease: undefined });
 	expect(state.stats).toMatchObject({ gateBlocked: 1 });
@@ -174,13 +287,13 @@ test("operational errors return to BUILD until the fourth error pauses the run",
 
 	for (let attempt = 1; attempt <= 4; attempt++) {
 		dispatch(state, `gate-${attempt}`);
-		effects = reduceGate(state, { type: "gate_error" }).effects;
+		effects = reduceGate(state, operationalEvent(state, "gate_error")).effects;
 	}
 
 	expect(state).toMatchObject({
 		phase: "awaiting_human",
 		gateCalls: 0,
-		gateRetryMode: "operational",
+		gateRetryMode: undefined,
 		gateLease: undefined,
 	});
 	expect(state.baselineCaptured).toBeFalse();
@@ -189,45 +302,24 @@ test("operational errors return to BUILD until the fourth error pauses the run",
 	expect(effects.map((effect) => effect.kind)).toEqual(["write_marker", "notify"]);
 	expect(effects[0]).toEqual({ kind: "write_marker", status: "paused" });
 });
-test("second identical BLOCKED pauses for human recovery, while new evidence resets the cap", () => {
+test("repeated structured BLOCKED identity ignores prose and pauses while new evidence resets the cap", () => {
 	const state = dispatch();
-	reduceGate(state, {
-		type: "gate_settled",
-		outcome: "BLOCKED",
-		findingsJson: '{"finding":"missing evidence"}',
-		snapshotDigest: sha64("a"),
-		observationBoundary: 3,
-	});
-	expect(state).toMatchObject({ phase: "building", consecutiveSameSnapshotBlocked: 1 });
+	reduceGate(state, blockedEvent(sha64("9")));
+	expect(state.blockedRecovery?.consecutiveEquivalentBlocked).toBe(1);
 
 	dispatch(state, "gate-2");
-	const repeated = reduceGate(state, {
-		type: "gate_settled",
-		outcome: "BLOCKED",
-		findingsJson: '{"finding":"missing evidence"}',
-		snapshotDigest: sha64("a"),
-		observationBoundary: 3,
-	});
-	expect(state).toMatchObject({ phase: "awaiting_human", consecutiveSameSnapshotBlocked: 2, baselineCaptured: false });
+	const repeated = reduceGate(state, blockedEvent(sha64("9")));
+	expect(state.phase).toBe("awaiting_human");
+	expect(state.blockedRecovery?.consecutiveEquivalentBlocked).toBe(2);
+	expect(state.baselineCaptured).toBeFalse();
 	expect(repeated.effects.map((effect) => effect.kind)).toEqual(["write_marker", "notify"]);
 
 	const reset = dispatch(buildingState(), "gate-3");
-	reduceGate(reset, {
-		type: "gate_settled",
-		outcome: "BLOCKED",
-		findingsJson: '{"finding":"missing evidence"}',
-		snapshotDigest: sha64("a"),
-		observationBoundary: 3,
-	});
+	reduceGate(reset, blockedEvent(sha64("9")));
 	dispatch(reset, "gate-4");
-	reduceGate(reset, {
-		type: "gate_settled",
-		outcome: "BLOCKED",
-		findingsJson: '{"finding":"missing evidence"}',
-		snapshotDigest: sha64("a"),
-		observationBoundary: 4,
-	});
-	expect(reset).toMatchObject({ phase: "building", consecutiveSameSnapshotBlocked: 1 });
+	reduceGate(reset, blockedEvent(sha64("8")));
+	expect(reset.phase).toBe("building");
+	expect(reset.blockedRecovery?.consecutiveEquivalentBlocked).toBe(1);
 });
 
 test("restore reconciliation preserves gating lease; interruption is explicit", () => {
@@ -237,7 +329,7 @@ test("restore reconciliation preserves gating lease; interruption is explicit", 
 	expect(state.gateLease?.toolCallId).toBe("gate-1");
 	expect(preserved.effects).toEqual([]);
 
-	const interrupted = reduceGate(state, { type: "gate_interrupted" });
+	const interrupted = reduceGate(state, operationalEvent(state, "gate_interrupted"));
 	expect(state).toMatchObject({ phase: "building", gateCalls: 0, gateRetryMode: "operational", gateLease: undefined });
 	expect(state.stats).toMatchObject({ gateInterruptions: 1, gateErrors: 0 });
 	expect(interrupted.effects.map((effect) => effect.kind)).toEqual(["notify"]);
@@ -297,7 +389,7 @@ test("every event is a no-op when its transition is inapplicable", () => {
 		{ state: building, event: { type: "gate_settled", outcome: "PASS" } },
 		{ state: building, event: { type: "gate_settled", outcome: "FAIL" } },
 		{ state: building, event: { type: "gate_settled", outcome: "BLOCKED" } },
-		{ state: building, event: { type: "gate_error" } },
+		{ state: building, event: detachedOperationalEvent("gate_error") },
 		{ state: building, event: { type: "human_continue", now: 1 } },
 		{ state: building, event: { type: "human_finish_failed", now: 1 } },
 		{
@@ -309,6 +401,8 @@ test("every event is a no-op when its transition is inapplicable", () => {
 				snapshotDigest: "ignored",
 				planDigest: "ignored",
 				buildRecordRound: 1,
+				repositoryFingerprint: repositoryFingerprint(),
+				reuseCycle: false,
 				now: 1,
 			},
 		},
@@ -394,7 +488,7 @@ function mulberry32(seed: number): () => number {
 function pausedAfterTwoFailures(): LeanFlowState {
 	const state = dispatch();
 	reduceGate(state, { type: "gate_settled", outcome: "FAIL", findingsJson: '{"id":"first"}' });
-	reduceGate(state, { type: "repair_round_ready", round: 2, baselineCaptured: true });
+	reduceGate(state, { type: "repair_round_ready", round: 2, baselineCaptured: true, freshRecord: false, lspEvidencePresent: true });
 	dispatch(state, "gate-2");
 	reduceGate(state, { type: "gate_settled", outcome: "FAIL", findingsJson: '{"id":"second"}' });
 	expect(state.phase).toBe("awaiting_human");
@@ -409,23 +503,27 @@ function randomGateEvent(state: LeanFlowState, random: () => number, seed: numbe
 	if (random() < 0.25) return invalidGateEvent(state, seed, index);
 
 	switch (state.phase) {
-		case "building":
+		case "building": {
+			attachFinalizedSnapshot(state);
 			return {
 				type: "gate_dispatch",
 				toolCallId: `gate-${seed}-${index}`,
 				runId: GATE_RUN_ID,
-				snapshotDigest: sha64("a"),
-				planDigest: sha64("b"),
-				buildRecordRound: 1,
+				snapshotDigest: finalizedGateSnapshotDigest(state.finalizedGateSnapshot!),
+				planDigest,
+				buildRecordRound: state.currentBuildRound!,
+				repositoryFingerprint: repositoryFingerprint(),
+				reuseCycle: state.gateRetryMode === "operational" || state.gateRetryMode === "evidence",
 				now: index,
 			};
+		}
 		case "gating":
-			if (random() < 0.2) return { type: "gate_error" };
-			if (random() < 0.2) return { type: "gate_interrupted" };
+			if (random() < 0.2) return operationalEvent(state, "gate_error");
+			if (random() < 0.2) return operationalEvent(state, "gate_interrupted");
 			if (random() < 0.4) return { type: "restore_reconcile", now: index };
 			return { type: "gate_settled", outcome: randomOutcome(random) };
 		case "repair_preparing":
-			return random() < 0.5 ? { type: "repair_round_ready", round: state.gateAttempt + 1, baselineCaptured: true } : { type: "repair_round_failed", reason: "disk full" };
+			return random() < 0.5 ? { type: "repair_round_ready", round: state.gateAttempt + 1, baselineCaptured: true, freshRecord: false, lspEvidencePresent: true } : { type: "repair_round_failed", reason: "disk full" };
 		case "awaiting_human":
 			return random() < 0.5
 				? { type: "human_continue", now: index }
@@ -447,12 +545,24 @@ function invalidGateEvent(state: LeanFlowState, seed: number, index: number): Ga
 				snapshotDigest: sha64("a"),
 				planDigest: sha64("b"),
 				buildRecordRound: 1,
+				repositoryFingerprint: repositoryFingerprint(),
+				reuseCycle: false,
 				now: index,
 			};
 		case "repair_preparing":
-			return { type: "gate_dispatch", toolCallId: `ignored-${seed}-${index}`, runId: GATE_RUN_ID, snapshotDigest: sha64("a"), planDigest: sha64("b"), buildRecordRound: 1, now: index };
+			return {
+				type: "gate_dispatch",
+				toolCallId: `ignored-${seed}-${index}`,
+				runId: GATE_RUN_ID,
+				snapshotDigest: sha64("a"),
+				planDigest,
+				buildRecordRound: 1,
+				repositoryFingerprint: repositoryFingerprint(),
+				reuseCycle: false,
+				now: index,
+			};
 		case "awaiting_human":
-			return { type: "gate_error" };
+			return detachedOperationalEvent("gate_error");
 		case "finalizing":
 			return terminalInvalidEvents(seed, index)[0]!;
 		default:
@@ -470,14 +580,16 @@ function terminalInvalidEvents(seed: number, index: number): GateEvent[] {
 			planDigest: sha64("b"),
 			buildRecordRound: 1,
 			now: index,
+			repositoryFingerprint: repositoryFingerprint(),
+			reuseCycle: false,
 		},
 		{ type: "gate_settled", outcome: "PASS" },
 		{ type: "gate_settled", outcome: "FAIL" },
 		{ type: "gate_settled", outcome: "BLOCKED" },
-		{ type: "gate_error" },
-		{ type: "gate_interrupted" },
+		detachedOperationalEvent("gate_error"),
+		detachedOperationalEvent("gate_interrupted"),
 		{ type: "restore_reconcile", now: index },
-		{ type: "repair_round_ready", round: 99, baselineCaptured: true },
+		{ type: "repair_round_ready", round: 99, baselineCaptured: true, freshRecord: false, lspEvidencePresent: true },
 		{ type: "repair_round_failed", reason: "x" },
 		{ type: "human_continue", now: index },
 		{ type: "human_finish_failed", now: index },

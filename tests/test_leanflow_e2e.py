@@ -131,17 +131,20 @@ class WorkflowPromptTest(unittest.TestCase):
         self.assertIn("Missing, invalid, duplicated, or diff-contradicted metadata", gate)
 
     def test_gate_requires_extension_generated_build_evidence(self) -> None:
-        """P1: Gate is blocked until extension-generated artifacts verify."""
+        """P1: Gate is blocked until the atomic extension-generated manifest verifies."""
         state = (ROOT / "extensions" / "leanflow" / "state.ts").read_text(encoding="utf-8")
         self.assertIn("writtenArtifacts", state)
+        self.assertIn("finalizedGateSnapshot", state)
         self.assertIn("baselineCaptured", state)
         index = (ROOT / "extensions" / "leanflow" / "index.ts").read_text(encoding="utf-8")
         self.assertIn("leanflow_capture_baseline", index)
         self.assertIn("leanflow_finalize_artifacts", index)
-        self.assertIn("missingArtifacts", index)
+        self.assertIn("verifyDurableFinalizedSnapshot", index)
+        self.assertIn("writtenArtifacts is advisory UI state", index)
         self.assertIn("Gate unavailable", index)
         self.assertIn("REQUIRED_ARTIFACTS", index)
         self.assertIn("state.writtenArtifacts = []", index)
+        self.assertNotIn("function missingArtifacts", index)
         self.assertNotIn("pendingArtifactUpdates", index)
 
     def test_lsp_is_not_a_build_action(self) -> None:
@@ -217,7 +220,7 @@ class WorkflowPromptTest(unittest.TestCase):
         """Malformed calls and missing artifacts block before Gate dispatch."""
         index = (ROOT / "extensions" / "leanflow" / "index.ts").read_text(encoding="utf-8")
         shape = index.index("const shape = validateGateTaskCall")
-        readiness = index.index("const missing = missingArtifacts(state)", shape)
+        readiness = index.index("const snapshot = await prepareGateSnapshot(ctx)", shape)
         dispatch = index.index("gate_dispatch", readiness)
         self.assertLess(shape, readiness)
         self.assertLess(readiness, dispatch)

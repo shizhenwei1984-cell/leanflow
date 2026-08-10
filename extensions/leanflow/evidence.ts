@@ -1,7 +1,12 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
+import {
+	normalizedValidationOutputDigest,
+	type ApprovedValidationContract,
+	type ValidationSemanticState,
+} from "./validation";
 
-export const BUILD_EVIDENCE_RECORD_VERSION = 1 as const;
+export const BUILD_EVIDENCE_RECORD_VERSION = 2 as const;
 export const MAX_GATE_ARTIFACT_BYTES = 1024 * 1024;
 
 export interface ParsedLspRequest {
@@ -16,43 +21,52 @@ export interface ParsedLspRequest {
 	payload?: string;
 }
 
-export interface BuildEvidenceObservationV1 {
+export interface BuildEvidenceObservationV2 {
 	toolCallId: string;
-	toolName: "bash" | "lsp";
+	toolName: "bash" | "lsp" | "validation";
 	command?: string;
+	validationId?: string;
+	executable?: string;
+	argv?: string[];
 	lspRequest?: ParsedLspRequest;
 	isError: boolean;
 	exitCode?: number;
 	timedOut?: boolean;
+	repositoryFingerprintBefore?: string;
+	repositoryFingerprintAfter?: string;
+	startedAt?: number;
+	finishedAt?: number;
 	text: string;
 }
 
-export interface BuildEvidenceBaselineV1 {
+export interface BuildEvidenceBaselineV2 {
 	head: string;
 	status: string;
 	capturedAt: number;
 }
 
-export interface BuildEvidenceRecordV1 {
-	version: 1;
+export interface BuildEvidenceRecordV2 {
+	version: 2;
 	runId: string;
 	planSlug: string;
 	planDigest: string;
+	approvedValidationDigest: string;
 	round: number;
-	baseline?: BuildEvidenceBaselineV1;
-	observations: BuildEvidenceObservationV1[];
+	baseline?: BuildEvidenceBaselineV2;
+	observations: BuildEvidenceObservationV2[];
 }
 
 export interface BuildRecordIdentity {
 	runId: string;
 	planSlug: string;
 	planDigest: string;
+	approvedValidationDigest: string;
 	round: number;
 }
 
 export interface SelectedValidation {
 	command: string;
-	observation: BuildEvidenceObservationV1;
+	observation: BuildEvidenceObservationV2;
 }
 
 export interface GitCommandEvidence {
@@ -74,7 +88,7 @@ export interface CompleteDiff {
 
 export interface RenderBuildArtifactsInput {
 	planArtifact: string;
-	record: BuildEvidenceRecordV1;
+	record: BuildEvidenceRecordV2;
 	finalHead: string;
 	finalStatus: string;
 	changedPaths: string[];
@@ -96,9 +110,36 @@ export class BuildEvidenceError extends Error {
 	}
 }
 
-const RECORD_KEYS = ["version", "runId", "planSlug", "planDigest", "round", "baseline", "observations"] as const;
+const RECORD_KEYS = [
+	"version",
+	"runId",
+	"planSlug",
+	"planDigest",
+	"approvedValidationDigest",
+	"round",
+	"baseline",
+	"observations",
+] as const;
+const LEGACY_RECORD_KEYS = ["version", "runId", "planSlug", "planDigest", "round", "baseline", "observations"] as const;
 const BASELINE_KEYS = ["head", "status", "capturedAt"] as const;
 const OBSERVATION_KEYS = [
+	"toolCallId",
+	"toolName",
+	"command",
+	"validationId",
+	"executable",
+	"argv",
+	"lspRequest",
+	"isError",
+	"exitCode",
+	"timedOut",
+	"repositoryFingerprintBefore",
+	"repositoryFingerprintAfter",
+	"startedAt",
+	"finishedAt",
+	"text",
+] as const;
+const LEGACY_OBSERVATION_KEYS = [
 	"toolCallId",
 	"toolName",
 	"command",
@@ -133,6 +174,20 @@ function finiteInteger(value: unknown): value is number {
 	return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value);
 }
 
+function assertBaseline(value: unknown): asserts value is BuildEvidenceBaselineV2 {
+	if (!isPlainRecord(value) || !hasOnlyKeys(value, BASELINE_KEYS)) {
+		throw new BuildEvidenceError("Internal build record has an invalid baseline.");
+	}
+	if (
+		!nonEmptyString(value.head) ||
+		typeof value.status !== "string" ||
+		typeof value.capturedAt !== "number" ||
+		!Number.isFinite(value.capturedAt)
+	) {
+		throw new BuildEvidenceError("Internal build record baseline is incomplete.");
+	}
+}
+
 function assertParsedLspRequest(value: unknown): asserts value is ParsedLspRequest {
 	if (!isPlainRecord(value) || !hasOnlyKeys(value, LSP_REQUEST_KEYS) || !nonEmptyString(value.action)) {
 		throw new BuildEvidenceError("Build record contains an invalid LSP request.");
@@ -153,13 +208,13 @@ function assertParsedLspRequest(value: unknown): asserts value is ParsedLspReque
 	}
 }
 
-function assertObservation(value: unknown): asserts value is BuildEvidenceObservationV1 {
+function assertObservation(value: unknown): asserts value is BuildEvidenceObservationV2 {
 	if (!isPlainRecord(value) || !hasOnlyKeys(value, OBSERVATION_KEYS)) {
 		throw new BuildEvidenceError("Build record contains an invalid observation object.");
 	}
 	if (
 		!nonEmptyString(value.toolCallId) ||
-		(value.toolName !== "bash" && value.toolName !== "lsp") ||
+		(value.toolName !== "bash" && value.toolName !== "lsp" && value.toolName !== "validation") ||
 		typeof value.isError !== "boolean" ||
 		typeof value.text !== "string"
 	) {
@@ -171,31 +226,74 @@ function assertObservation(value: unknown): asserts value is BuildEvidenceObserv
 	if (value.timedOut !== undefined && typeof value.timedOut !== "boolean") {
 		throw new BuildEvidenceError("Build record observation has an invalid timeout result.");
 	}
+	for (const key of ["repositoryFingerprintBefore", "repositoryFingerprintAfter"] as const) {
+		if (value[key] !== undefined && (typeof value[key] !== "string" || !SHA256_PATTERN.test(value[key]))) {
+			throw new BuildEvidenceError(`Build record observation has an invalid ${key} field.`);
+		}
+	}
 	if (value.toolName === "bash") {
-		if (!nonEmptyString(value.command) || value.lspRequest !== undefined) {
-			throw new BuildEvidenceError("Build record bash observation has an invalid command shape.");
+		if (
+			!nonEmptyString(value.command) ||
+			value.validationId !== undefined ||
+			value.executable !== undefined ||
+			value.argv !== undefined ||
+			value.lspRequest !== undefined ||
+			value.repositoryFingerprintBefore !== undefined ||
+			value.repositoryFingerprintAfter !== undefined ||
+			value.startedAt !== undefined ||
+			value.finishedAt !== undefined
+		) {
+			throw new BuildEvidenceError("Build record bash observation has an invalid shape.");
+		}
+	} else if (value.toolName === "validation") {
+		if (
+			!nonEmptyString(value.command) ||
+			!nonEmptyString(value.validationId) ||
+			!nonEmptyString(value.executable) ||
+			!Array.isArray(value.argv) ||
+			value.argv.some((argument) => typeof argument !== "string") ||
+			value.lspRequest !== undefined ||
+			!nonEmptyString(value.repositoryFingerprintBefore) ||
+			(!value.isError && !nonEmptyString(value.repositoryFingerprintAfter)) ||
+			typeof value.startedAt !== "number" ||
+			!Number.isFinite(value.startedAt) ||
+			typeof value.finishedAt !== "number" ||
+			!Number.isFinite(value.finishedAt) ||
+			value.finishedAt < value.startedAt
+		) {
+			throw new BuildEvidenceError("Build record validation observation has an invalid shape.");
 		}
 	} else {
-		if (value.command !== undefined) {
-			throw new BuildEvidenceError("Build record LSP observation cannot contain a bash command.");
+		if (
+			value.command !== undefined ||
+			value.validationId !== undefined ||
+			value.executable !== undefined ||
+			value.argv !== undefined ||
+			value.repositoryFingerprintBefore !== undefined ||
+			value.repositoryFingerprintAfter !== undefined ||
+			value.startedAt !== undefined ||
+			value.finishedAt !== undefined
+		) {
+			throw new BuildEvidenceError("Build record LSP observation contains incompatible fields.");
 		}
 		assertParsedLspRequest(value.lspRequest);
 	}
 }
 
-export function createBuildEvidenceRecord(identity: BuildRecordIdentity): BuildEvidenceRecordV1 {
+export function createBuildEvidenceRecord(identity: BuildRecordIdentity): BuildEvidenceRecordV2 {
 	assertIdentity(identity);
 	return {
 		version: BUILD_EVIDENCE_RECORD_VERSION,
 		runId: identity.runId,
 		planSlug: identity.planSlug,
 		planDigest: identity.planDigest,
+		approvedValidationDigest: identity.approvedValidationDigest,
 		round: identity.round,
 		observations: [],
 	};
 }
 
-export function parseBuildEvidenceRecord(value: unknown, expected: BuildRecordIdentity): BuildEvidenceRecordV1 {
+export function parseBuildEvidenceRecord(value: unknown, expected: BuildRecordIdentity): BuildEvidenceRecordV2 {
 	assertIdentity(expected);
 	if (!isPlainRecord(value) || !hasOnlyKeys(value, RECORD_KEYS)) {
 		throw new BuildEvidenceError("Internal build record is missing or has an invalid shape.");
@@ -205,32 +303,21 @@ export function parseBuildEvidenceRecord(value: unknown, expected: BuildRecordId
 		value.runId !== expected.runId ||
 		value.planSlug !== expected.planSlug ||
 		value.planDigest !== expected.planDigest ||
+		value.approvedValidationDigest !== expected.approvedValidationDigest ||
 		value.round !== expected.round ||
 		!Array.isArray(value.observations)
 	) {
 		throw new BuildEvidenceError("Internal build record identity does not match the active LeanFlow run.");
 	}
-	if (value.baseline !== undefined) {
-		if (!isPlainRecord(value.baseline) || !hasOnlyKeys(value.baseline, BASELINE_KEYS)) {
-			throw new BuildEvidenceError("Internal build record has an invalid baseline.");
-		}
-		if (
-			!nonEmptyString(value.baseline.head) ||
-			typeof value.baseline.status !== "string" ||
-			typeof value.baseline.capturedAt !== "number" ||
-			!Number.isFinite(value.baseline.capturedAt)
-		) {
-			throw new BuildEvidenceError("Internal build record baseline is incomplete.");
-		}
-	}
+	if (value.baseline !== undefined) assertBaseline(value.baseline);
 	for (const observation of value.observations) assertObservation(observation);
-	return value as unknown as BuildEvidenceRecordV1;
+	return value as unknown as BuildEvidenceRecordV2;
 }
 
 export function parseBuildEvidenceRecordWithoutRound(
 	value: unknown,
 	expected: Omit<BuildRecordIdentity, "round">,
-): BuildEvidenceRecordV1 {
+): BuildEvidenceRecordV2 {
 	if (!isPlainRecord(value) || !hasOnlyKeys(value, RECORD_KEYS)) {
 		throw new BuildEvidenceError("Internal build record is missing or has an invalid shape.");
 	}
@@ -239,6 +326,7 @@ export function parseBuildEvidenceRecordWithoutRound(
 		value.runId !== expected.runId ||
 		value.planSlug !== expected.planSlug ||
 		value.planDigest !== expected.planDigest ||
+		value.approvedValidationDigest !== expected.approvedValidationDigest ||
 		!Array.isArray(value.observations)
 	) {
 		throw new BuildEvidenceError("Internal build record identity does not match the active LeanFlow run.");
@@ -246,21 +334,49 @@ export function parseBuildEvidenceRecordWithoutRound(
 	if (!finiteInteger(value.round) || (value.round as number) < 1) {
 		throw new BuildEvidenceError("Internal build record has an invalid round.");
 	}
-	if (value.baseline !== undefined) {
-		if (!isPlainRecord(value.baseline) || !hasOnlyKeys(value.baseline, BASELINE_KEYS)) {
-			throw new BuildEvidenceError("Internal build record has an invalid baseline.");
-		}
-		if (
-			!nonEmptyString(value.baseline.head) ||
-			typeof value.baseline.status !== "string" ||
-			typeof value.baseline.capturedAt !== "number" ||
-			!Number.isFinite(value.baseline.capturedAt)
-		) {
-			throw new BuildEvidenceError("Internal build record baseline is incomplete.");
-		}
-	}
+	if (value.baseline !== undefined) assertBaseline(value.baseline);
 	for (const observation of value.observations) assertObservation(observation);
-	return value as unknown as BuildEvidenceRecordV1;
+	return value as unknown as BuildEvidenceRecordV2;
+}
+
+export function migrateLegacyBuildEvidenceRecord(
+	value: unknown,
+	expected: BuildRecordIdentity,
+): BuildEvidenceRecordV2 {
+	assertIdentity(expected);
+	if (!isPlainRecord(value) || !hasOnlyKeys(value, LEGACY_RECORD_KEYS)) {
+		throw new BuildEvidenceError("Legacy build record is missing or has an invalid shape.");
+	}
+	if (
+		value.version !== 1 ||
+		value.runId !== expected.runId ||
+		value.planSlug !== expected.planSlug ||
+		value.planDigest !== expected.planDigest ||
+		value.round !== expected.round ||
+		!Array.isArray(value.observations)
+	) {
+		throw new BuildEvidenceError("Legacy build record identity does not match the active LeanFlow run.");
+	}
+	if (value.baseline !== undefined) assertBaseline(value.baseline);
+	const observations: BuildEvidenceObservationV2[] = [];
+	for (const candidate of value.observations) {
+		if (!isPlainRecord(candidate) || !hasOnlyKeys(candidate, LEGACY_OBSERVATION_KEYS)) {
+			throw new BuildEvidenceError("Legacy build record contains an invalid observation.");
+		}
+		const migrated = { ...candidate } as unknown;
+		assertObservation(migrated);
+		observations.push(migrated);
+	}
+	return {
+		version: BUILD_EVIDENCE_RECORD_VERSION,
+		runId: expected.runId,
+		planSlug: expected.planSlug,
+		planDigest: expected.planDigest,
+		approvedValidationDigest: expected.approvedValidationDigest,
+		round: expected.round,
+		...(value.baseline ? { baseline: value.baseline as unknown as BuildEvidenceBaselineV2 } : {}),
+		observations,
+	};
 }
 
 function assertIdentity(identity: BuildRecordIdentity): void {
@@ -268,6 +384,7 @@ function assertIdentity(identity: BuildRecordIdentity): void {
 		!nonEmptyString(identity.runId) ||
 		!nonEmptyString(identity.planSlug) ||
 		!SHA256_PATTERN.test(identity.planDigest) ||
+		!SHA256_PATTERN.test(identity.approvedValidationDigest) ||
 		!finiteInteger(identity.round) ||
 		identity.round < 1
 	) {
@@ -275,33 +392,99 @@ function assertIdentity(identity: BuildRecordIdentity): void {
 	}
 }
 
-export function selectValidationObservations(
-	record: BuildEvidenceRecordV1,
-	validationCommands: readonly string[],
-): SelectedValidation[] {
-	if (validationCommands.length === 0) {
-		throw new BuildEvidenceError("At least one validation command is required.");
+export function validationSemanticStates(
+	record: BuildEvidenceRecordV2,
+	contract: ApprovedValidationContract,
+	repositoryFingerprint: string,
+): ValidationSemanticState[] {
+	if (record.approvedValidationDigest !== contract.digest) {
+		throw new BuildEvidenceError("BUILD record validation contract does not match the approved plan.");
 	}
-	const commands = [...validationCommands];
-	if (commands.some((command) => command.trim().length === 0)) {
-		throw new BuildEvidenceError("Validation commands must be non-empty after trimming.");
+	const approvedById = new Map(contract.validations.map((validation) => [validation.id, validation]));
+	for (const observation of record.observations) {
+		if (observation.toolName !== "validation") continue;
+		const approved = approvedById.get(observation.validationId!);
+		if (
+			!approved ||
+			observation.command !== approved.displayCommand ||
+			observation.executable !== approved.executable ||
+			JSON.stringify(observation.argv) !== JSON.stringify(approved.argv)
+		) {
+			throw new BuildEvidenceError(`Validation observation is not approved by the plan: ${observation.validationId}`);
+		}
 	}
-	if (new Set(commands).size !== commands.length) {
-		throw new BuildEvidenceError("Validation commands must be globally unique.");
-	}
+	return contract.validations.map((validation) => {
+		const observation = record.observations
+			.filter(
+				(candidate) =>
+					candidate.toolName === "validation" &&
+					candidate.validationId === validation.id &&
+					candidate.command === validation.displayCommand &&
+					candidate.executable === validation.executable &&
+					JSON.stringify(candidate.argv) === JSON.stringify(validation.argv),
+			)
+			.at(-1);
+		if (!observation) return { id: validation.id, status: "missing" };
+		const output = normalizedValidationOutputDigest(observation.text);
+		const repositoryFingerprintAfter = observation.repositoryFingerprintAfter;
+		if (
+			observation.isError ||
+			observation.timedOut === true ||
+			observation.exitCode !== 0 ||
+			observation.repositoryFingerprintBefore !== repositoryFingerprintAfter
+		) {
+			return {
+				id: validation.id,
+				status: "failed",
+				normalizedOutputDigest: output,
+				...(repositoryFingerprintAfter ? { repositoryFingerprintAfter } : {}),
+				observationId: observation.toolCallId,
+			};
+		}
+		if (repositoryFingerprintAfter !== repositoryFingerprint) {
+			return {
+				id: validation.id,
+				status: "stale",
+				normalizedOutputDigest: output,
+				...(repositoryFingerprintAfter ? { repositoryFingerprintAfter } : {}),
+				observationId: observation.toolCallId,
+			};
+		}
+		return {
+			id: validation.id,
+			status: "passed",
+			normalizedOutputDigest: output,
+			observationId: observation.toolCallId,
+			repositoryFingerprintAfter,
+		};
+	});
+}
 
-	return commands.map((command) => {
-		const matches = record.observations.filter(
-			(observation) => observation.toolName === "bash" && observation.command === command,
+export function selectValidationObservations(
+	record: BuildEvidenceRecordV2,
+	contract: ApprovedValidationContract,
+	repositoryFingerprint: string,
+): SelectedValidation[] {
+	const states = validationSemanticStates(record, contract, repositoryFingerprint);
+	const incomplete = states.filter((state) => state.status !== "passed");
+	if (incomplete.length > 0) {
+		throw new BuildEvidenceError(
+			`Required validations are incomplete: ${incomplete.map((state) => `${state.id}=${state.status}`).join(", ")}`,
 		);
-		const observation = matches.at(-1);
-		if (!observation) {
-			throw new BuildEvidenceError(`Validation command was not recorded in the current round: ${command}`);
-		}
-		if (observation.isError || observation.timedOut === true || observation.exitCode !== 0) {
-			throw new BuildEvidenceError(`Validation command did not finish synchronously with exit code 0: ${command}`);
-		}
-		return { command, observation };
+	}
+	return contract.validations.map((validation) => {
+		const observation = record.observations
+			.filter(
+				(candidate) =>
+					candidate.toolName === "validation" &&
+					candidate.validationId === validation.id &&
+					candidate.command === validation.displayCommand &&
+					candidate.executable === validation.executable &&
+					JSON.stringify(candidate.argv) === JSON.stringify(validation.argv),
+			)
+			.at(-1);
+		if (!observation) throw new BuildEvidenceError(`Required validation observation is missing: ${validation.id}`);
+		return { command: validation.displayCommand, observation };
 	});
 }
 
@@ -342,7 +525,7 @@ function headingText(value: string): string {
 	return value.replace(/[\r\n]+/g, " ↵ ").trim() || "(empty command)";
 }
 
-function renderObservation(observation: BuildEvidenceObservationV1): string[] {
+function renderObservation(observation: BuildEvidenceObservationV2): string[] {
 	const lines = [
 		`- tool call: \`${observation.toolCallId}\``,
 		`- error: ${observation.isError}`,
@@ -353,6 +536,13 @@ function renderObservation(observation: BuildEvidenceObservationV1): string[] {
 		lines.push("- parsed request:", markdownFence(JSON.stringify(observation.lspRequest, null, 2), "json"));
 	} else {
 		lines.push("- command:", markdownFence(observation.command ?? "", "sh"));
+		if (observation.toolName === "validation") {
+			lines.push(
+				`- validation ID: \`${observation.validationId}\``,
+				`- repository before: \`${observation.repositoryFingerprintBefore}\``,
+				`- repository after: \`${observation.repositoryFingerprintAfter}\``,
+			);
+		}
 	}
 	lines.push("- result:", markdownFence(observation.text));
 	return lines;
@@ -396,6 +586,7 @@ export function renderBuildArtifacts(input: RenderBuildArtifactsInput): Rendered
 		runId: input.record.runId,
 		planSlug: input.record.planSlug,
 		planDigest: input.record.planDigest,
+		approvedValidationDigest: input.record.approvedValidationDigest,
 		round: input.record.round,
 	});
 	if (!record.baseline) throw new BuildEvidenceError("Cannot render Gate artifacts without an immutable baseline.");
@@ -413,6 +604,7 @@ export function renderBuildArtifacts(input: RenderBuildArtifactsInput): Rendered
 		`- Run ID: \`${record.runId}\``,
 		`- Plan slug: \`${record.planSlug}\``,
 		`- Plan SHA-256: \`${record.planDigest}\``,
+		`- Approved validation contract SHA-256: \`${record.approvedValidationDigest}\``,
 		`- Build round: ${record.round}`,
 		"",
 		"## LSP observations",
@@ -482,6 +674,7 @@ export function renderBuildArtifacts(input: RenderBuildArtifactsInput): Rendered
 		`- Plan: \`${input.planArtifact}\``,
 		`- Run ID: \`${record.runId}\``,
 		`- Build round: ${record.round}`,
+		`- Approved validation contract SHA-256: \`${record.approvedValidationDigest}\``,
 		"",
 	];
 	for (const [index, observation] of lspObservations.entries()) {

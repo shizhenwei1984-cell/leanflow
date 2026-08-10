@@ -13,7 +13,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path, PurePosixPath
-from typing import Literal, NotRequired, TypedDict, cast
+from typing import Literal, Optional, TypedDict, cast
 from collections.abc import Sequence
 
 PACKAGE = "leanflow"
@@ -24,17 +24,20 @@ InstallKind = Literal["file", "directory"]
 InstallMode = Literal["copy", "symlink"]
 InstallScope = Literal["user", "project"]
 InstallSource = tuple[str, Path, InstallKind]
-MetadataEntry = tuple[str, InstallKind, str, str | None]
+MetadataEntry = tuple[str, InstallKind, str, Optional[str]]
 
 
-class PlannedEntry(TypedDict):
+class PlannedEntryRequired(TypedDict):
     digest: str
     kind: InstallKind
     path: str
     snapshot: str | None
     source_overlap: bool
     state: str
-    link_target: NotRequired[str]
+
+
+class PlannedEntry(PlannedEntryRequired, total=False):
+    link_target: str
 
 
 # Source-relative path -> install-relative path -> kind.

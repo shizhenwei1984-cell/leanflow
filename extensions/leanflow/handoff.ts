@@ -1,11 +1,13 @@
+import { createHash } from "node:crypto";
 import type { HandoffStatus } from "./state";
-import { parseApprovedValidation, type ApprovedValidation } from "./validation";
+import { parseValidationContract, type ApprovedValidationContract } from "./validation";
 
 export type HandoffBlockerCode =
 	| "TARGET_MISSING"
 	| "BEHAVIOR_MISSING"
 	| "ACCEPTANCE_MISSING"
-	| "VERIFICATION_MISSING";
+	| "VERIFICATION_MISSING"
+	| "VERIFICATION_INVALID";
 
 export interface HandoffBlocker {
 	code: HandoffBlockerCode;
@@ -16,6 +18,7 @@ export interface HandoffResult {
 	status: HandoffStatus;
 	blockers: HandoffBlocker[];
 	warnings: string[];
+	validationContract?: ApprovedValidationContract;
 }
 
 const TARGET_PATH_OCCURRENCES =
@@ -134,37 +137,6 @@ function sliceSection(lines: string[], headingPattern: RegExp): string[] {
 }
 
 
-function hasVerificationEvidence(lines: string[]): boolean {
-	const section = sliceSection(lines, /verification|验证/i);
-	if (section.length === 0) return false;
-	const text = section.join("\n");
-	const fenceBlocks: string[] = [];
-	const fenceRe = /(```|~~~)[^\n]*\n([\s\S]*?)\n\1/g;
-	let match: RegExpExecArray | null;
-	while ((match = fenceRe.exec(text)) !== null) fenceBlocks.push(match[2] ?? "");
-	let validFencedCommand = false;
-	for (const block of fenceBlocks) {
-		for (const rawLine of block.split(/\r?\n/)) {
-			const normalized = normalizeEntry(rawLine);
-			if (!normalized || normalized.startsWith("#")) continue;
-			if (isPlaceholder(normalized) || isDecoratedPlaceholder(normalized) || !parseApprovedValidation(normalized)) {
-				return false;
-			}
-			validFencedCommand = true;
-		}
-	}
-	if (validFencedCommand) return true;
-	for (const line of section) {
-		const inline = /`([^`]+)`/g;
-		let matchInline: RegExpExecArray | null;
-		while ((matchInline = inline.exec(line)) !== null) {
-			const normalized = normalizeEntry(matchInline[1] ?? "");
-			if (normalized && !isPlaceholder(normalized) && !isDecoratedPlaceholder(normalized) && parseApprovedValidation(normalized)) return true;
-		}
-	}
-	return false;
-}
-
 function hasAcceptanceEvidence(lines: string[]): boolean {
 	const section = sliceSection(lines, /acceptance|验收/i);
 
@@ -183,33 +155,16 @@ function hasAcceptanceEvidence(lines: string[]): boolean {
 	}
 	return false;
 }
-/** Extracts the exact non-shell validation commands approved in a plan. */
-export function approvedValidationsFromPlan(content: string): ApprovedValidation[] {
-	const section = sliceSection(content.split(/\r?\n/), /verification|验证/i);
-	const candidates: string[] = [];
-	const text = section.join("\n");
-	const fenceRe = /(```|~~~)[^\n]*\n([\s\S]*?)\n\1/g;
-	let fence: RegExpExecArray | null;
-	while ((fence = fenceRe.exec(text)) !== null) candidates.push(...(fence[2] ?? "").split(/\r?\n/));
-	for (const line of section) {
-		const inline = /`([^`]+)`/g;
-		let match: RegExpExecArray | null;
-		while ((match = inline.exec(line)) !== null) candidates.push(match[1] ?? "");
-	}
-	const seen = new Set<string>();
-	return candidates.flatMap((candidate) => {
-		const parsed = parseApprovedValidation(normalizeEntry(candidate));
-		if (!parsed || seen.has(parsed.digest)) return [];
-		seen.add(parsed.digest);
-		return [parsed];
-	});
-}
 
+function contentDigest(content: string): string {
+	return createHash("sha256").update(content, "utf8").digest("hex");
+}
 export function assessHandoff(planContent: string): HandoffResult {
 	const lines = planContent.split(/\r?\n/).filter((line) => !METADATA_LINE.test(line));
 	const content = lines.join("\n");
 	const blockers: HandoffBlocker[] = [];
 	const warnings: string[] = [];
+	const validation = parseValidationContract(planContent, contentDigest(planContent));
 
 	if (!hasCriticalFilesEntries(lines)) {
 		blockers.push({
@@ -229,10 +184,18 @@ export function assessHandoff(planContent: string): HandoffResult {
 			detail: "Plan has no acceptance section with a concrete criterion.",
 		});
 	}
-	if (!hasVerificationEvidence(lines)) {
+	if (validation.approved.length === 0) {
 		blockers.push({
 			code: "VERIFICATION_MISSING",
-			detail: "Plan has no Verification/验证 section containing an executable command.",
+			detail: "Plan has no Verification/验证 section containing an approved executable command.",
+		});
+	}
+	if (validation.rejected.length > 0) {
+		blockers.push({
+			code: "VERIFICATION_INVALID",
+			detail: `Verification contains rejected command candidates: ${validation.rejected
+				.map((candidate) => `${candidate.raw} (${candidate.reason})`)
+				.join("; ")}`,
 		});
 	}
 
@@ -247,6 +210,7 @@ export function assessHandoff(planContent: string): HandoffResult {
 		status: blockers.length > 0 ? "NEEDS_UPDATE" : warnings.length > 0 ? "READY_WITH_WARNINGS" : "READY",
 		blockers,
 		warnings,
+		...(validation.contract ? { validationContract: validation.contract } : {}),
 	};
 }
 

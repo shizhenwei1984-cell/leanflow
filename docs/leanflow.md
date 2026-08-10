@@ -18,7 +18,7 @@ Main Session
 | Planner | Understand request, investigate, decide feasibility and acceptance coverage, write canonical plan | Scout only, when a focused fact is needed |
 | Scout | Repository, call-chain, test, official-documentation, and external fact finding | None |
 | Builder | Same Main Session implementation; sole writer | None |
-| Gate | Independent final plan/diff/validation verification; PASS/FAIL | One Scout only for an unavailable approved-plan correctness or compatibility fact |
+| Gate | Independent final plan/diff/validation verification; PASS/FAIL/structured BLOCKED | One Scout only for an unavailable approved-plan correctness or compatibility fact |
 
 There are no reviewer, audit, validator, planner, implementer, developer, coder, or builder subagents.
 
@@ -29,8 +29,9 @@ The LeanFlow extension (`extensions/leanflow/`) provides:
 - **State machine** — tracks `idle → planning → awaiting_approval → building → gating → finalizing → idle`, persists it via session entries, and measures Main Session provider usage, response count, and elapsed time
 - **Durable approval identity** — binds the approved plan's opaque run ID and SHA-256 content digest to extension-owned `local://.leanflow/runs/<runId>.json` state plus the fixed-length `local://.leanflow/active/<sha256(slug)>.json` pointer; recovery checks that hash key first and falls back read-only to legacy percent-encoded pointer names, while terminal, cancelled, invalidated, expired, malformed, or ambiguously orphaned markers cannot recover
 - **Tool guard** — fails closed before approval, while the initial LSP probe is pending, and until `leanflow_capture_baseline` freezes HEAD/status; normalized Hashline, `local:/`, `local://`, and absolute sandbox targets resolve to filesystem identity; Main remains the sole source writer
-- **Mechanical evidence** — records only allowed bash/LSP inputs paired with real results in `local://.leanflow/runs/<runId>-build-record.json`; `leanflow_finalize_artifacts` validates selected synchronous commands, unchanged HEAD, full tracked/untracked binary diff, empty files, hashes, and size before atomically generating all Gate artifacts
-- **Gate readiness** — blocks direct artifact writes and malformed Gate wire shapes before budget accounting; Gate runs only after all three extension-generated artifacts verify successfully
+- **Mechanical evidence** — parses an immutable approved validation contract from the plan, executes each approved executable/argv only through `leanflow_run_validation({ validationId })`, captures repository fingerprints before/after, and stores versioned observations in `local://.leanflow/runs/<runId>-build-record.json`
+- **Atomic Gate provenance** — `leanflow_finalize_artifacts({})` requires current passing observations for every required validation, generates the three artifacts, and commits a finalized manifest last; the manifest binds run/plan/contract identity, explicit BUILD round, BUILD-record digest, three artifact digests, repository fingerprint, and semantic validation-state digest
+- **Gate readiness** — treats `writtenArtifacts` as advisory only; dispatch and settlement reread the durable manifest plus every bound input, classify plan/repository/record/artifact drift separately, and block direct artifact or internal-record writes
 - **Context filter** — through BUILD, GATE, and finalization, removes planning history, injects a compact builder preamble, and records message-count and serialized-byte observations separately
 - **Budget enforcement** — max 3 Scout calls and max 2 Gate calls, checked before incrementing at the `tool_call` level
 - **Runtime stats** — `/flowstats` reports Main Session phase metrics, distinct Gate verdict/error counters, and context-filter reductions. Provider reduction plus Scout/Gate tokens are `not measured`
@@ -48,15 +49,23 @@ The LeanFlow extension (`extensions/leanflow/`) provides:
 
 ### BUILD
 
-After approval, the same Main Session becomes Builder. For source plans it first runs the required LSP diagnostics probe, then calls `leanflow_capture_baseline({})`; documentation/resource-only plans skip only the probe. Main implements the approved plan and runs synchronous validation commands. It then calls `leanflow_finalize_artifacts({ validationCommands: [...] })` with the exact commands already observed. The extension generates and verifies `local://<slug>-build.md`, `local://<slug>-diff.md`, and `local://<slug>-evidence.md`; Main cannot write them directly. A repair keeps the original baseline, starts a new evidence round, and reruns validation. Evidence recovery permits only exact approved Verification commands that were successfully recorded for the active BUILD round; no code-writing subagent exists.
+After approval, the same Main Session becomes Builder. For source plans it first runs the required LSP diagnostics probe, then calls `leanflow_capture_baseline({})`; documentation/resource-only plans skip only the probe. Baseline output lists each immutable approved validation ID. Main implements the plan, calls `leanflow_run_validation({ validationId })` for every required ID, then calls `leanflow_finalize_artifacts({})`. The extension generates and verifies `local://<slug>-build.md`, `local://<slug>-diff.md`, and `local://<slug>-evidence.md`, then atomically persists the finalized Gate manifest; Main cannot write these artifacts or internal records directly. A repair keeps the original baseline but advances `currentBuildRound`, clears prior observations, restores any required LSP probe for a fresh record, reruns validation, and finalizes a new manifest.
 
 ### GATE
 
 One independent Gate reads the canonical plan, final diff, build record, and runtime evidence by reference. Gate has no shell access; all runtime facts come from the extension-generated evidence artifact. Its strict verdict schema is owned by `agents/gate.md`, and callers send one canonical batch item without `outputSchema`.
 - PASS moves to `finalizing`; the compact context remains active through the terminal response, then the run becomes idle.
-- First valid FAIL is repaired by Main with refreshed validation/evidence, then one Gate retry is allowed.
-- A Gate operational error preserves the existing artifacts and returns to BUILD for a bounded retry without counting an implementation repair; after four consecutive operational errors, LeanFlow pauses in `awaiting_human`.
-- `BLOCKED` does not consume a verdict attempt. LeanFlow returns to BUILD to rerun only exact approved Verification commands, record a new successful approved-validation observation, and regenerate evidence without source changes. A second identical `BLOCKED` finding with unchanged plan, repository fingerprint, and approved-validation evidence pauses in `awaiting_human`; unrelated LSP observations are not progress.
+- First valid FAIL is repaired by Main in a new explicit BUILD round with fresh validation observations and a new finalized manifest, then one Gate retry is allowed.
+- A Gate operational or transport error preserves the exact finalized manifest and returns to BUILD for unchanged-manifest redispatch only; source writes, validation reruns, and re-finalization are forbidden. After four consecutive operational errors, LeanFlow pauses in `awaiting_human`.
+- `BLOCKED` carries a structured reason code and affected approved validation IDs without consuming a verdict attempt. LeanFlow returns to BUILD to run only those IDs and re-finalize without source changes. A Gate dispatch attempted without a newly passed affected ID whose normalized output digest or repository fingerprint differs from its BLOCKED boundary pauses in `awaiting_human`; a mechanically identical rerun and arbitrary Bash/LSP observations are not semantic progress.
+
+## Recovery and persisted state
+
+Active runs persist the current `stateVersion` and complete compact operation identity: explicit `currentBuildRound`, Gate/LSP/repair leases, approved validation contract and digest, finalized manifest, operational retry snapshot, and structured BLOCKED recovery state. Restore normalizes every field from `defaultState`, re-parses legacy approved validations, immediately persists repaired state, and never treats legacy artifact marks as Gate authority. Legacy Gate-ready state without a valid manifest returns to evidence recovery; legacy operational state without retry identity pauses for human recovery.
+
+Repair setup is a two-checkpoint transaction. The repair lease is persisted before the BUILD record advances. Restore handles both crash windows—lease written with the old record, or new record written with the lease still pending—then synchronizes `currentBuildRound`, `gateAttempt`, baseline state, and required LSP applicability. A freshly reconstructed record clears mutation state and re-arms a required durable LSP probe before Baseline or source mutation.
+
+Gate settlement and session interruption both verify the durable manifest and every bound input before recovery. An unchanged snapshot enters operational redispatch with the original lease identity. Repository drift returns to normal BUILD, artifact drift returns to evidence-only recovery, plan or validation drift returns to planning/re-approval, and invalid BUILD-record identity pauses in `awaiting_human`.
 
 ## Statistics semantics
 
@@ -89,7 +98,7 @@ commands/flow.md
 agents/scout.md
 agents/gate.md
 skills/leanflow/SKILL.md
-extensions/leanflow/          (directory: index.ts, state.ts, guard.ts, handoff.ts, validation.ts, context.ts)
+extensions/leanflow/          (directory: index.ts, state.ts, machine.ts, provenance.ts, validation.ts, evidence.ts, guard.ts, handoff.ts, context.ts, stats.ts)
 ```
 
 Use `python3 scripts/install_leanflow.py --scope user --apply` to install them under the user OMP agent directory. The default is symlink mode on POSIX and copy mode on Windows.

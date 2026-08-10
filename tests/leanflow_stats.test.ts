@@ -3,7 +3,7 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { filterForBuilder } from "../extensions/leanflow/context";
 import { checkAgentBudget, checkTaskGuard, extractAgentRoles } from "../extensions/leanflow/guard";
 
-import { CUSTOM_TYPE, defaultState, restoreState } from "../extensions/leanflow/state";
+import { CUSTOM_TYPE, STATE_VERSION, defaultState, restoreState } from "../extensions/leanflow/state";
 import {
 	addUsage,
 	formatStats,
@@ -123,15 +123,16 @@ test("restore normalizes an older persisted state without new metric fields", ()
 	expect(restored.stats?.gateBlocked).toBe(0);
 });
 
-test("restore re-parses persisted approved validations instead of trusting derived fields", () => {
+test("restore re-parses legacy approved validations into a canonical contract", () => {
+	const planDigest = "a".repeat(64);
 	const restored = restoreState([
 		{
 			type: "custom",
 			customType: CUSTOM_TYPE,
 			data: {
 				phase: "building",
+				planDigest,
 				approvedValidations: [
-					{ displayCommand: "make test", executable: "rm", argv: ["-rf", "/"], digest: "forged", kind: "build" },
 					{ displayCommand: "make test", executable: "rm", argv: ["-rf", "/"], digest: "forged", kind: "build" },
 					{ displayCommand: "make test", executable: "make", argv: ["test"], digest: "duplicate", kind: "test" },
 					{ displayCommand: "rm -rf /", executable: "make", argv: ["test"], digest: "forged", kind: "test" },
@@ -140,40 +141,43 @@ test("restore re-parses persisted approved validations instead of trusting deriv
 		},
 	]);
 
-	expect(restored.approvedValidations).toEqual([
+	expect(restored.approvedValidationContract?.validations).toEqual([
 		expect.objectContaining({ displayCommand: "make test", executable: "make", argv: ["test"], kind: "test" }),
 	]);
+	expect(restored.approvedValidationDigest).toBe(restored.approvedValidationContract?.digest);
 });
 
 
-test("restore drops incomplete BLOCKED recovery identities and preserves valid v4 gating state", () => {
+test("restore drops malformed BLOCKED recovery and degrades legacy gating safely", () => {
 	const invalid = restoreState([
 		{
 			type: "custom",
 			customType: CUSTOM_TYPE,
 			data: {
 				phase: "building",
-				stateVersion: 5,
-				consecutiveSameSnapshotBlocked: 2,
-				lastBlockedSnapshotDigest: "not-a-digest",
-				lastBlockedObservationBoundary: -1,
-				lastBlockedFindingDigest: "forged",
+				stateVersion: STATE_VERSION,
+				blockedRecovery: {
+					reasonCode: "missing_validation",
+					evidenceIds: [],
+					validationStates: [],
+					semanticEvidenceDigest: "not-a-digest",
+					consecutiveEquivalentBlocked: 2,
+				},
 			},
 		},
 	]);
-	expect(invalid).toMatchObject({ stateVersion: 5, consecutiveSameSnapshotBlocked: 0 });
-	expect(invalid.lastBlockedSnapshotDigest).toBeUndefined();
-	expect(invalid.lastBlockedObservationBoundary).toBeUndefined();
-	expect(invalid.lastBlockedFindingDigest).toBeUndefined();
+	expect(invalid.stateVersion).toBe(STATE_VERSION);
+	expect(invalid.blockedRecovery).toBeUndefined();
 
 	const sha = "a".repeat(64);
-	const valid = restoreState([
+	const legacy = restoreState([
 		{
 			type: "custom",
 			customType: CUSTOM_TYPE,
 			data: {
 				phase: "gating",
 				stateVersion: 4,
+				gateAttempt: 1,
 				gateLease: {
 					toolCallId: "gate",
 					kind: "gate",
@@ -193,14 +197,18 @@ test("restore drops incomplete BLOCKED recovery identities and preserves valid v
 			},
 		},
 	]);
-	expect(valid.phase).toBe("gating");
-	expect(valid.gateLease?.repositoryFingerprint?.combinedDigest).toBe(sha);
-	expect(valid.stateVersion).toBe(5);
+	expect(legacy).toMatchObject({
+		phase: "building",
+		stateVersion: STATE_VERSION,
+		gateRetryMode: "evidence",
+		gateLease: undefined,
+		currentBuildRound: 1,
+	});
 });
 
 test("restore rejects a non-object persisted state without throwing", () => {
 	const restored = restoreState([{ type: "custom", customType: CUSTOM_TYPE, data: "corrupt" }]);
-	expect(restored).toMatchObject({ phase: "idle", stateVersion: 5, gateCalls: 0 });
+	expect(restored).toMatchObject({ phase: "idle", stateVersion: STATE_VERSION, gateCalls: 0 });
 });
 test("restore accepts paused state and preserves only valid compact operation metadata", () => {
 	const validRunId = "11111111-1111-4111-8111-111111111111";
@@ -254,16 +262,7 @@ test("restore accepts paused state and preserves only valid compact operation me
 		gateDispatches: 3,
 		humanRepairCycles: 1,
 		handoffBlockers: ["TARGET_MISSING", "VERIFICATION_MISSING"],
-		gateLease: {
-			toolCallId: "gate-call",
-			kind: "gate",
-			runId: validRunId,
-			cycle: 2,
-			startedAt: 1,
-			snapshotDigest: sha,
-			planDigest: sha,
-			buildRecordRound: 2,
-		},
+		gateLease: undefined,
 	});
 	expect(restored.lspLease).toBeUndefined();
 	expect(restored.lastGateFindings).toHaveLength(4_000);
@@ -352,6 +351,11 @@ test("filtering survives an unavailable byte observation and preserves builder e
 	expect(filtered?.[0]).toBe(firstUser);
 	expect(filtered?.[1]).toMatchObject({ customType: "leanflow-builder-context" });
 	expect(filtered?.[2]).toBe(postApproval);
+	const preamble = JSON.stringify(filtered?.[1]);
+	expect(preamble).toContain("leanflow_run_validation");
+	expect(preamble).toContain("leanflow_finalize_artifacts({})");
+	expect(preamble).not.toContain("validationCommands");
+	expect(preamble).not.toContain("synchronously with bash");
 	expect(() => recordContextFilter(state, [{ content: BigInt(1) }], filtered ?? [])).not.toThrow();
 	expect(state.stats?.beforeBytes).toBeUndefined();
 	expect(formatStats(state)).toContain("Byte-count reduction: unavailable");

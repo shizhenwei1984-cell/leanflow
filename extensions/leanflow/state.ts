@@ -1,4 +1,16 @@
-import { parseApprovedValidation, type ApprovedValidation } from "./validation";
+import {
+	createApprovedValidationContract,
+	parseApprovedValidation,
+	type ApprovedValidation,
+	type ApprovedValidationContract,
+	type ValidationSemanticState,
+} from "./validation";
+import {
+	parseFinalizedGateSnapshot,
+	parseOperationalRetrySnapshot,
+	type FinalizedGateSnapshot,
+	type OperationalRetrySnapshot,
+} from "./provenance";
 /**
  * LeanFlow state machine types and persistence.
  *
@@ -116,6 +128,24 @@ export interface RepairLease {
 	reason: "gate_fail" | "repair_setup_failed" | "human_continue";
 	startedAt: number;
 }
+export type BlockedReasonCode =
+	| "missing_validation"
+	| "failed_validation"
+	| "stale_validation"
+	| "run_mismatch"
+	| "artifact_unreadable"
+	| "artifact_inconsistent"
+	| "build_record_invalid"
+	| "other_validation_failure";
+
+export interface BlockedRecoveryState {
+	reasonCode: BlockedReasonCode;
+	evidenceIds: string[];
+	validationStates: ValidationSemanticState[];
+	semanticEvidenceDigest: string;
+	consecutiveEquivalentBlocked: number;
+}
+
 
 export interface LeanFlowState {
 	phase: LeanFlowPhase;
@@ -144,8 +174,12 @@ export interface LeanFlowState {
 	/** Structured handoff blocker codes, without human-readable details. */
 	handoffBlockers?: string[];
 	/** Branch index immediately after the exact proposal request was dispatched. */
-	/** Exact Verification commands approved with the canonical plan. */
-	approvedValidations?: ApprovedValidation[];
+	/** Canonical required Validation contract derived from the approved plan. */
+	approvedValidationContract?: ApprovedValidationContract;
+	/** Convenience copy of approvedValidationContract.digest for record/manifest identity checks. */
+	approvedValidationDigest?: string;
+	/** Durable BUILD record round used by every BUILD, finalization, and Gate path. */
+	currentBuildRound?: number;
 	proposalBoundary?: number;
 	/** Canonical artifact named by the successful xd://propose request. */
 	proposedPlanArtifact?: string;
@@ -189,17 +223,16 @@ export interface LeanFlowState {
 	baselineCaptured?: boolean;
 	/** Whether any repository mutation was conservatively allowed after baseline capture. */
 	buildMutationObserved?: boolean;
-	/** Build evidence artifacts written this round: build / diff / evidence. */
+	/** Advisory UI marks only; never authoritative for Gate readiness. */
 	writtenArtifacts?: string[];
-	/** Per-cycle consecutive operational Gate errors used for the 4-error pause cap; reset on PASS/FAIL/BLOCKED and /flowcontinue. */
+	/** Atomic durable provenance manifest written after all Gate artifacts verify. */
+	finalizedGateSnapshot?: FinalizedGateSnapshot;
+	/** Identity retained only while retrying an operationally interrupted Gate. */
+	operationalRetrySnapshot?: OperationalRetrySnapshot;
+	/** Semantic BLOCKED identity and validation-state boundary. */
+	blockedRecovery?: BlockedRecoveryState;
+	/** Per-cycle consecutive operational Gate errors used for the 4-error pause cap. */
 	consecutiveGateErrors?: number;
-	/** Bounded evidence-recovery loop detector for repeated BLOCKED Gate outcomes. */
-	/** Digest of plan + repository fingerprint + successful approved validation evidence; excludes unrelated LSP observations. */
-	lastBlockedSnapshotDigest?: string;
-	/** Number of successful approved validation observations at the BLOCKED boundary. */
-	lastBlockedObservationBoundary?: number;
-	lastBlockedFindingDigest?: string;
-	consecutiveSameSnapshotBlocked?: number;
 	/** Persisted repair transaction lease for crash recovery. */
 	repairLease?: RepairLease;
 	/** Persisted workflow schema version; absence implies v1 (pre-7614368). */
@@ -239,7 +272,7 @@ export function defaultState(): LeanFlowState {
 		gateDispatches: 0,
 		gateAttempt: 0,
 		humanRepairCycles: 0,
-		consecutiveSameSnapshotBlocked: 0,
+		blockedRecovery: undefined,
 		consecutiveGateErrors: 0,
 		stateVersion: STATE_VERSION,
 		lspProbeStatus: "pending",
@@ -272,7 +305,7 @@ export function restoreState(branch: Iterable<BranchEntry>): LeanFlowState {
 	return normalizeState(latest);
 }
 
-export const STATE_VERSION = 5;
+export const STATE_VERSION = 6;
 
 function migrateLegacyGateState(
 	state: LeanFlowState,
@@ -318,8 +351,8 @@ function normalizeRepairLease(value: unknown): RepairLease | undefined {
 	return { fromRound, toRound, reason: lease.reason, startedAt };
 }
 
-function normalizeApprovedValidations(value: unknown): ApprovedValidation[] | undefined {
-	if (!Array.isArray(value)) return undefined;
+function normalizeApprovedValidations(value: unknown): ApprovedValidation[] {
+	if (!Array.isArray(value)) return [];
 	const seen = new Set<string>();
 	return value.flatMap((candidate) => {
 		if (
@@ -337,57 +370,213 @@ function normalizeApprovedValidations(value: unknown): ApprovedValidation[] | un
 	});
 }
 
-function normalizeBlockedEvidenceRecovery(
-	state: LeanFlowState,
-): Pick<
-	LeanFlowState,
-	"lastBlockedSnapshotDigest" | "lastBlockedObservationBoundary" | "lastBlockedFindingDigest" | "consecutiveSameSnapshotBlocked"
-> {
-	const snapshot = state.lastBlockedSnapshotDigest;
-	const boundary = state.lastBlockedObservationBoundary;
-	const finding = state.lastBlockedFindingDigest;
-	const count = state.consecutiveSameSnapshotBlocked;
+function normalizeApprovedValidationContract(
+	value: unknown,
+	planDigest: string | undefined,
+	legacyValidations: unknown,
+): ApprovedValidationContract | undefined {
+	if (!planDigest || !SHA256_PATTERN.test(planDigest)) return undefined;
+	const candidate =
+		typeof value === "object" && value !== null && !Array.isArray(value)
+			? (value as Partial<ApprovedValidationContract>)
+			: undefined;
+	const validations = normalizeApprovedValidations(candidate?.validations ?? legacyValidations);
+	if (validations.length === 0) return undefined;
+	try {
+		const canonical = createApprovedValidationContract(planDigest, validations);
+		if (candidate && candidate.digest !== canonical.digest) return undefined;
+		return canonical;
+	} catch {
+		return undefined;
+	}
+}
+
+const BLOCKED_REASON_CODES = new Set<BlockedReasonCode>([
+	"missing_validation",
+	"failed_validation",
+	"stale_validation",
+	"run_mismatch",
+	"artifact_unreadable",
+	"artifact_inconsistent",
+	"build_record_invalid",
+	"other_validation_failure",
+]);
+const VALIDATION_SEMANTIC_STATUSES = new Set(["missing", "failed", "stale", "passed"]);
+
+function normalizeBlockedRecovery(value: unknown): BlockedRecoveryState | undefined {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+	const candidate = value as Partial<BlockedRecoveryState>;
 	if (
-		typeof snapshot !== "string" ||
-		!/^[a-f0-9]{64}$/.test(snapshot) ||
-		typeof boundary !== "number" ||
-		!Number.isInteger(boundary) ||
-		boundary < 0 ||
-		typeof finding !== "string" ||
-		!/^finding-[a-f0-9]{64}$/.test(finding) ||
-		typeof count !== "number" ||
-		!Number.isInteger(count) ||
-		count < 1
+		typeof candidate.reasonCode !== "string" ||
+		!BLOCKED_REASON_CODES.has(candidate.reasonCode as BlockedReasonCode) ||
+		!Array.isArray(candidate.evidenceIds) ||
+		candidate.evidenceIds.length === 0 ||
+		candidate.evidenceIds.some((id) => typeof id !== "string" || id.trim().length === 0) ||
+		new Set(candidate.evidenceIds).size !== candidate.evidenceIds.length ||
+		!Array.isArray(candidate.validationStates) ||
+		typeof candidate.semanticEvidenceDigest !== "string" ||
+		!SHA256_PATTERN.test(candidate.semanticEvidenceDigest) ||
+		typeof candidate.consecutiveEquivalentBlocked !== "number" ||
+		!Number.isInteger(candidate.consecutiveEquivalentBlocked) ||
+		candidate.consecutiveEquivalentBlocked < 1
 	) {
-		return { consecutiveSameSnapshotBlocked: 0 };
+		return undefined;
+	}
+	const states: ValidationSemanticState[] = [];
+	const seen = new Set<string>();
+	for (const state of candidate.validationStates) {
+		if (
+			typeof state !== "object" ||
+			state === null ||
+			Array.isArray(state) ||
+			!("id" in state) ||
+			typeof state.id !== "string" ||
+			!("status" in state) ||
+			typeof state.status !== "string" ||
+			!VALIDATION_SEMANTIC_STATUSES.has(state.status) ||
+			seen.has(state.id)
+		) {
+			return undefined;
+		}
+		const observationId =
+			"observationId" in state && typeof state.observationId === "string"
+				? state.observationId
+				: undefined;
+		const normalizedOutputDigest =
+			"normalizedOutputDigest" in state && typeof state.normalizedOutputDigest === "string"
+				? state.normalizedOutputDigest
+				: undefined;
+		const repositoryFingerprintAfter =
+			"repositoryFingerprintAfter" in state && typeof state.repositoryFingerprintAfter === "string"
+				? state.repositoryFingerprintAfter
+				: undefined;
+		if (
+			(state.status !== "missing" && (!observationId || observationId.trim().length === 0)) ||
+			(normalizedOutputDigest !== undefined && !SHA256_PATTERN.test(normalizedOutputDigest)) ||
+			(repositoryFingerprintAfter !== undefined && !SHA256_PATTERN.test(repositoryFingerprintAfter))
+		) {
+			return undefined;
+		}
+		seen.add(state.id);
+		states.push({
+			id: state.id,
+			status: state.status as ValidationSemanticState["status"],
+			...(observationId ? { observationId } : {}),
+			...(normalizedOutputDigest ? { normalizedOutputDigest } : {}),
+			...(repositoryFingerprintAfter ? { repositoryFingerprintAfter } : {}),
+		});
 	}
 	return {
-		lastBlockedSnapshotDigest: snapshot,
-		lastBlockedObservationBoundary: boundary,
-		lastBlockedFindingDigest: finding,
-		consecutiveSameSnapshotBlocked: Math.min(2, count),
+		reasonCode: candidate.reasonCode as BlockedReasonCode,
+		evidenceIds: [...candidate.evidenceIds].sort(),
+		validationStates: states,
+		semanticEvidenceDigest: candidate.semanticEvidenceDigest,
+		consecutiveEquivalentBlocked: Math.min(2, candidate.consecutiveEquivalentBlocked),
 	};
 }
 function normalizeState(value: unknown): LeanFlowState {
-	const persistedVersion =
-		typeof value === "object" && value !== null && !Array.isArray(value) && "stateVersion" in value
-			? value.stateVersion
-			: undefined;
-	const state =
+	const raw =
 		typeof value === "object" && value !== null && !Array.isArray(value)
-			? { ...defaultState(), ...value }
-			: defaultState();
-	state.stateVersion = typeof persistedVersion === "number" ? persistedVersion : undefined;
+			? (value as Record<string, unknown>)
+			: {};
+	const persistedVersion = typeof raw.stateVersion === "number" ? raw.stateVersion : undefined;
+	const legacySchema = persistedVersion !== STATE_VERSION;
+	const state = { ...defaultState(), ...raw } as LeanFlowState & Record<string, unknown>;
+	state.stateVersion = persistedVersion;
 	const rawPhase = isPhase(state.phase) ? state.phase : "idle";
 	const migrated = migrateLegacyGateState(state, rawPhase);
-	const phase = migrated.phase;
-	const gateCalls = migrated.gateCalls;
+	let phase = migrated.phase;
+	let gateRetryMode =
+		state.gateRetryMode === "repair" || state.gateRetryMode === "evidence" || state.gateRetryMode === "operational"
+			? state.gateRetryMode
+			: undefined;
+	const planDigestValue = typeof state.planDigest === "string" ? state.planDigest : undefined;
+	const approvedValidationContract = normalizeApprovedValidationContract(
+		state.approvedValidationContract,
+		planDigestValue,
+		raw.approvedValidations,
+	);
+	const approvedValidationDigest = approvedValidationContract?.digest;
+	const repairLease = normalizeRepairLease(state.repairLease);
+	let gateLease = normalizeOperationLease(state.gateLease);
+	let finalizedGateSnapshot = parseFinalizedGateSnapshot(state.finalizedGateSnapshot);
+	let operationalRetrySnapshot = parseOperationalRetrySnapshot(state.operationalRetrySnapshot);
+	let blockedRecovery = normalizeBlockedRecovery(state.blockedRecovery);
+	let baselineCaptured = state.baselineCaptured === true;
+	let writtenArtifacts = Array.isArray(state.writtenArtifacts)
+		? state.writtenArtifacts.filter((item): item is string => typeof item === "string")
+		: undefined;
+
+	if (
+		finalizedGateSnapshot &&
+		(finalizedGateSnapshot.runId !== state.runId ||
+			finalizedGateSnapshot.planSlug !== state.planSlug ||
+			finalizedGateSnapshot.planDigest !== planDigestValue ||
+			finalizedGateSnapshot.approvedValidationDigest !== approvedValidationDigest)
+	) {
+		finalizedGateSnapshot = undefined;
+	}
+	if (
+		operationalRetrySnapshot &&
+		(!finalizedGateSnapshot ||
+			operationalRetrySnapshot.originalGateLease.runId !== state.runId ||
+			operationalRetrySnapshot.originalGateLease.planDigest !== planDigestValue)
+	) {
+		operationalRetrySnapshot = undefined;
+	}
+
+	if (legacySchema) {
+		finalizedGateSnapshot = undefined;
+		operationalRetrySnapshot = undefined;
+		blockedRecovery = undefined;
+		writtenArtifacts = [];
+		gateLease = undefined;
+		if (gateRetryMode === "operational") {
+			phase = "awaiting_human";
+			gateRetryMode = undefined;
+			baselineCaptured = false;
+		} else if (rawPhase === "gating") {
+			phase = "building";
+			gateRetryMode = "evidence";
+		}
+	}
+	if (phase === "gating" && (!gateLease || !finalizedGateSnapshot)) {
+		phase = "building";
+		gateRetryMode = "evidence";
+		gateLease = undefined;
+		writtenArtifacts = [];
+	}
+	if (gateRetryMode === "operational" && !operationalRetrySnapshot) {
+		phase = "awaiting_human";
+		gateRetryMode = undefined;
+		baselineCaptured = false;
+	}
+
+	const inferredBuildRound =
+		finalizedGateSnapshot?.buildRecordRound ??
+		operationalRetrySnapshot?.originalGateLease.buildRecordRound ??
+		repairLease?.toRound ??
+		gateLease?.buildRecordRound ??
+		(gateRetryMode === "evidence" || gateRetryMode === "operational"
+			? numberOr(state.gateAttempt, 0)
+			: numberOr(state.gateAttempt, 0) + 1);
+	const currentBuildRound =
+		phase === "planning" || phase === "awaiting_approval" || phase === "idle"
+			? undefined
+			: typeof state.currentBuildRound === "number" &&
+					Number.isInteger(state.currentBuildRound) &&
+					state.currentBuildRound >= 1
+				? state.currentBuildRound
+				: inferredBuildRound >= 1
+					? inferredBuildRound
+					: undefined;
+
 	return {
 		phase,
 		stateVersion: STATE_VERSION,
 		phaseStartedAt: optionalNumber(state.phaseStartedAt),
 		scoutCalls: numberOr(state.scoutCalls, 0),
-		gateCalls,
+		gateCalls: migrated.gateCalls,
 		gateDispatches:
 			typeof state.gateDispatches === "number" && Number.isFinite(state.gateDispatches) && state.gateDispatches >= 0
 				? state.gateDispatches
@@ -396,11 +585,9 @@ function normalizeState(value: unknown): LeanFlowState {
 		runId: typeof state.runId === "string" ? state.runId : undefined,
 		planSlug: typeof state.planSlug === "string" ? state.planSlug : undefined,
 		planArtifact: typeof state.planArtifact === "string" ? state.planArtifact : undefined,
+		planDigest: planDigestValue,
 		startedAt: optionalNumber(state.startedAt),
-		gateRetryMode:
-			state.gateRetryMode === "repair" || state.gateRetryMode === "evidence" || state.gateRetryMode === "operational"
-				? state.gateRetryMode
-				: undefined,
+		gateRetryMode,
 		handoffStatus: isHandoffStatus(state.handoffStatus) ? state.handoffStatus : undefined,
 		handoffWarnings: Array.isArray(state.handoffWarnings) ? state.handoffWarnings.filter((v) => typeof v === "string") : undefined,
 		handoffBlockers: Array.isArray(state.handoffBlockers)
@@ -408,12 +595,23 @@ function normalizeState(value: unknown): LeanFlowState {
 					(blocker): blocker is string => typeof blocker === "string" && HANDOFF_BLOCKER_CODES[blocker] === true,
 				)
 			: undefined,
+		approvedValidationContract,
+		approvedValidationDigest,
+		currentBuildRound,
 		proposalBoundary: optionalNumber(state.proposalBoundary),
-		planDigest: typeof state.planDigest === "string" ? state.planDigest : undefined,
 		proposedPlanArtifact: typeof state.proposedPlanArtifact === "string" ? state.proposedPlanArtifact : undefined,
 		approvedPlanArtifact: typeof state.approvedPlanArtifact === "string" ? state.approvedPlanArtifact : undefined,
+		proposedPlanDigest: typeof state.proposedPlanDigest === "string" ? state.proposedPlanDigest : undefined,
+		approvalInvalidated: state.approvalInvalidated === true,
+		approvalRepairBoundary: optionalNumber(state.approvalRepairBoundary),
 		runMarkerArtifact: typeof state.runMarkerArtifact === "string" ? state.runMarkerArtifact : undefined,
 		runMarkerStatus: isRunMarkerStatus(state.runMarkerStatus) ? state.runMarkerStatus : undefined,
+		terminalOutcome:
+			state.terminalOutcome === "pass" ||
+			state.terminalOutcome === "fail_after_retry" ||
+			state.terminalOutcome === "gate_operational_failure"
+				? state.terminalOutcome
+				: undefined,
 		persistenceDegraded: state.persistenceDegraded === true,
 		persistenceFailureStage:
 			state.persistenceFailureStage === "precondition" ||
@@ -421,7 +619,6 @@ function normalizeState(value: unknown): LeanFlowState {
 			state.persistenceFailureStage === "pointer"
 				? state.persistenceFailureStage
 				: undefined,
-		approvedValidations: normalizeApprovedValidations(state.approvedValidations),
 		persistenceFailurePath:
 			typeof state.persistenceFailurePath === "string" ? state.persistenceFailurePath : undefined,
 		persistenceFailureCode:
@@ -429,11 +626,8 @@ function normalizeState(value: unknown): LeanFlowState {
 		persistenceFailureMessage:
 			typeof state.persistenceFailureMessage === "string" ? state.persistenceFailureMessage : undefined,
 		lspProbeStatus: normalizeLspProbeStatus(state),
-		proposedPlanDigest: typeof state.proposedPlanDigest === "string" ? state.proposedPlanDigest : undefined,
-		approvalInvalidated: state.approvalInvalidated === true,
-		approvalRepairBoundary: optionalNumber(state.approvalRepairBoundary),
 		lspProbeTarget: typeof state.lspProbeTarget === "string" ? state.lspProbeTarget : undefined,
-		gateLease: normalizeOperationLease(state.gateLease),
+		gateLease,
 		lspLease: normalizeOperationLease(state.lspLease),
 		humanRepairCycles:
 			typeof state.humanRepairCycles === "number" &&
@@ -447,21 +641,19 @@ function normalizeState(value: unknown): LeanFlowState {
 					? state.lastGateFindings
 					: `${state.lastGateFindings.slice(0, 3_999)}…`
 				: undefined,
-		baselineCaptured: state.baselineCaptured === true,
+		baselineCaptured,
 		buildMutationObserved: state.buildMutationObserved === true,
-		writtenArtifacts: Array.isArray(state.writtenArtifacts) ? state.writtenArtifacts.filter((v) => typeof v === "string") : undefined,
+		writtenArtifacts,
+		finalizedGateSnapshot,
+		operationalRetrySnapshot,
+		blockedRecovery,
 		consecutiveGateErrors:
-			typeof state.consecutiveGateErrors === "number" && Number.isFinite(state.consecutiveGateErrors) && state.consecutiveGateErrors >= 0
+			typeof state.consecutiveGateErrors === "number" &&
+			Number.isFinite(state.consecutiveGateErrors) &&
+			state.consecutiveGateErrors >= 0
 				? Math.floor(state.consecutiveGateErrors)
 				: 0,
-		...normalizeBlockedEvidenceRecovery(state),
-		repairLease: normalizeRepairLease(state.repairLease),
-		terminalOutcome:
-			state.terminalOutcome === "pass" ||
-			state.terminalOutcome === "fail_after_retry" ||
-			state.terminalOutcome === "gate_operational_failure"
-				? state.terminalOutcome
-				: undefined,
+		repairLease,
 		stats: normalizeStats(state.stats),
 	};
 }
@@ -538,6 +730,7 @@ const HANDOFF_BLOCKER_CODES: Record<string, true> = {
 	BEHAVIOR_MISSING: true,
 	ACCEPTANCE_MISSING: true,
 	VERIFICATION_MISSING: true,
+	VERIFICATION_INVALID: true,
 };
 
 function normalizeOperationLease(value: unknown): OperationLease | undefined {

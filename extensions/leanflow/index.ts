@@ -34,30 +34,38 @@ import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolCallEvent } from "@oh-my-pi/pi-coding-agent";
 import { approvedPlanArtifact, filterForBuilder } from "./context";
 import {
-	buildGateSnapshotDigest,
 	composeCompleteDiff,
 	createBuildEvidenceRecord,
+	migrateLegacyBuildEvidenceRecord,
 	parseBuildEvidenceRecord,
 	parseBuildEvidenceRecordWithoutRound,
 	renderBuildArtifacts,
 	selectValidationObservations,
+	validationSemanticStates,
 } from "./evidence";
 import type {
-	BuildEvidenceObservationV1,
-	BuildEvidenceRecordV1,
+	BuildEvidenceObservationV2,
+	BuildEvidenceRecordV2,
 	BuildRecordIdentity,
 	GitCommandEvidence,
 	ParsedLspRequest,
 	UntrackedPatch,
 } from "./evidence";
-import { CUSTOM_TYPE, defaultState, defaultStats, hasPersistedState, restoreState } from "./state";
-import type { GateOutcome, LeanFlowState, RepositoryFingerprint } from "./state";
-import { checkInvariants, reduceGate, resetBlockedEvidenceRecovery } from "./machine";
+import {
+	createFinalizedGateSnapshot,
+	createOperationalRetrySnapshot,
+	finalizedGateSnapshotDigest,
+	parseFinalizedGateSnapshot,
+} from "./provenance";
+import type { FinalizedGateSnapshot, OperationalInterruption } from "./provenance";
+import { CUSTOM_TYPE, STATE_VERSION, defaultState, defaultStats, hasPersistedState, restoreState } from "./state";
+import type { BlockedReasonCode, GateOutcome, LeanFlowState, RepositoryFingerprint } from "./state";
+import { checkInvariants, reduceGate, resetBlockedRecovery } from "./machine";
 import type { Effect, SnapshotFailureKind } from "./machine";
 import { checkAgentBudget, checkTaskGuard, extractAgentRoles, validateGateTaskCall } from "./guard";
 import type { GateArtifacts, LeanFlowAgentRole } from "./guard";
-import { approvedValidationsFromPlan, assessHandoff, formatHandoffNotification } from "./handoff";
-import { parseApprovedValidation } from "./validation";
+import { assessHandoff, formatHandoffNotification } from "./handoff";
+import { parseValidationContract, validationStatesDigest } from "./validation";
 import {
 	addUsage,
 	formatStats,
@@ -135,6 +143,10 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
 		return false;
 	}
 }
+function isLeanFlowInternalRepositoryPath(relative: string): boolean {
+	return relative === ".leanflow" || relative.startsWith(".leanflow/");
+}
+
 
 function isTaskToolCall(event: ToolCallEvent): event is ToolCallEvent & { input: Record<string, unknown>; toolName: "task" } {
 	return event.toolName === "task" && isPlainRecord(event.input);
@@ -181,13 +193,16 @@ function isWriteToolCall(event: ToolCallEvent): event is ToolCallEvent & { input
 	);
 }
 const CAPTURE_BASELINE_DEVICE_PATH = "xd://leanflow_capture_baseline";
+const RUN_VALIDATION_DEVICE_PATH = "xd://leanflow_run_validation";
 const FINALIZE_ARTIFACTS_DEVICE_PATH = "xd://leanflow_finalize_artifacts";
-type RoutedLeanFlowDeviceCall = "capture_baseline" | "finalize_artifacts" | "invalid";
+type RoutedLeanFlowDeviceCall = "capture_baseline" | "run_validation" | "finalize_artifacts" | "invalid";
 
 function routedLeanFlowDeviceCall(event: ToolCallEvent): RoutedLeanFlowDeviceCall | undefined {
 	if (
 		!isWriteToolCall(event) ||
-		(event.input.path !== CAPTURE_BASELINE_DEVICE_PATH && event.input.path !== FINALIZE_ARTIFACTS_DEVICE_PATH)
+		(event.input.path !== CAPTURE_BASELINE_DEVICE_PATH &&
+			event.input.path !== RUN_VALIDATION_DEVICE_PATH &&
+			event.input.path !== FINALIZE_ARTIFACTS_DEVICE_PATH)
 	) {
 		return undefined;
 	}
@@ -201,12 +216,13 @@ function routedLeanFlowDeviceCall(event: ToolCallEvent): RoutedLeanFlowDeviceCal
 	if (event.input.path === CAPTURE_BASELINE_DEVICE_PATH) {
 		return Object.keys(payload).length === 0 ? "capture_baseline" : "invalid";
 	}
-	if (Object.keys(payload).length !== 1 || !("validationCommands" in payload)) return "invalid";
-	const commands = payload.validationCommands;
-	return Array.isArray(commands) &&
-		commands.length > 0 &&
-		commands.every((command) => typeof command === "string" && command.length > 0)
-		? "finalize_artifacts"
+	if (event.input.path === FINALIZE_ARTIFACTS_DEVICE_PATH) {
+		return Object.keys(payload).length === 0 ? "finalize_artifacts" : "invalid";
+	}
+	return Object.keys(payload).length === 1 &&
+		typeof payload.validationId === "string" &&
+		payload.validationId.trim().length > 0
+		? "run_validation"
 		: "invalid";
 }
 
@@ -430,8 +446,10 @@ function classifyToolEffect(
 	if (issueReport) return "control_plane_mutation";
 	if (
 		event.toolName === "leanflow_capture_baseline" ||
+		event.toolName === "leanflow_run_validation" ||
 		event.toolName === "leanflow_finalize_artifacts" ||
 		routedDeviceCall === "capture_baseline" ||
+		routedDeviceCall === "run_validation" ||
 		routedDeviceCall === "finalize_artifacts"
 	) {
 		return "control_plane_mutation";
@@ -520,6 +538,10 @@ function runMarkerArtifact(_planSlug: string, runId: string): string {
 function buildRecordArtifact(runId: string): string {
 	return `local://.leanflow/runs/${runId}-build-record.json`;
 }
+function finalizedSnapshotArtifact(runId: string): string {
+	return `local://.leanflow/runs/${runId}-finalized-gate.json`;
+}
+
 
 function sha256Hex(value: string): string {
 	return createHash("sha256").update(value, "utf8").digest("hex");
@@ -684,6 +706,17 @@ export default function leanflow(pi: ExtensionAPI): void {
 		| { toolName: "bash"; command: string }
 		| { toolName: "lsp"; lspRequest: ParsedLspRequest };
 	const pendingEvidenceObservations = new Map<string, PendingEvidenceObservation>();
+	let buildRecordLockTail = Promise.resolve();
+
+	async function acquireBuildRecordLock(): Promise<() => void> {
+		const previous = buildRecordLockTail;
+		let release!: () => void;
+		buildRecordLockTail = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		await previous;
+		return release;
+	}
 
 	function persist(): void {
 		pi.appendEntry(CUSTOM_TYPE, state);
@@ -740,20 +773,29 @@ export default function leanflow(pi: ExtensionAPI): void {
 		delete state.persistenceFailureMessage;
 	}
 
-	type BuildRecordSetupResult = { ok: true; round: number; baselinePresent: boolean } | { ok: false; reason: string };
+	type BuildRecordSetupResult =
+		| {
+				ok: true;
+				round: number;
+				baselinePresent: boolean;
+				freshRecord: boolean;
+				lspEvidencePresent: boolean;
+		  }
+		| { ok: false; reason: string };
 
 	function evidenceFailureMessage(error: unknown): string {
 		return error instanceof Error ? error.message : String(error);
 	}
 
 	function activeBuildIdentity(round: number): BuildRecordIdentity {
-		if (!state.runId || !state.planSlug || !state.planDigest) {
-			throw new Error("active LeanFlow run identity is incomplete");
+		if (!state.runId || !state.planSlug || !state.planDigest || !state.approvedValidationDigest) {
+			throw new Error("active LeanFlow run identity or approved validation contract is incomplete");
 		}
 		return {
 			runId: state.runId,
 			planSlug: state.planSlug,
 			planDigest: state.planDigest,
+			approvedValidationDigest: state.approvedValidationDigest,
 			round,
 		};
 	}
@@ -768,169 +810,281 @@ export default function leanflow(pi: ExtensionAPI): void {
 		return recordPath;
 	}
 
-	async function loadBuildRecord(ctx: ExtensionContext, round: number): Promise<BuildEvidenceRecordV1> {
-		const recordPath = activeBuildRecordPath(ctx);
-		let value: unknown;
+	function activeFinalizedSnapshotPath(ctx: ExtensionContext): string {
+		if (!ctx.localProtocolOptions || !state.runId) {
+			throw new Error("local protocol options or run ID are unavailable");
+		}
+		const artifact = finalizedSnapshotArtifact(state.runId);
+		const snapshotPath = resolveRunMarkerPath(ctx.localProtocolOptions, artifact);
+		if (!snapshotPath) throw new Error(`finalized Gate snapshot path cannot be resolved: ${artifact}`);
+		return snapshotPath;
+	}
+
+	async function readBuildRecordValue(ctx: ExtensionContext): Promise<unknown> {
 		try {
-			value = JSON.parse(await fs.readFile(recordPath, "utf8"));
+			return JSON.parse(await fs.readFile(activeBuildRecordPath(ctx), "utf8"));
 		} catch (error) {
 			throw new Error(`internal build record is missing or unreadable: ${evidenceFailureMessage(error)}`);
 		}
-		return parseBuildEvidenceRecord(value, activeBuildIdentity(round));
 	}
 
-	function isApprovedValidation(command: string): boolean {
-		const parsed = parseApprovedValidation(command);
-		return (
-			parsed !== undefined &&
-			state.approvedValidations?.some(
-				(approved) => approved.digest === parsed.digest && approved.displayCommand === parsed.displayCommand,
-			) === true
-		);
+	async function loadBuildRecord(ctx: ExtensionContext, round: number): Promise<BuildEvidenceRecordV2> {
+		return parseBuildEvidenceRecord(await readBuildRecordValue(ctx), activeBuildIdentity(round));
 	}
 
-	function isApprovedValidationCommand(event: ToolCallEvent): boolean {
-		if (event.toolName !== "bash" || !isPlainRecord(event.input)) return false;
-		const keys = Reflect.ownKeys(event.input);
-		return keys.length === 1 && keys[0] === "command" && typeof event.input.command === "string" && isApprovedValidation(event.input.command);
-	}
-
-	function isSuccessfulApprovedObservation(observation: BuildEvidenceObservationV1): boolean {
-		return (
-			observation.toolName === "bash" &&
-			typeof observation.command === "string" &&
-			isApprovedValidation(observation.command) &&
-			!observation.isError &&
-			observation.exitCode === 0 &&
-			observation.timedOut !== true
-		);
-	}
-
-	function blockedSemanticEvidenceDigest(
-		lease: NonNullable<LeanFlowState["gateLease"]>,
-		record: BuildEvidenceRecordV1,
-	): string | undefined {
-		if (!lease.planDigest || !lease.repositoryFingerprint) return undefined;
-		const validations = record.observations.filter(isSuccessfulApprovedObservation).map((observation) => ({
-			command: observation.command,
-			exitCode: observation.exitCode,
-			timedOut: observation.timedOut === true,
-			text: observation.text,
-		}));
-		return createHash("sha256")
-			.update(
-				JSON.stringify({
-					planDigest: lease.planDigest,
-					repositoryFingerprint: lease.repositoryFingerprint.combinedDigest,
-					validations,
-				}),
-				"utf8",
-			)
-			.digest("hex");
-	}
-
-	async function readBuildRecordForReconciliation(ctx: ExtensionContext): Promise<BuildEvidenceRecordV1> {
-		const recordPath = activeBuildRecordPath(ctx);
-		let value: unknown;
+	async function readBuildRecordForReconciliation(ctx: ExtensionContext): Promise<BuildEvidenceRecordV2> {
+		const value = await readBuildRecordValue(ctx);
+		const identity = activeBuildIdentity(state.currentBuildRound ?? Math.max(1, state.gateAttempt));
 		try {
-			value = JSON.parse(await fs.readFile(recordPath, "utf8"));
+			return parseBuildEvidenceRecordWithoutRound(value, {
+				runId: identity.runId,
+				planSlug: identity.planSlug,
+				planDigest: identity.planDigest,
+				approvedValidationDigest: identity.approvedValidationDigest,
+			});
 		} catch (error) {
-			throw new Error(`internal build record is missing or unreadable: ${evidenceFailureMessage(error)}`);
+			const legacyRound = isPlainRecord(value) && Number.isInteger(value.round) ? (value.round as number) : undefined;
+			if (value && isPlainRecord(value) && value.version === 1 && legacyRound !== undefined && legacyRound >= 1) {
+				const migrated = migrateLegacyBuildEvidenceRecord(value, activeBuildIdentity(legacyRound));
+				await writeJsonAtomically(activeBuildRecordPath(ctx), migrated);
+				return migrated;
+			}
+			throw error;
 		}
-		if (!state.runId || !state.planSlug || !state.planDigest) {
-			throw new Error("active LeanFlow run identity is incomplete");
-		}
-		return parseBuildEvidenceRecordWithoutRound(value, {
-			runId: state.runId,
-			planSlug: state.planSlug,
-			planDigest: state.planDigest,
-		});
 	}
 
 	function expectedGateRoundForSnapshot(): number {
-		return state.gateRetryMode === "operational" || state.gateRetryMode === "evidence" ? state.gateAttempt : state.gateAttempt + 1;
+		if (!Number.isInteger(state.currentBuildRound) || (state.currentBuildRound ?? 0) < 1) {
+			throw new Error("current BUILD round is unavailable");
+		}
+		return state.currentBuildRound!;
 	}
 
-	/**
-	 * Re-read the immutable Gate inputs immediately before dispatch. State marks
-	 * are merely readiness hints; the files and build record are the authority.
-	 */
-	async function prepareGateSnapshot(
+	type VerifiedGateSnapshot = {
+		manifest: FinalizedGateSnapshot;
+		snapshotDigest: string;
+		build: string;
+		diff: string;
+		evidence: string;
+		record: BuildEvidenceRecordV2;
+	};
+
+	function hasSemanticValidationProgress(
+		before: ReadonlyArray<NonNullable<LeanFlowState["blockedRecovery"]>["validationStates"][number]>,
+		after: ReadonlyArray<FinalizedGateSnapshot["validationStates"][number]>,
+		affectedIds: readonly string[],
+	): boolean {
+		const previous = new Map(before.map((validation) => [validation.id, validation]));
+		const affected = new Set(affectedIds);
+		return after.some((validation) => {
+			const prior = previous.get(validation.id);
+			if (!affected.has(validation.id)) return false;
+			return (
+				validation.status === "passed" &&
+				prior?.status !== "passed" &&
+				validation.observationId !== undefined &&
+				(prior?.normalizedOutputDigest === undefined ||
+					validation.normalizedOutputDigest !== prior.normalizedOutputDigest ||
+					prior.repositoryFingerprintAfter === undefined ||
+					validation.repositoryFingerprintAfter !== prior.repositoryFingerprintAfter)
+			);
+		});
+	}
+
+	async function verifyDurableFinalizedSnapshot(
 		ctx: ExtensionContext,
-	): Promise<{ ok: true; snapshotDigest: string; planDigest: string; buildRecordRound: number; build: string; diff: string; evidence: string } | { ok: false; reason: string }> {
-		if (pendingEvidenceObservations.size > 0) {
-			return {
-				ok: false,
-				reason: `${pendingEvidenceObservations.size} BUILD evidence observation(s) are still pending`,
-			};
-		}
-		if (!ctx.localProtocolOptions) {
-			return { ok: false, reason: "local artifact storage is unavailable" };
-		}
-		if (!state.runId || !state.planDigest) {
-			return { ok: false, reason: "active run identity is incomplete" };
+		lease?: NonNullable<LeanFlowState["gateLease"]>,
+	): Promise<{ ok: true; value: VerifiedGateSnapshot } | { ok: false; kind: SnapshotFailureKind; reason: string }> {
+		if (
+			!ctx.localProtocolOptions ||
+			!state.runId ||
+			!state.planSlug ||
+			!state.planDigest ||
+			!state.approvedValidationContract ||
+			!state.approvedValidationDigest ||
+			!state.currentBuildRound
+		) {
+			return { ok: false, kind: "lease_invalid", reason: "active Gate provenance identity is incomplete" };
 		}
 		const artifacts = expectedGateArtifacts(state);
-		if (!artifacts) return { ok: false, reason: "canonical Gate artifact identity is unavailable" };
+		if (!artifacts) {
+			return { ok: false, kind: "artifact_rebuildable", reason: "canonical Gate artifact identity is unavailable" };
+		}
+
+		let manifest: FinalizedGateSnapshot;
+		let manifestText: string;
+		try {
+			manifestText = await fs.readFile(activeFinalizedSnapshotPath(ctx), "utf8");
+			const parsed = parseFinalizedGateSnapshot(JSON.parse(manifestText));
+			if (!parsed) throw new Error("manifest schema or semantic digest is invalid");
+			manifest = parsed;
+		} catch (error) {
+			return {
+				ok: false,
+				kind: "artifact_rebuildable",
+				reason: `finalized Gate manifest is missing or invalid: ${evidenceFailureMessage(error)}`,
+			};
+		}
+		const snapshotDigest = finalizedGateSnapshotDigest(manifest);
+		if (
+			!state.finalizedGateSnapshot ||
+			finalizedGateSnapshotDigest(state.finalizedGateSnapshot) !== snapshotDigest
+		) {
+			return { ok: false, kind: "artifact_rebuildable", reason: "persisted finalized Gate manifest does not match state" };
+		}
+		if (
+			manifest.runId !== state.runId ||
+			manifest.planSlug !== state.planSlug ||
+			manifest.planDigest !== state.planDigest ||
+			manifest.approvedValidationDigest !== state.approvedValidationDigest
+		) {
+			return { ok: false, kind: "plan_drift", reason: "finalized Gate manifest does not match the approved plan or validation contract" };
+		}
+		if (manifest.buildRecordRound !== state.currentBuildRound) {
+			return { ok: false, kind: "record_invalid", reason: "finalized Gate manifest does not match currentBuildRound" };
+		}
+		if (
+			lease &&
+			(lease.runId !== manifest.runId ||
+				lease.planDigest !== manifest.planDigest ||
+				lease.buildRecordRound !== manifest.buildRecordRound ||
+				lease.snapshotDigest !== snapshotDigest ||
+				lease.repositoryFingerprint?.combinedDigest !== manifest.repositoryFingerprint.combinedDigest)
+		) {
+			return { ok: false, kind: "lease_invalid", reason: "Gate lease does not match the durable finalized snapshot" };
+		}
+
+		const planPath = resolveRunMarkerPath(ctx.localProtocolOptions, artifacts.plan);
+		if (!planPath) return { ok: false, kind: "plan_drift", reason: "canonical plan artifact path cannot be resolved" };
+		try {
+			if (sha256Hex(await fs.readFile(planPath, "utf8")) !== manifest.planDigest) {
+				return { ok: false, kind: "plan_drift", reason: "canonical plan digest changed after finalization" };
+			}
+		} catch {
+			return { ok: false, kind: "plan_drift", reason: "canonical plan artifact is missing or unreadable" };
+		}
 
 		const readArtifact = async (
 			kind: "build" | "diff" | "evidence",
 			artifact: string,
+			expectedDigest: string,
 		): Promise<{ ok: true; content: string } | { ok: false; reason: string }> => {
 			const artifactPath = resolveRunMarkerPath(ctx.localProtocolOptions!, artifact);
 			if (!artifactPath) return { ok: false, reason: `canonical ${kind} artifact path cannot be resolved` };
-			let content: string;
 			try {
-				content = await fs.readFile(artifactPath, "utf8");
+				const content = await fs.readFile(artifactPath, "utf8");
+				if (content.length === 0 || sha256Hex(content) !== expectedDigest) {
+					return { ok: false, reason: `canonical ${kind} artifact digest does not match the finalized manifest` };
+				}
+				return { ok: true, content };
 			} catch {
 				return { ok: false, reason: `canonical ${kind} artifact is missing or unreadable` };
 			}
-			if (content.length === 0) return { ok: false, reason: `canonical ${kind} artifact is empty` };
-			if (!content.includes(state.runId!)) {
-				return { ok: false, reason: `canonical ${kind} artifact does not belong to this run` };
-			}
-			return { ok: true, content };
 		};
-
 		const [build, diff, evidence] = await Promise.all([
-			readArtifact("build", artifacts.build),
-			readArtifact("diff", artifacts.diff),
-			readArtifact("evidence", artifacts.evidence),
+			readArtifact("build", artifacts.build, manifest.buildArtifactDigest),
+			readArtifact("diff", artifacts.diff, manifest.diffArtifactDigest),
+			readArtifact("evidence", artifacts.evidence, manifest.evidenceArtifactDigest),
 		]);
-		if (!build.ok) return build;
-		if (!diff.ok) return diff;
-		if (!evidence.ok) return evidence;
+		if (!build.ok) return { ok: false, kind: "artifact_rebuildable", reason: build.reason };
+		if (!diff.ok) return { ok: false, kind: "artifact_rebuildable", reason: diff.reason };
+		if (!evidence.ok) return { ok: false, kind: "artifact_rebuildable", reason: evidence.reason };
 
-		const planPath = resolveRunMarkerPath(ctx.localProtocolOptions, artifacts.plan);
-		if (!planPath) return { ok: false, reason: "canonical plan artifact path cannot be resolved" };
-		let canonicalPlan: string;
+		let record: BuildEvidenceRecordV2;
 		try {
-			canonicalPlan = await fs.readFile(planPath, "utf8");
-		} catch {
-			return { ok: false, reason: "canonical plan artifact is missing or unreadable" };
-		}
-		if (sha256Hex(canonicalPlan) !== state.planDigest) {
-			return { ok: false, reason: "canonical plan digest does not match the approved plan" };
-		}
-
-		const recordRound = expectedGateRoundForSnapshot();
-		try {
-			const record = await loadBuildRecord(ctx, recordRound);
-			if (record.round !== recordRound) {
-				return { ok: false, reason: "BUILD record round does not match the pending Gate cycle" };
+			const recordText = await fs.readFile(activeBuildRecordPath(ctx), "utf8");
+			if (sha256Hex(recordText) !== manifest.buildRecordDigest) {
+				return { ok: false, kind: "record_invalid", reason: "BUILD record digest does not match the finalized manifest" };
+			}
+			record = parseBuildEvidenceRecord(JSON.parse(recordText), activeBuildIdentity(manifest.buildRecordRound));
+			const semanticStates = validationSemanticStates(
+				record,
+				state.approvedValidationContract,
+				manifest.repositoryFingerprint.combinedDigest,
+			);
+			if (
+				validationStatesDigest(semanticStates) !== validationStatesDigest(manifest.validationStates) ||
+				semanticStates.some((validation) => validation.status !== "passed")
+			) {
+				return { ok: false, kind: "record_invalid", reason: "BUILD record validation states do not match the finalized manifest" };
 			}
 		} catch (error) {
-			return { ok: false, reason: `BUILD record validation failed: ${evidenceFailureMessage(error)}` };
+			return { ok: false, kind: "record_invalid", reason: `BUILD record validation failed: ${evidenceFailureMessage(error)}` };
 		}
 
+		let repositoryFingerprint: RepositoryFingerprint;
+		try {
+			repositoryFingerprint = await captureRepositoryFingerprint(ctx, undefined);
+		} catch (error) {
+			return {
+				ok: false,
+				kind: "transport_error",
+				reason: `repository fingerprint cannot be verified: ${evidenceFailureMessage(error)}`,
+			};
+		}
+		if (repositoryFingerprint.combinedDigest !== manifest.repositoryFingerprint.combinedDigest) {
+			return { ok: false, kind: "repository_changed", reason: "repository state changed after artifact finalization" };
+		}
 		return {
 			ok: true,
-			snapshotDigest: buildGateSnapshotDigest({ planDigest: state.planDigest!, build: build.content, diff: diff.content, evidence: evidence.content }),
-			planDigest: state.planDigest!,
-			buildRecordRound: recordRound,
-			build: build.content,
-			diff: diff.content,
-			evidence: evidence.content,
+			value: {
+				manifest,
+				snapshotDigest,
+				build: build.content,
+				diff: diff.content,
+				evidence: evidence.content,
+				record,
+			},
+		};
+	}
+
+	/**
+	 * Re-read the atomic manifest and every bound input immediately before
+	 * dispatch. writtenArtifacts is advisory UI state and grants no authority.
+	 */
+	async function prepareGateSnapshot(
+		ctx: ExtensionContext,
+	): Promise<
+		| {
+				ok: true;
+				snapshotDigest: string;
+				planDigest: string;
+				buildRecordRound: number;
+				repositoryFingerprint: RepositoryFingerprint;
+				build: string;
+				diff: string;
+				evidence: string;
+		  }
+		| { ok: false; reason: string; noSemanticProgress?: boolean }
+	> {
+		if (pendingEvidenceObservations.size > 0) {
+			return { ok: false, reason: `${pendingEvidenceObservations.size} BUILD evidence observation(s) are still pending` };
+		}
+		const verified = await verifyDurableFinalizedSnapshot(ctx);
+		if (!verified.ok) return { ok: false, reason: verified.reason };
+		if (
+			state.blockedRecovery &&
+			!hasSemanticValidationProgress(
+				state.blockedRecovery.validationStates,
+				verified.value.manifest.validationStates,
+				state.blockedRecovery.evidenceIds,
+			)
+		) {
+			return {
+				ok: false,
+				noSemanticProgress: true,
+				reason: "no affected validation produced a newly passed observation with a changed output digest or repository fingerprint after the prior BLOCKED verdict",
+			};
+		}
+		return {
+			ok: true,
+			snapshotDigest: verified.value.snapshotDigest,
+			planDigest: verified.value.manifest.planDigest,
+			buildRecordRound: verified.value.manifest.buildRecordRound,
+			repositoryFingerprint: verified.value.manifest.repositoryFingerprint,
+			build: verified.value.build,
+			diff: verified.value.diff,
+			evidence: verified.value.evidence,
 		};
 	}
 
@@ -938,78 +1092,8 @@ export default function leanflow(pi: ExtensionAPI): void {
 		ctx: ExtensionContext,
 		lease: NonNullable<LeanFlowState["gateLease"]>,
 	): Promise<{ ok: true } | { ok: false; kind: SnapshotFailureKind; reason: string }> {
-		if (
-			!ctx.localProtocolOptions ||
-			!state.runId ||
-			!state.planDigest ||
-			!lease.planDigest ||
-			!lease.snapshotDigest ||
-			lease.buildRecordRound === undefined ||
-			!lease.repositoryFingerprint
-		) {
-			return { ok: false, kind: "lease_invalid", reason: "Gate lease is missing durable snapshot identity" };
-		}
-		if (state.planDigest !== lease.planDigest) {
-			return { ok: false, kind: "plan_drift", reason: "canonical plan digest changed since Gate dispatch" };
-		}
-		const artifacts = expectedGateArtifacts(state);
-		if (!artifacts) return { ok: false, kind: "artifact_rebuildable", reason: "canonical Gate artifact identity is unavailable" };
-		const readArtifact = async (kind: string, artifact: string): Promise<{ ok: true; content: string } | { ok: false; reason: string }> => {
-			const artifactPath = resolveRunMarkerPath(ctx.localProtocolOptions!, artifact);
-			if (!artifactPath) return { ok: false, reason: `canonical ${kind} artifact path cannot be resolved` };
-			try {
-				const content = await fs.readFile(artifactPath, "utf8");
-				if (content.length === 0) return { ok: false, reason: `canonical ${kind} artifact is empty` };
-				if (!content.includes(state.runId!)) return { ok: false, reason: `canonical ${kind} artifact does not belong to this run` };
-				return { ok: true, content };
-			} catch {
-				return { ok: false, reason: `canonical ${kind} artifact is missing or unreadable` };
-			}
-		};
-		const [build, diff, evidence] = await Promise.all([
-			readArtifact("build", artifacts.build),
-			readArtifact("diff", artifacts.diff),
-			readArtifact("evidence", artifacts.evidence),
-		]);
-		if (!build.ok) return { ok: false, kind: "artifact_rebuildable", reason: build.reason };
-		if (!diff.ok) return { ok: false, kind: "artifact_rebuildable", reason: diff.reason };
-		if (!evidence.ok) return { ok: false, kind: "artifact_rebuildable", reason: evidence.reason };
-		const planPath = resolveRunMarkerPath(ctx.localProtocolOptions, artifacts.plan);
-		if (!planPath) return { ok: false, kind: "plan_drift", reason: "canonical plan artifact path cannot be resolved" };
-		try {
-			const canonicalPlan = await fs.readFile(planPath, "utf8");
-			if (sha256Hex(canonicalPlan) !== lease.planDigest) {
-				return { ok: false, kind: "plan_drift", reason: "canonical plan digest changed since Gate dispatch" };
-			}
-		} catch {
-			return { ok: false, kind: "plan_drift", reason: "canonical plan artifact is missing or unreadable" };
-		}
-		try {
-			const record = await loadBuildRecord(ctx, lease.buildRecordRound);
-			if (record.round !== lease.buildRecordRound) {
-				return { ok: false, kind: "record_invalid", reason: "BUILD record round does not match the dispatched Gate lease" };
-			}
-		} catch (error) {
-			return { ok: false, kind: "record_invalid", reason: `BUILD record validation failed: ${evidenceFailureMessage(error)}` };
-		}
-		const currentDigest = buildGateSnapshotDigest({ planDigest: lease.planDigest, build: build.content, diff: diff.content, evidence: evidence.content });
-		if (currentDigest !== lease.snapshotDigest) {
-			return { ok: false, kind: "snapshot_changed", reason: "Gate snapshot changed since dispatch; retry with unchanged evidence" };
-		}
-		let repositoryFingerprint: RepositoryFingerprint;
-		try {
-			repositoryFingerprint = await captureRepositoryFingerprint(ctx, undefined);
-		} catch (error) {
-			return {
-				ok: false,
-				kind: "repository_changed",
-				reason: `repository fingerprint cannot be verified: ${evidenceFailureMessage(error)}`,
-			};
-		}
-		if (repositoryFingerprint.combinedDigest !== lease.repositoryFingerprint.combinedDigest) {
-			return { ok: false, kind: "repository_changed", reason: "repository state changed since Gate dispatch" };
-		}
-		return { ok: true };
+		const verified = await verifyDurableFinalizedSnapshot(ctx, lease);
+		return verified.ok ? { ok: true } : verified;
 	}
 	async function planDriftedDuringGate(ctx: ExtensionContext, dispatchedPlanDigest: string | undefined): Promise<boolean> {
 		if (!ctx.localProtocolOptions || !dispatchedPlanDigest || state.planDigest !== dispatchedPlanDigest) return true;
@@ -1028,11 +1112,14 @@ export default function leanflow(pi: ExtensionAPI): void {
 		try {
 			const record = createBuildEvidenceRecord(activeBuildIdentity(1));
 			await writeJsonAtomically(activeBuildRecordPath(ctx), record);
+			state.currentBuildRound = 1;
 			state.baselineCaptured = false;
 			state.buildMutationObserved = false;
 			state.writtenArtifacts = [];
-			resetBlockedEvidenceRecovery(state);
-			return { ok: true, round: 1, baselinePresent: false };
+			state.finalizedGateSnapshot = undefined;
+			state.operationalRetrySnapshot = undefined;
+			resetBlockedRecovery(state);
+			return { ok: true, round: 1, baselinePresent: false, freshRecord: true, lspEvidencePresent: false };
 		} catch (error) {
 			const reason = evidenceFailureMessage(error);
 			if (ctx.hasUI) {
@@ -1047,11 +1134,11 @@ export default function leanflow(pi: ExtensionAPI): void {
 
 	async function beginRepairBuildRound(ctx: ExtensionContext): Promise<BuildRecordSetupResult> {
 		const lease = state.repairLease;
-		const fromRound = lease ? lease.fromRound : state.gateAttempt;
-		const toRound = lease ? lease.toRound : state.gateAttempt + 1;
+		const fromRound = lease ? lease.fromRound : (state.currentBuildRound ?? state.gateAttempt);
+		const toRound = lease ? lease.toRound : fromRound + 1;
 		let recoveryEligible = false;
 		try {
-			let actual: BuildEvidenceRecordV1;
+			let actual: BuildEvidenceRecordV2;
 			try {
 				actual = await readBuildRecordForReconciliation(ctx);
 			} catch (error) {
@@ -1059,19 +1146,31 @@ export default function leanflow(pi: ExtensionAPI): void {
 				throw new Error(`internal build record is missing or unreadable: ${evidenceFailureMessage(error)}`);
 			}
 			if (actual.round === toRound) {
-				return { ok: true, round: toRound, baselinePresent: !!actual.baseline };
+				return {
+					ok: true,
+					round: toRound,
+					baselinePresent: !!actual.baseline,
+					freshRecord: actual.observations.length === 0,
+					lspEvidencePresent: actual.observations.some((observation) => observation.toolName === "lsp"),
+				};
 			}
 			if (actual.round !== fromRound) {
 				recoveryEligible = true;
 				throw new Error(`BUILD record round ${actual.round} does not match expected ${fromRound} → ${toRound}`);
 			}
-			const nextRecord: BuildEvidenceRecordV1 = {
+			const nextRecord: BuildEvidenceRecordV2 = {
 				...actual,
 				round: toRound,
 				observations: [],
 			};
 			await writeJsonAtomically(activeBuildRecordPath(ctx), nextRecord);
-			return { ok: true, round: toRound, baselinePresent: !!nextRecord.baseline };
+			return {
+				ok: true,
+				round: toRound,
+				baselinePresent: !!nextRecord.baseline,
+				freshRecord: true,
+				lspEvidencePresent: false,
+			};
 		} catch (error) {
 			let failure = error;
 			if (recoveryEligible && lease?.reason === "human_continue") {
@@ -1079,7 +1178,13 @@ export default function leanflow(pi: ExtensionAPI): void {
 					const fresh = createBuildEvidenceRecord(activeBuildIdentity(toRound));
 					await writeJsonAtomically(activeBuildRecordPath(ctx), fresh);
 					state.buildMutationObserved = false;
-					return { ok: true, round: toRound, baselinePresent: false };
+					return {
+						ok: true,
+						round: toRound,
+						baselinePresent: false,
+						freshRecord: true,
+						lspEvidencePresent: false,
+					};
 				} catch (recoveryError) {
 					failure = recoveryError;
 				}
@@ -1095,16 +1200,24 @@ export default function leanflow(pi: ExtensionAPI): void {
 		}
 	}
 
-	async function appendBuildObservation(
+	async function appendBuildObservationUnlocked(
 		ctx: ExtensionContext,
-		observation: BuildEvidenceObservationV1,
+		observation: BuildEvidenceObservationV2,
 	): Promise<void> {
-		const record = await loadBuildRecord(
-			ctx,
-			state.gateRetryMode === "evidence" ? state.gateAttempt : state.gateAttempt + 1,
-		);
+		const record = await loadBuildRecord(ctx, expectedGateRoundForSnapshot());
 		record.observations.push(observation);
 		await writeJsonAtomically(activeBuildRecordPath(ctx), record);
+	}
+	async function appendBuildObservation(
+		ctx: ExtensionContext,
+		observation: BuildEvidenceObservationV2,
+	): Promise<void> {
+		const release = await acquireBuildRecordLock();
+		try {
+			await appendBuildObservationUnlocked(ctx, observation);
+		} finally {
+			release();
+		}
 	}
 
 	function flattenTextContent(content: unknown): string {
@@ -1464,7 +1577,8 @@ export default function leanflow(pi: ExtensionAPI): void {
 		}
 
 		const assessed = assessHandoff(content);
-		const approvedValidations = approvedValidationsFromPlan(content);
+		const currentPlanDigest = planDigest(content);
+		const validationContract = assessed.validationContract;
 		const identityValid = runIdFromPlan(content) === state.runId;
 		const lsp = lspStatusFromPlan(content);
 		const warnings = [...assessed.warnings];
@@ -1475,9 +1589,10 @@ export default function leanflow(pi: ExtensionAPI): void {
 		const handoffStatus = identityValid ? assessed.status : "NEEDS_UPDATE";
 
 		state.planArtifact = artifact;
-		state.planDigest = planDigest(content);
+		state.planDigest = currentPlanDigest;
 		state.handoffStatus = handoffStatus;
-		state.approvedValidations = approvedValidations;
+		state.approvedValidationContract = validationContract;
+		state.approvedValidationDigest = validationContract?.digest;
 		state.handoffWarnings = warnings;
 		state.handoffBlockers = assessed.blockers.map((blocker) => blocker.code);
 		state.lspProbeStatus = lsp.status;
@@ -1580,7 +1695,9 @@ export default function leanflow(pi: ExtensionAPI): void {
 			}
 		}
 		state = {
+			...defaultState(),
 			phase: "planning",
+			stateVersion: STATE_VERSION,
 			phaseStartedAt: now,
 			runId,
 			scoutCalls: 0,
@@ -1695,6 +1812,8 @@ export default function leanflow(pi: ExtensionAPI): void {
 							type: "repair_round_ready",
 							round: buildRecord.round,
 							baselineCaptured: buildRecord.baselinePresent,
+							freshRecord: buildRecord.freshRecord,
+							lspEvidencePresent: buildRecord.lspEvidencePresent,
 						});
 						await executeGateEffects(ctx, readyEffects);
 						persist();
@@ -1716,34 +1835,32 @@ export default function leanflow(pi: ExtensionAPI): void {
 		result: ParsedGateResult | undefined,
 		isError: boolean,
 		ctx: ExtensionContext,
+		interruptedBy: OperationalInterruption = "tool_error",
 	): Promise<void> {
 		const lease = state.gateLease;
-		let observationBoundary: number | undefined;
-		let blockedSnapshotDigest: string | undefined;
-		if (result?.verdict === "BLOCKED" && lease?.buildRecordRound !== undefined) {
-			try {
-				const record = await loadBuildRecord(ctx, lease.buildRecordRound);
-				observationBoundary = record.observations.filter(isSuccessfulApprovedObservation).length;
-				blockedSnapshotDigest = blockedSemanticEvidenceDigest(lease, record);
-			} catch {
-				// The existing snapshot-validation path will convert an unreadable record into deterministic recovery.
-			}
+		if (!lease || !state.finalizedGateSnapshot) {
+			const { effects } = reduceGate(state, {
+				type: "snapshot_record_invalid",
+				reason: "Gate settlement lacks its durable lease or finalized manifest",
+			});
+			await executeGateEffects(ctx, effects);
+			persist();
+			updateStatus(ctx);
+			return;
 		}
-		if (!isError && result !== undefined && lease?.repositoryFingerprint) {
+		if (!isError && result !== undefined) {
 			let currentFingerprint: RepositoryFingerprint;
 			try {
 				currentFingerprint = await captureRepositoryFingerprint(ctx, undefined);
 			} catch (error) {
-				const { effects } = reduceGate(state, {
-					type: "repository_changed_during_gate",
-					reason: `repository fingerprint cannot be verified immediately before settlement: ${evidenceFailureMessage(error)}`,
-				});
-				await executeGateEffects(ctx, effects);
-				persist();
-				updateStatus(ctx);
+				await finishGateResult(undefined, true, ctx, "transport_error");
+				ctx.ui.notify(
+					`LeanFlow: repository fingerprint transport failed immediately before settlement: ${evidenceFailureMessage(error)}`,
+					"warning",
+				);
 				return;
 			}
-			if (currentFingerprint.combinedDigest !== lease.repositoryFingerprint.combinedDigest) {
+			if (currentFingerprint.combinedDigest !== lease.repositoryFingerprint?.combinedDigest) {
 				const { effects } = reduceGate(state, {
 					type: "repository_changed_during_gate",
 					reason: "repository state changed immediately before Gate settlement",
@@ -1754,18 +1871,55 @@ export default function leanflow(pi: ExtensionAPI): void {
 				return;
 			}
 		}
-		const { effects } = reduceGate(
-			state,
-			isError || result === undefined
-				? { type: "gate_error" }
-				: {
-						type: "gate_settled",
-						outcome: result.verdict,
-						findingsJson: result.canonicalJson,
-						snapshotDigest: blockedSnapshotDigest,
-						observationBoundary,
-					},
-		);
+
+		let gateEvent: Extract<Parameters<typeof reduceGate>[1], { type: "gate_error" | "gate_settled" }>;
+		if (isError || result === undefined) {
+			gateEvent = {
+				type: "gate_error",
+				operationalRetrySnapshot: createOperationalRetrySnapshot(
+					lease,
+					state.finalizedGateSnapshot,
+					interruptedBy,
+				),
+			};
+		} else {
+			const evidenceIds = result.evidenceIds ? [...new Set(result.evidenceIds)].sort() : undefined;
+			let validationStates = state.finalizedGateSnapshot.validationStates.map((validation) => ({ ...validation }));
+			if (result.verdict === "BLOCKED") {
+				if (
+					!result.reasonCode ||
+					!evidenceIds ||
+					evidenceIds.some((id) => !validationStates.some((validation) => validation.id === id))
+				) {
+					await finishGateResult(undefined, true, ctx, "invalid_gate_output");
+					ctx.ui.notify("LeanFlow: Gate BLOCKED result named an unknown approved validation ID.", "warning");
+					return;
+				}
+				const blockedStatus =
+					result.reasonCode === "missing_validation"
+						? "missing"
+						: result.reasonCode === "failed_validation" || result.reasonCode === "other_validation_failure"
+							? "failed"
+							: "stale";
+				validationStates = validationStates.map((validation) =>
+					evidenceIds.includes(validation.id) ? { ...validation, status: blockedStatus } : validation,
+				);
+			}
+			gateEvent = {
+				type: "gate_settled",
+				outcome: result.verdict,
+				findingsJson: result.canonicalJson,
+				...(result.reasonCode ? { reasonCode: result.reasonCode } : {}),
+				...(evidenceIds ? { evidenceIds } : {}),
+				...(result.verdict === "BLOCKED"
+					? {
+							validationStates,
+							semanticEvidenceDigest: state.finalizedGateSnapshot.semanticEvidenceDigest,
+					  }
+					: {}),
+			};
+		}
+		const { effects } = reduceGate(state, gateEvent);
 		await executeGateEffects(ctx, effects);
 		persist();
 		updateStatus(ctx);
@@ -1828,10 +1982,6 @@ export default function leanflow(pi: ExtensionAPI): void {
 	 * filesystem or revalidates artifact content, plan digest, or build record.
 	 */
 	function cheapGateReadiness(ctx: ExtensionContext): { ready: true } | { ready: false; reason: string } {
-		const missing = missingArtifacts(state);
-		if (missing.length > 0) {
-			return { ready: false, reason: `missing artifact marks: ${missing.join(", ")}` };
-		}
 		if (pendingEvidenceObservations.size > 0) {
 			return {
 				ready: false,
@@ -1842,7 +1992,9 @@ export default function leanflow(pi: ExtensionAPI): void {
 			return { ready: false, reason: "repair preparation in progress" };
 		}
 		if (!ctx.localProtocolOptions) return { ready: false, reason: "local artifact storage is unavailable" };
-		if (!state.runId || !state.planDigest) return { ready: false, reason: "active run identity is incomplete" };
+		if (!state.runId || !state.planDigest || !state.approvedValidationDigest) {
+			return { ready: false, reason: "active run identity or validation contract is incomplete" };
+		}
 		if (!expectedGateArtifacts(state)) {
 			return { ready: false, reason: "canonical Gate artifact identity is unavailable" };
 		}
@@ -1896,7 +2048,9 @@ export default function leanflow(pi: ExtensionAPI): void {
 	function reconciliationFingerprint(value: LeanFlowState): string {
 		return JSON.stringify({
 			phase: value.phase,
+			stateVersion: value.stateVersion,
 			gateAttempt: value.gateAttempt,
+			currentBuildRound: value.currentBuildRound,
 			gateCalls: value.gateCalls,
 			gateRetryMode: value.gateRetryMode,
 			gateLease: value.gateLease,
@@ -1904,13 +2058,12 @@ export default function leanflow(pi: ExtensionAPI): void {
 			repairLease: value.repairLease,
 			baselineCaptured: value.baselineCaptured,
 			writtenArtifacts: value.writtenArtifacts,
-			stateVersion: value.stateVersion,
 			consecutiveGateErrors: value.consecutiveGateErrors,
-			approvedValidations: value.approvedValidations,
-			lastBlockedSnapshotDigest: value.lastBlockedSnapshotDigest,
-			lastBlockedObservationBoundary: value.lastBlockedObservationBoundary,
-			lastBlockedFindingDigest: value.lastBlockedFindingDigest,
-			consecutiveSameSnapshotBlocked: value.consecutiveSameSnapshotBlocked,
+			approvedValidationContract: value.approvedValidationContract,
+			approvedValidationDigest: value.approvedValidationDigest,
+			finalizedGateSnapshot: value.finalizedGateSnapshot,
+			operationalRetrySnapshot: value.operationalRetrySnapshot,
+			blockedRecovery: value.blockedRecovery,
 		});
 	}
 
@@ -1940,23 +2093,76 @@ export default function leanflow(pi: ExtensionAPI): void {
 		pendingGatePlanDigests.clear();
 		pendingEvidenceObservations.clear();
 
-		const gateLeaseBeforeReconciliation = state.gateLease;
-		const fingerprintBeforeReconcile = reconciliationFingerprint(state);
-		const migratedFromLegacy =
+		const restoredFromLegacy =
 			rawBeforeRestore !== undefined && rawBeforeRestore.stateVersion !== state.stateVersion;
+		const fingerprintBeforeReconcile = reconciliationFingerprint(state);
 		const { effects } = reduceGate(state, { type: "restore_reconcile", now: Date.now() });
 		await executeGateEffects(ctx, effects);
 
-		if (wasGatingRaw) {
-			const leaseToRestore = (rawBeforeRestore?.gateLease ?? gateLeaseBeforeReconciliation) as NonNullable<LeanFlowState["gateLease"]>;
-			const isGatingNow = state.phase === "gating" && state.gateLease !== undefined;
-			if (!isGatingNow) {
-				if (leaseToRestore) state.gateLease = leaseToRestore as typeof state.gateLease;
-				if (state.phase !== "gating") state.phase = "gating";
+		if (wasGatingRaw && state.phase === "gating" && state.gateLease && state.finalizedGateSnapshot) {
+			const lease = state.gateLease;
+			const verified = await verifyDurableFinalizedSnapshot(ctx, lease);
+			if (verified.ok || verified.kind === "transport_error") {
+				const interrupted = reduceGate(state, {
+					type: "gate_interrupted",
+					operationalRetrySnapshot: createOperationalRetrySnapshot(
+						lease,
+						state.finalizedGateSnapshot,
+						verified.ok ? "session_switch" : "transport_error",
+					),
+				});
+				await executeGateEffects(ctx, interrupted.effects);
+			} else if (verified.kind === "repository_changed") {
+				const changed = reduceGate(state, {
+					type: "repository_changed_during_gate",
+					reason: verified.reason,
+				});
+				await executeGateEffects(ctx, changed.effects);
+			} else if (verified.kind === "plan_drift") {
+				await recoverFromPlanDrift(ctx, verified.reason);
+			} else if (verified.kind === "artifact_rebuildable" || verified.kind === "snapshot_changed") {
+				const invalid = reduceGate(state, { type: "snapshot_evidence_invalid", reason: verified.reason });
+				await executeGateEffects(ctx, invalid.effects);
+			} else {
+				const invalid = reduceGate(state, { type: "snapshot_record_invalid", reason: verified.reason });
+				await executeGateEffects(ctx, invalid.effects);
 			}
-			const interrupted = reduceGate(state, { type: "gate_interrupted" });
-			await executeGateEffects(ctx, interrupted.effects);
 		}
+		if (
+			state.phase === "building" &&
+			state.gateRetryMode === "operational" &&
+			state.operationalRetrySnapshot &&
+			state.finalizedGateSnapshot
+		) {
+			const verified = await verifyDurableFinalizedSnapshot(ctx);
+			if (!verified.ok && verified.kind !== "transport_error") {
+				if (verified.kind === "repository_changed") {
+					state.gateRetryMode = undefined;
+					state.operationalRetrySnapshot = undefined;
+					state.finalizedGateSnapshot = undefined;
+					state.writtenArtifacts = [];
+					state.buildMutationObserved = true;
+				} else if (verified.kind === "plan_drift") {
+					state.gateLease = {
+						...state.operationalRetrySnapshot.originalGateLease,
+					};
+					state.phase = "gating";
+					await recoverFromPlanDrift(ctx, verified.reason);
+				} else if (verified.kind === "artifact_rebuildable" || verified.kind === "snapshot_changed") {
+					state.gateRetryMode = "evidence";
+					state.operationalRetrySnapshot = undefined;
+					state.finalizedGateSnapshot = undefined;
+					state.writtenArtifacts = [];
+				} else {
+					state.gateRetryMode = undefined;
+					state.operationalRetrySnapshot = undefined;
+					state.finalizedGateSnapshot = undefined;
+					state.baselineCaptured = false;
+					state.phase = "awaiting_human";
+				}
+			}
+		}
+
 
 		if (state.phase === "repair_preparing") {
 			// Repair transactions reconcile from their durable lease and BUILD
@@ -1966,7 +2172,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 				let degraded = false;
 				try {
 					const record = await readBuildRecordForReconciliation(ctx);
-					const fromRound = state.gateAttempt;
+					const fromRound = state.currentBuildRound ?? state.gateAttempt;
 					const toRound = fromRound + 1;
 					if (record.round === fromRound || record.round === toRound) {
 						state.repairLease = { fromRound, toRound, reason: "gate_fail", startedAt: Date.now() };
@@ -1994,6 +2200,8 @@ export default function leanflow(pi: ExtensionAPI): void {
 							type: "repair_round_ready",
 							round: buildRecord.round,
 							baselineCaptured: buildRecord.baselinePresent,
+							freshRecord: buildRecord.freshRecord,
+							lspEvidencePresent: buildRecord.lspEvidencePresent,
 						});
 						await executeGateEffects(
 							ctx,
@@ -2013,22 +2221,22 @@ export default function leanflow(pi: ExtensionAPI): void {
 		} else if (state.phase === "building") {
 			try {
 				const record = await readBuildRecordForReconciliation(ctx);
-				const expected = expectedGateRoundForSnapshot();
-				if (record.round !== expected) {
-					if (record.round >= 1 && record.round <= 100) {
-						if (record.round === 1 && state.gateRetryMode === "repair") {
-							state.gateRetryMode = undefined;
-						}
-						if (state.gateRetryMode === "operational" || state.gateRetryMode === "evidence") {
-							state.gateAttempt = record.round;
-						} else {
-							state.gateAttempt = record.round - 1;
-							if (state.gateAttempt < 0) state.gateAttempt = 0;
-						}
-					}
-				}
-			} catch {
-				// Missing or unreadable record is handled at next preflight as a blocked readiness reason.
+				state.currentBuildRound = record.round;
+				state.gateAttempt =
+					state.gateRetryMode === "operational" || state.gateRetryMode === "evidence"
+						? record.round
+						: Math.max(0, record.round - 1);
+			} catch (error) {
+				state.gateRetryMode = undefined;
+				state.operationalRetrySnapshot = undefined;
+				state.finalizedGateSnapshot = undefined;
+				state.writtenArtifacts = [];
+				state.baselineCaptured = false;
+				state.phase = "awaiting_human";
+				ctx.ui.notify(
+					`LeanFlow: BUILD record reconciliation failed safely: ${evidenceFailureMessage(error)}`,
+					"warning",
+				);
 			}
 		}
 
@@ -2036,7 +2244,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 		if (violations.length > 0) {
 			ctx.ui.notify(`LeanFlow invariant violation: ${violations.join("; ")}`, "warning");
 		}
-		if (migratedFromLegacy || reconciliationFingerprint(state) !== fingerprintBeforeReconcile) {
+		if (restoredFromLegacy || reconciliationFingerprint(state) !== fingerprintBeforeReconcile) {
 			persist();
 		}
 
@@ -2135,7 +2343,9 @@ export default function leanflow(pi: ExtensionAPI): void {
 			// Initialize state machine and the first observable phase.
 			const now = Date.now();
 			state = {
+				...defaultState(),
 				phase: "planning",
+				stateVersion: STATE_VERSION,
 				phaseStartedAt: now,
 				scoutCalls: 0,
 				runId: randomUUID(),
@@ -2157,11 +2367,20 @@ export default function leanflow(pi: ExtensionAPI): void {
 
 	const { z } = pi.zod;
 	const captureBaselineParameters = z.object({}).strict();
-	const finalizeArtifactsParameters = z
+	const runValidationParameters = z
 		.object({
-			validationCommands: z.array(z.string().min(1)).min(1),
+			validationId: z.string().min(1),
 		})
 		.strict();
+	const finalizeArtifactsParameters = z.object({}).strict();
+	const approvedValidationInstructions = (): string =>
+		[
+			"Approved validation IDs (execute each with leanflow_run_validation):",
+			...(state.approvedValidationContract?.validations ?? []).map(
+				(validation) => `- ${validation.id}: ${validation.displayCommand}`,
+			),
+		].join("\n");
+
 	pi.registerTool<typeof captureBaselineParameters>({
 		name: "leanflow_capture_baseline",
 		label: "Capture LeanFlow Baseline",
@@ -2169,6 +2388,8 @@ export default function leanflow(pi: ExtensionAPI): void {
 		parameters: captureBaselineParameters,
 		strict: true,
 		async execute(_toolCallId, _params, signal, _onUpdate, ctx) {
+			const release = await acquireBuildRecordLock();
+			try {
 			const fail = (message: string) => ({
 				content: [{ type: "text" as const, text: `LeanFlow baseline capture failed: ${message}` }],
 				isError: true,
@@ -2184,7 +2405,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 			}
 			try {
 				const activeRound = state.repairLease ? state.repairLease.toRound : expectedGateRoundForSnapshot();
-				let record: BuildEvidenceRecordV1;
+				let record: BuildEvidenceRecordV2;
 				try {
 					record = await loadBuildRecord(ctx, activeRound);
 				} catch {
@@ -2193,7 +2414,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 						state.baselineCaptured = true;
 						persist();
 						return {
-							content: [{ type: "text" as const, text: `LeanFlow immutable BUILD baseline already captured at ${record.baseline.head}.` }],
+							content: [{ type: "text" as const, text: `LeanFlow immutable BUILD baseline already captured at ${record.baseline.head}.\n${approvedValidationInstructions()}` }],
 						};
 					}
 					throw new Error(`BUILD record round ${record.round} does not match expected ${activeRound}`);
@@ -2202,7 +2423,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 					state.baselineCaptured = true;
 					persist();
 					return {
-						content: [{ type: "text" as const, text: `LeanFlow immutable BUILD baseline already captured at ${record.baseline.head}.` }],
+						content: [{ type: "text" as const, text: `LeanFlow immutable BUILD baseline already captured at ${record.baseline.head}.\n${approvedValidationInstructions()}` }],
 					};
 				}
 				const headResult = await runGit(ctx, ["rev-parse", "HEAD"], signal);
@@ -2221,59 +2442,183 @@ export default function leanflow(pi: ExtensionAPI): void {
 					content: [
 						{
 							type: "text" as const,
-							text: `LeanFlow immutable BUILD baseline captured at ${head}.`,
+							text: `LeanFlow immutable BUILD baseline captured at ${head}.\n${approvedValidationInstructions()}`,
 						},
 					],
 				};
 			} catch (error) {
 				return fail(evidenceFailureMessage(error));
 			}
+			} finally {
+				release();
+			}
 		},
 	});
+	pi.registerTool<typeof runValidationParameters>({
+		name: "leanflow_run_validation",
+		label: "Run Approved LeanFlow Validation",
+		description:
+			"Execute one approved Verification entry by validation ID without shell parsing, and bind its result to repository fingerprints.",
+		parameters: runValidationParameters,
+		strict: true,
+		async execute(toolCallId, params, signal, _onUpdate, ctx) {
+			const release = await acquireBuildRecordLock();
+			try {
+			const fail = (message: string) => ({
+				content: [{ type: "text" as const, text: `LeanFlow validation failed: ${message}` }],
+				isError: true,
+			});
+			if (state.phase !== "building") return fail("the workflow is not in BUILD.");
+			if (state.gateRetryMode === "operational") {
+				return fail("operational recovery may only redispatch the already-finalized snapshot.");
+			}
+			if (state.baselineCaptured !== true) return fail("capture the immutable BUILD baseline first.");
+			const validation = state.approvedValidationContract?.validations.find(
+				(candidate) => candidate.id === params.validationId,
+			);
+			if (!validation) return fail(`validation ID ${JSON.stringify(params.validationId)} is not approved.`);
+			if (
+				state.finalizedGateSnapshot ||
+				state.operationalRetrySnapshot ||
+				(state.writtenArtifacts?.length ?? 0) > 0
+			) {
+				state.finalizedGateSnapshot = undefined;
+				state.operationalRetrySnapshot = undefined;
+				state.writtenArtifacts = [];
+				try {
+					persist();
+				} catch (error) {
+					return fail(
+						`prior Gate authority could not be invalidated: ${evidenceFailureMessage(error)}`,
+					);
+				}
+			}
+			const startedAt = Date.now();
+			let before: RepositoryFingerprint;
+			try {
+				before = await captureRepositoryFingerprint(ctx, signal);
+			} catch (error) {
+				return fail(`repository fingerprint before validation is unavailable: ${evidenceFailureMessage(error)}`);
+			}
+			const execution = await pi.exec(validation.executable, validation.argv, { cwd: ctx.cwd, signal }).then(
+				(result) => ({ ok: true as const, result }),
+				(error: unknown) => ({ ok: false as const, error }),
+			);
+			if (!execution.ok) return fail(`execution could not start: ${evidenceFailureMessage(execution.error)}`);
+			const result = execution.result;
+			const finishedAt = Date.now();
+			let after: RepositoryFingerprint | undefined;
+			let fingerprintError: string | undefined;
+			try {
+				after = await captureRepositoryFingerprint(ctx, signal);
+			} catch (error) {
+				fingerprintError = evidenceFailureMessage(error);
+			}
+			const observation: BuildEvidenceObservationV2 = {
+				toolCallId,
+				toolName: "validation",
+				validationId: validation.id,
+				command: validation.displayCommand,
+				executable: validation.executable,
+				argv: [...validation.argv],
+				repositoryFingerprintBefore: before.combinedDigest,
+				repositoryFingerprintAfter: after?.combinedDigest,
+				startedAt,
+				finishedAt,
+				isError: result.code !== 0 || result.killed || fingerprintError !== undefined,
+				exitCode: result.code,
+				timedOut: result.killed,
+				text: combinedExecOutput(result.stdout, result.stderr),
+			};
+			try {
+				await appendBuildObservationUnlocked(ctx, observation);
+			} catch (error) {
+				return fail(`result could not be committed to the BUILD record: ${evidenceFailureMessage(error)}`);
+			}
+			state.finalizedGateSnapshot = undefined;
+			state.writtenArtifacts = [];
+			if (!after || before.combinedDigest !== after.combinedDigest) {
+				state.buildMutationObserved = true;
+				if (state.gateRetryMode === "evidence") {
+					state.gateRetryMode = undefined;
+					resetBlockedRecovery(state);
+				}
+			}
+			persist();
+			if (fingerprintError) {
+				return fail(`repository fingerprint after validation is unavailable: ${fingerprintError}`);
+			}
+			if (before.combinedDigest !== after!.combinedDigest) {
+				return fail("the approved validation mutated repository state; its evidence is stale.");
+			}
+			if (result.code !== 0 || result.killed) {
+				return fail(
+					`${validation.displayCommand} exited ${result.code}${result.killed ? " after interruption" : ""}:\n${observation.text ?? ""}`,
+				);
+			}
+			return {
+				content: [
+					{
+						type: "text" as const,
+						text: `LeanFlow validation ${validation.id} passed without repository mutation.\n${observation.text ?? ""}`,
+					},
+				],
+			};
+			} finally {
+				release();
+			}
+		},
+	});
+
 
 	pi.registerTool<typeof finalizeArtifactsParameters>({
 		name: "leanflow_finalize_artifacts",
 		label: "Finalize LeanFlow Artifacts",
-		description: "Mechanically generate this run's build, complete diff, and runtime evidence artifacts from recorded observations.",
+		description:
+			"Mechanically generate and atomically bind the plan, validation contract, BUILD record, repository fingerprint, and three Gate artifacts.",
 		parameters: finalizeArtifactsParameters,
 		strict: true,
-		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+		async execute(_toolCallId, _params, signal, _onUpdate, ctx) {
+			const release = await acquireBuildRecordLock();
+			try {
 			const fail = (message: string) => ({
 				content: [{ type: "text" as const, text: `LeanFlow artifact finalization failed: ${message}` }],
 				isError: true,
 			});
 			if (state.phase !== "building") return fail("the workflow is not in BUILD.");
 			if (state.gateRetryMode === "operational") {
-				return fail("an operational Gate retry must reuse the existing artifacts unchanged.");
+				return fail("an operational Gate retry must reuse the existing finalized manifest unchanged.");
 			}
-			if (state.lspProbeStatus === "pending") return fail("the required initial LSP diagnostics probe is incomplete.");
+			if (state.lspProbeStatus === "pending") return fail("the required LSP diagnostics probe is incomplete.");
 			if (state.baselineCaptured !== true) return fail("capture the immutable BUILD baseline first.");
 			if (pendingEvidenceObservations.size > 0) {
 				return fail("one or more BUILD observations are still unpersisted.");
 			}
 			try {
-				if (!state.planArtifact || !state.runId || !state.planDigest || !ctx.localProtocolOptions) {
-					throw new Error("active plan identity or local protocol options are incomplete");
+				if (
+					!state.planArtifact ||
+					!state.runId ||
+					!state.planDigest ||
+					!state.approvedValidationContract ||
+					!state.approvedValidationDigest ||
+					!ctx.localProtocolOptions
+				) {
+					throw new Error("active plan identity, validation contract, or local protocol options are incomplete");
 				}
 				const planPath = resolveRunMarkerPath(ctx.localProtocolOptions, state.planArtifact);
 				if (!planPath) throw new Error("canonical plan path cannot be resolved");
 				const planContent = await fs.readFile(planPath, "utf8");
-				if (runIdFromPlan(planContent) !== state.runId || planDigest(planContent) !== state.planDigest) {
-					throw new Error("canonical plan run ID or digest changed after approval");
+				if (
+					runIdFromPlan(planContent) !== state.runId ||
+					planDigest(planContent) !== state.planDigest ||
+					parseValidationContract(planContent, state.planDigest).contract?.digest !== state.approvedValidationDigest
+				) {
+					throw new Error("canonical plan or approved validation contract changed after approval");
 				}
 
-				const record = await loadBuildRecord(
-					ctx,
-					state.gateRetryMode === "evidence" ? state.gateAttempt : state.gateAttempt + 1,
-				);
-				if (!record.baseline) throw new Error("the internal build record has no immutable baseline");
-				if (
-					state.gateRetryMode === "evidence" &&
-					params.validationCommands.some((command) => !isApprovedValidation(command))
-				) {
-					throw new Error("evidence recovery may finalize only exact Verification commands from the approved plan");
-				}
-				const validations = selectValidationObservations(record, params.validationCommands);
+				const recordRound = expectedGateRoundForSnapshot();
+				const record = await loadBuildRecord(ctx, recordRound);
+				if (!record.baseline) throw new Error("the internal BUILD record has no immutable baseline");
 				const gitEvidence: GitCommandEvidence[] = [
 					{
 						command: "git rev-parse HEAD",
@@ -2293,9 +2638,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 				gitEvidence.push(finalHeadResult.evidence);
 				const finalHead = finalHeadResult.stdout.trim();
 				if (finalHead !== record.baseline.head) {
-					throw new Error(
-						`final HEAD ${finalHead || "(empty)"} differs from baseline HEAD ${record.baseline.head}`,
-					);
+					throw new Error(`final HEAD ${finalHead || "(empty)"} differs from baseline HEAD ${record.baseline.head}`);
 				}
 				const finalStatusResult = await runGit(
 					ctx,
@@ -2306,7 +2649,6 @@ export default function leanflow(pi: ExtensionAPI): void {
 				);
 				gitEvidence.push(finalStatusResult.evidence);
 				const finalStatus = finalStatusResult.stdout.trimEnd();
-
 				const trackedDiffResult = await runGit(
 					ctx,
 					["diff", "--binary", record.baseline.head, "--"],
@@ -2334,9 +2676,9 @@ export default function leanflow(pi: ExtensionAPI): void {
 					[0],
 					"Sorted untracked paths",
 				);
-				const untrackedPaths = parseNulList(untrackedResult.stdout, untrackedResult.evidence.command).sort((left, right) =>
-					Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8")),
-				);
+				const untrackedPaths = parseNulList(untrackedResult.stdout, untrackedResult.evidence.command)
+					.filter((relative) => !isLeanFlowInternalRepositoryPath(relative))
+					.sort((left, right) => Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8")));
 				gitEvidence.push({
 					...untrackedResult.evidence,
 					output: untrackedPaths.map((candidate) => JSON.stringify(candidate)).join("\n"),
@@ -2361,10 +2703,23 @@ export default function leanflow(pi: ExtensionAPI): void {
 					gitEvidence.push(patchResult.evidence);
 				}
 
-				const completeDiff = composeCompleteDiff(
-					trackedDiffResult.stdout,
-					untrackedPatches,
-					emptyUntrackedFiles,
+				const completeDiff = composeCompleteDiff(trackedDiffResult.stdout, untrackedPatches, emptyUntrackedFiles);
+				const repositoryFingerprint = await captureRepositoryFingerprint(ctx, signal);
+				const validationStates = validationSemanticStates(
+					record,
+					state.approvedValidationContract,
+					repositoryFingerprint.combinedDigest,
+				);
+				const incomplete = validationStates.filter((validation) => validation.status !== "passed");
+				if (incomplete.length > 0) {
+					throw new Error(
+						`required validation evidence is incomplete: ${incomplete.map((validation) => `${validation.id}=${validation.status}`).join(", ")}`,
+					);
+				}
+				const validations = selectValidationObservations(
+					record,
+					state.approvedValidationContract,
+					repositoryFingerprint.combinedDigest,
 				);
 				const changedPaths = [...new Set([...trackedPaths, ...untrackedPaths])];
 				const rendered = renderBuildArtifacts({
@@ -2386,8 +2741,16 @@ export default function leanflow(pi: ExtensionAPI): void {
 				] as const;
 
 				state.writtenArtifacts = [];
+				state.finalizedGateSnapshot = undefined;
 				persist();
+				try {
+					await fs.unlink(activeFinalizedSnapshotPath(ctx));
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+				}
+
 				const verified: string[] = [];
+				const artifactDigests = new Map<string, string>();
 				for (const output of outputs) {
 					const filePath = resolveRunMarkerPath(ctx.localProtocolOptions, output.artifact);
 					if (!filePath) throw new Error(`canonical ${output.kind} artifact path cannot be resolved`);
@@ -2400,20 +2763,49 @@ export default function leanflow(pi: ExtensionAPI): void {
 					if (expectedBytes !== actualBytes || expectedDigest !== actualDigest) {
 						throw new Error(`canonical ${output.kind} artifact failed byte/hash verification`);
 					}
+					artifactDigests.set(output.kind, actualDigest);
 					verified.push(`${output.kind}.md ${actualBytes} bytes sha256:${actualDigest}`);
 				}
+
+				const recordText = await fs.readFile(activeBuildRecordPath(ctx), "utf8");
+				parseBuildEvidenceRecord(JSON.parse(recordText), activeBuildIdentity(recordRound));
+				const manifest = createFinalizedGateSnapshot({
+					runId: state.runId,
+					planSlug: state.planSlug!,
+					planDigest: state.planDigest,
+					approvedValidationDigest: state.approvedValidationDigest,
+					buildRecordRound: recordRound,
+					buildRecordDigest: sha256Hex(recordText),
+					buildArtifactDigest: artifactDigests.get("build")!,
+					diffArtifactDigest: artifactDigests.get("diff")!,
+					evidenceArtifactDigest: artifactDigests.get("evidence")!,
+					repositoryFingerprint,
+					validationStates,
+				});
+				await writeJsonAtomically(activeFinalizedSnapshotPath(ctx), manifest);
+				const persistedManifest = parseFinalizedGateSnapshot(
+					JSON.parse(await fs.readFile(activeFinalizedSnapshotPath(ctx), "utf8")),
+				);
+				if (!persistedManifest || finalizedGateSnapshotDigest(persistedManifest) !== finalizedGateSnapshotDigest(manifest)) {
+					throw new Error("finalized Gate manifest failed atomic persistence verification");
+				}
+				state.finalizedGateSnapshot = persistedManifest;
+				state.operationalRetrySnapshot = undefined;
 				state.writtenArtifacts = [...REQUIRED_ARTIFACTS];
 				persist();
 				return {
 					content: [
 						{
 							type: "text" as const,
-							text: `LeanFlow Gate artifacts finalized and verified:\n${verified.join("\n")}`,
+							text: `LeanFlow Gate artifacts and manifest finalized:\n${verified.join("\n")}\nmanifest sha256:${finalizedGateSnapshotDigest(persistedManifest)}`,
 						},
 					],
 				};
 			} catch (error) {
 				return fail(evidenceFailureMessage(error));
+			}
+			} finally {
+				release();
 			}
 		},
 	});
@@ -2537,16 +2929,36 @@ export default function leanflow(pi: ExtensionAPI): void {
 							: "LeanFlow: capture the immutable BUILD baseline before repository mutations.",
 			};
 		}
+		const gateTask =
+			isTaskToolCall(event) && roles.length > 0 && roles.every((role) => role === "gate");
+		const approvedValidationTool =
+			event.toolName === "leanflow_run_validation" || routedDeviceCall === "run_validation";
+		const finalizeTool =
+			event.toolName === "leanflow_finalize_artifacts" || routedDeviceCall === "finalize_artifacts";
 		if (
-			effect === "repository_mutation" &&
-			((state.phase === "building" && state.gateRetryMode === "operational") ||
-				((state.phase === "building" || state.phase === "gating") &&
-					state.gateRetryMode === "evidence" &&
-					!isApprovedValidationCommand(event)))
+			state.phase === "building" &&
+			state.gateRetryMode === "operational" &&
+			effect !== "read_only" &&
+			!gateTask &&
+			!issueReport
 		) {
 			return {
 				block: true,
-				reason: "LeanFlow: Gate evidence recovery must reuse the implementation unchanged.",
+				reason: "LeanFlow: operational recovery permits only read-only inspection and Gate redispatch.",
+			};
+		}
+		if (
+			state.phase === "building" &&
+			state.gateRetryMode === "evidence" &&
+			effect !== "read_only" &&
+			!gateTask &&
+			!approvedValidationTool &&
+			!finalizeTool &&
+			!issueReport
+		) {
+			return {
+				block: true,
+				reason: "LeanFlow: evidence recovery permits only approved validation IDs and artifact finalization.",
 			};
 		}
 		if (state.phase === "repair_preparing") {
@@ -2573,40 +2985,24 @@ export default function leanflow(pi: ExtensionAPI): void {
 				}
 				const shape = validateGateTaskCall(event.input, artifacts);
 				if (shape.block) return { block: true, reason: shape.reason };
-				const missing = missingArtifacts(state);
-				if (missing.length > 0) {
-					recordStats(() => recordGateReadinessBlock(state));
-					return {
-						block: true,
-						reason: `LeanFlow: Gate unavailable — complete build evidence first (missing: ${missing.join(", ")}).`,
-					};
-				}
+				// writtenArtifacts is advisory UI state. The atomic manifest and
+				// its bound digests are the only Gate-readiness authority.
 				const snapshot = await prepareGateSnapshot(ctx);
 				if (!snapshot.ok) {
 					recordStats(() => recordGateReadinessBlock(state));
+					if (snapshot.noSemanticProgress) {
+						const stalled = reduceGate(state, {
+							type: "blocked_no_progress",
+							reason: snapshot.reason,
+						});
+						await executeGateEffects(ctx, stalled.effects);
+						persist();
+						updateStatus(ctx);
+					}
 					return {
 						block: true,
 						reason: `LeanFlow: Gate unavailable — complete build evidence first (${snapshot.reason}).`,
 					};
-				}
-				let repositoryFingerprint: RepositoryFingerprint;
-				try {
-					repositoryFingerprint = await captureRepositoryFingerprint(ctx, undefined);
-				} catch (error) {
-					recordStats(() => recordGateReadinessBlock(state));
-					return {
-						block: true,
-						reason: `LeanFlow: Gate unavailable — repository fingerprint failed (${evidenceFailureMessage(error)}).`,
-					};
-				}
-				// A retry over unchanged evidence remains in its existing BUILD record
-				// round. gateAttempt temporarily advances while its Gate call is
-				// in-flight, so reset it before the reducer allocates that same cycle.
-				if (
-					(state.gateRetryMode === "operational" || state.gateRetryMode === "evidence") &&
-					state.gateAttempt > 0
-				) {
-					state.gateAttempt--;
 				}
 				reduceGate(state, {
 					type: "gate_dispatch",
@@ -2615,7 +3011,8 @@ export default function leanflow(pi: ExtensionAPI): void {
 					snapshotDigest: snapshot.snapshotDigest,
 					planDigest: snapshot.planDigest,
 					buildRecordRound: snapshot.buildRecordRound,
-					repositoryFingerprint,
+					repositoryFingerprint: snapshot.repositoryFingerprint,
+					reuseCycle: state.gateRetryMode === "operational" || state.gateRetryMode === "evidence",
 					now: Date.now(),
 				});
 				pendingGateCalls.add(event.toolCallId);
@@ -2741,7 +3138,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 				!asyncRunning
 					? 0
 					: explicitExitCode;
-			const observation: BuildEvidenceObservationV1 = {
+			const observation: BuildEvidenceObservationV2 = {
 				toolCallId: event.toolCallId,
 				toolName: pendingObservation.toolName,
 				...(pendingObservation.toolName === "bash"
@@ -2754,10 +3151,6 @@ export default function leanflow(pi: ExtensionAPI): void {
 			};
 			try {
 				await appendBuildObservation(ctx, observation);
-				if (isSuccessfulApprovedObservation(observation)) {
-					resetBlockedEvidenceRecovery(state);
-					persist();
-				}
 				pendingEvidenceObservations.delete(event.toolCallId);
 			} catch (error) {
 				state.baselineCaptured = false;
@@ -2825,7 +3218,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 			const dispatchedPlanDigest = pendingGatePlanDigests.get(event.toolCallId) ?? state.gateLease?.planDigest;
 			pendingGateCalls.delete(event.toolCallId);
 			pendingGatePlanDigests.delete(event.toolCallId);
-			if (!event.isError && state.phase === "gating" && state.gateLease) {
+			if (state.phase === "gating" && state.gateLease) {
 				const snapshotCheck = await verifyGateSnapshot(ctx, state.gateLease);
 				if (!snapshotCheck.ok) {
 					ctx.ui.notify(`LeanFlow: ${snapshotCheck.reason}; Gate result was discarded.`, "warning");
@@ -3026,11 +3419,6 @@ function artifactKind(ctx: ExtensionContext, rawTarget: string, state: LeanFlowS
 	return undefined;
 }
 
-/** Evidence artifacts not yet written this round. */
-function missingArtifacts(state: LeanFlowState): string[] {
-	const written = new Set(state.writtenArtifacts ?? []);
-	return REQUIRED_ARTIFACTS.filter((kind) => !written.has(kind)).map((k) => `${k}.md`);
-}
 
 // ---------------------------------------------------------------------------
 // Planner-only prompt — no Gate schema, no build artifact detail
@@ -3075,10 +3463,6 @@ function buildPlanningPrompt(task: string, slug: string, runId: string): string 
 	].join("\n");
 }
 
-// ---------------------------------------------------------------------------
-// Gate verdict parsing and semantic validation
-// ---------------------------------------------------------------------------
-
 type GateFindingCategory =
 	| "correctness"
 	| "validation_failure"
@@ -3099,6 +3483,8 @@ interface GateFinding {
 interface ParsedGateResult {
 	verdict: GateOutcome;
 	findings: GateFinding[];
+	reasonCode?: BlockedReasonCode;
+	evidenceIds?: string[];
 	canonicalJson: string;
 }
 
@@ -3117,6 +3503,16 @@ const GATE_BLOCKING_CATEGORIES = new Set<GateFindingCategory>([
 	"plan_deviation",
 	"missing_change",
 	"regression_risk",
+]);
+const GATE_BLOCKED_REASON_CODES = new Set<BlockedReasonCode>([
+	"missing_validation",
+	"failed_validation",
+	"stale_validation",
+	"run_mismatch",
+	"artifact_unreadable",
+	"artifact_inconsistent",
+	"build_record_invalid",
+	"other_validation_failure",
 ]);
 
 function parseGateResult(content: unknown): { ok: true; result: ParsedGateResult } | { ok: false; reason: string } {
@@ -3173,29 +3569,54 @@ function parseGateResult(content: unknown): { ok: true; result: ParsedGateResult
 			if (value.verdict === "PASS" && blocking.length > 0) {
 				return { ok: false, reason: "PASS must not contain blocking findings" };
 			}
-			if (value.verdict === "FAIL" && (blocking.length === 0 || blocking.some((finding) => !GATE_BLOCKING_CATEGORIES.has(finding.category)))) {
-				return { ok: false, reason: "FAIL requires a blocking correctness, validation_failure, plan_deviation, missing_change, or regression_risk finding" };
+			if (
+				value.verdict === "FAIL" &&
+				(blocking.length === 0 || blocking.some((finding) => !GATE_BLOCKING_CATEGORIES.has(finding.category)))
+			) {
+				return {
+					ok: false,
+					reason:
+						"FAIL requires a blocking correctness, validation_failure, plan_deviation, missing_change, or regression_risk finding",
+				};
 			}
+			let reasonCode: BlockedReasonCode | undefined;
+			let evidenceIds: string[] | undefined;
 			if (value.verdict === "BLOCKED") {
 				const finding = findings[0];
-				const rationale = finding ? `${finding.issue} ${finding.required_fix}` : "";
 				if (
 					findings.length !== 1 ||
 					!finding ||
 					finding.severity !== "blocking" ||
 					finding.category !== "validation_failure" ||
-					!/(?:missing|invalid|unreadable|inconsistent|缺少|无效|不可读|不一致)/i.test(rationale) ||
-					!/(?:validation|evidence|验证|证据)/i.test(rationale)
+					typeof value.reason_code !== "string" ||
+					!GATE_BLOCKED_REASON_CODES.has(value.reason_code as BlockedReasonCode) ||
+					!Array.isArray(value.evidence_ids) ||
+					value.evidence_ids.length === 0 ||
+					value.evidence_ids.some((id) => typeof id !== "string" || id.trim().length === 0)
 				) {
-					return { ok: false, reason: "BLOCKED requires exactly one blocking validation_failure that explains missing or invalid validation evidence" };
+					return {
+						ok: false,
+						reason:
+							"BLOCKED requires one blocking validation_failure plus a structured reason_code and non-empty evidence_ids",
+					};
 				}
+				reasonCode = value.reason_code as BlockedReasonCode;
+				evidenceIds = [...new Set(value.evidence_ids.map((id) => (id as string).trim()))].sort();
+			} else if ("reason_code" in value || "evidence_ids" in value) {
+				return { ok: false, reason: "PASS and FAIL must not contain BLOCKED recovery fields" };
 			}
 			return {
 				ok: true,
 				result: {
 					verdict: value.verdict,
 					findings,
-					canonicalJson: JSON.stringify({ verdict: value.verdict, findings }),
+					...(reasonCode ? { reasonCode } : {}),
+					...(evidenceIds ? { evidenceIds } : {}),
+					canonicalJson: JSON.stringify({
+						verdict: value.verdict,
+						findings,
+						...(reasonCode ? { reason_code: reasonCode, evidence_ids: evidenceIds } : {}),
+					}),
 				},
 			};
 		}

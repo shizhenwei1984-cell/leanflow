@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { expect, test } from "bun:test";
@@ -66,6 +66,7 @@ function createHarness(): Harness {
 		registerCommand: (name: string, def: unknown) => commands.set(name, def as never),
 		registerTool: (def: Record<string, unknown>) => tools.set(def.name as string, def as never),
 		exec: async (command: string, args: string[]) => {
+			if (command === "bun") return { stdout: "1 pass\n0 fail\nRan 1 test.\n", stderr: "", code: 0, killed: false };
 			if (command !== "git") return { stdout: "", stderr: `unexpected: ${command}`, code: 127, killed: false };
 			if (args[0] === "rev-parse") return { stdout: `${"a".repeat(40)}\n`, stderr: "", code: 0, killed: false };
 			if (args[0] === "status" || args[0] === "ls-files") return { stdout: "", stderr: "", code: 0, killed: false };
@@ -99,9 +100,6 @@ function buildRecordPath(h: Harness) {
 	const runId = (h.states.at(-1) as Record<string, string>).runId;
 	return resolveRunMarkerPath(h.ctx.localProtocolOptions, `local://.leanflow/runs/${runId}-build-record.json`)!;
 }
-function runMarkerPath(h: Harness) {
-	return resolveRunMarkerPath(h.ctx.localProtocolOptions, (h.states.at(-1) as Record<string, string>).runMarkerArtifact)!;
-}
 async function writeInitialPlan(h: Harness, content = "Update src/example.ts with the requested behavior and run focused tests.\nLSP applicability: required") {
 	await h.commands.get("flow")!.handler(EXAMPLE_TASK, h.ctx);
 	const latest = h.states.at(-1) as Record<string, string>;
@@ -130,19 +128,25 @@ async function executeRegisteredTool(h: Harness, name: string, params: Record<st
 	if (guard && typeof guard === "object" && "block" in guard && (guard as Record<string, unknown>).block === true) throw new Error(`blocked: ${JSON.stringify(guard)}`);
 	return h.tools.get(name)!.execute(toolCallId, params, undefined, undefined, h.ctx);
 }
-async function recordSuccessfulValidation(h: Harness, command: string, output = "1 pass\n0 fail\nRan 1 test.") {
-	const toolCallId = `validation-${h.states.length}`;
-	await h.handlers.get("tool_call")!({ toolName: "bash", toolCallId, input: { command } }, h.ctx);
-	await h.handlers.get("tool_result")!({ toolName: "bash", toolCallId, isError: false, details: {}, content: [{ type: "text", text: output }] }, h.ctx);
+async function recordSuccessfulValidation(h: Harness, command: string) {
+	const state = h.states.at(-1) as {
+		approvedValidationContract: { validations: Array<{ id: string; displayCommand: string }> };
+	};
+	const validation =
+		state.approvedValidationContract.validations.find((candidate) => candidate.displayCommand === command) ??
+		state.approvedValidationContract.validations[0];
+	if (!validation) throw new Error(`approved validation not found: ${command}`);
+	const result = await executeRegisteredTool(h, "leanflow_run_validation", { validationId: validation.id });
+	if ((result as Record<string, unknown>).isError) throw new Error(`validation failed: ${JSON.stringify(result)}`);
 }
-async function completeBuildEvidence(h: Harness, command = "bun test tests/*.test.ts") {
+async function completeBuildEvidence(h: Harness, command = "bun test tests/leanflow_lsp_guard.test.ts") {
 	const st = h.states.at(-1) as Record<string, unknown>;
 	if (st.baselineCaptured !== true) {
 		const cap = await executeRegisteredTool(h, "leanflow_capture_baseline", {});
 		if ((cap as Record<string, unknown>).isError) throw new Error(`baseline failed: ${JSON.stringify(cap)}`);
 	}
 	await recordSuccessfulValidation(h, command);
-	const fin = await executeRegisteredTool(h, "leanflow_finalize_artifacts", { validationCommands: [command] });
+	const fin = await executeRegisteredTool(h, "leanflow_finalize_artifacts", {});
 	if ((fin as Record<string, unknown>).isError) throw new Error(`finalize failed: ${JSON.stringify(fin)}`);
 }
 
@@ -253,7 +257,6 @@ test("P1-2: restore reconciles building with actual record round", async () => {
 	const h = createHarness();
 	await enterDocumentationBuild(h);
 	await completeBuildEvidence(h, "bun test recon-1");
-	const before = h.states.at(-1) as Record<string, unknown>;
 	const rec = JSON.parse(readFileSync(buildRecordPath(h), "utf8"));
 	expect(rec.round).toBe(1);
 	await h.handlers.get("session_switch")!({}, h.ctx);
@@ -271,7 +274,7 @@ test("P1-3: repair_preparing crash recovery via restore", async () => {
 	expect(readFileSync(buildRecordPath(h), "utf8")).toContain(`"round":2`);
 });
 
-test("P2-1: gating without lease → restore self-heals", async () => {
+test("P2-1: gating without lease → legacy restore self-heals", async () => {
 	const h = createHarness();
 	await enterDocumentationBuild(h);
 	await completeBuildEvidence(h, "bun test lease-1");
@@ -287,7 +290,7 @@ test("P2-1: gating without lease → restore self-heals", async () => {
 	await h.handlers.get("session_switch")!({}, h.ctx);
 	const after = h.states.at(-1) as Record<string, unknown>;
 	expect(after.phase).toBe("building");
-	expect(after.gateRetryMode).toBeUndefined();
+	expect(after.gateRetryMode).toBe("evidence");
 });
 
 test("P2-2: TBD placeholder handoff → NEEDS_UPDATE", () => {

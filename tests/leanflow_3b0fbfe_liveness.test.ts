@@ -8,6 +8,7 @@ import { canonicalGateTask } from "../extensions/leanflow/guard";
 import { assessHandoff } from "../extensions/leanflow/handoff";
 import { checkInvariants } from "../extensions/leanflow/machine";
 import leanflow, { resolveRunMarkerPath } from "../extensions/leanflow/index";
+import { STATE_VERSION } from "../extensions/leanflow/state";
 
 // Liveness coverage for the 3b0fbfe follow-up plan §4: every fail-closed path
 // must also expose a typed, verifiable recovery path.
@@ -70,6 +71,7 @@ function createHarness(): Harness {
 		registerCommand: (name: string, def: unknown) => commands.set(name, def as never),
 		registerTool: (def: Record<string, unknown>) => tools.set(def.name as string, def as never),
 		exec: async (command: string, args: string[]) => {
+			if (command === "bun") return { stdout: "1 pass\n0 fail\nRan 1 test.\n", stderr: "", code: 0, killed: false };
 			if (command !== "git") return { stdout: "", stderr: `unexpected: ${command}`, code: 127, killed: false };
 			if (args[0] === "rev-parse") return { stdout: `${"a".repeat(40)}\n`, stderr: "", code: 0, killed: false };
 			if (args[0] === "status" || args[0] === "ls-files") return { stdout: "", stderr: "", code: 0, killed: false };
@@ -178,20 +180,25 @@ async function executeRegisteredTool(h: Harness, name: string, params: Record<st
 	if (guard && typeof guard === "object" && "block" in guard && (guard as Record<string, unknown>).block === true) throw new Error(`blocked: ${JSON.stringify(guard)}`);
 	return h.tools.get(name)!.execute(toolCallId, params, undefined, undefined, h.ctx);
 }
-async function recordSuccessfulValidation(h: Harness, command: string, output = "1 pass\n0 fail\nRan 1 test.") {
-	const toolCallId = `validation-${h.states.length}`;
-	const guard = await h.handlers.get("tool_call")!({ toolName: "bash", toolCallId, input: { command } }, h.ctx);
-	if (guard && typeof guard === "object" && "block" in guard && (guard as Record<string, unknown>).block === true) throw new Error(`validation blocked: ${JSON.stringify(guard)}`);
-	await h.handlers.get("tool_result")!({ toolName: "bash", toolCallId, isError: false, details: {}, content: [{ type: "text", text: output }] }, h.ctx);
+async function recordSuccessfulValidation(h: Harness, command: string) {
+	const state = lastState(h);
+	const contract = state.approvedValidationContract as {
+		validations: Array<{ id: string; displayCommand: string }>;
+	};
+	const validation =
+		contract.validations.find((candidate) => candidate.displayCommand === command) ?? contract.validations[0];
+	if (!validation) throw new Error(`approved validation not found: ${command}`);
+	const result = await executeRegisteredTool(h, "leanflow_run_validation", { validationId: validation.id });
+	if ((result as Record<string, unknown>).isError) throw new Error(`validation failed: ${JSON.stringify(result)}`);
 }
-async function completeBuildEvidence(h: Harness, command = "bun test tests/*.test.ts") {
+async function completeBuildEvidence(h: Harness, command = "bun test tests/leanflow_lsp_guard.test.ts") {
 	const st = lastState(h);
 	if (st.baselineCaptured !== true) {
 		const cap = await executeRegisteredTool(h, "leanflow_capture_baseline", {});
 		if ((cap as Record<string, unknown>).isError) throw new Error(`baseline failed: ${JSON.stringify(cap)}`);
 	}
 	await recordSuccessfulValidation(h, command);
-	const fin = await executeRegisteredTool(h, "leanflow_finalize_artifacts", { validationCommands: [command] });
+	const fin = await executeRegisteredTool(h, "leanflow_finalize_artifacts", {});
 	if ((fin as Record<string, unknown>).isError) throw new Error(`finalize failed: ${JSON.stringify(fin)}`);
 }
 
@@ -320,7 +327,7 @@ test("liveness 4: crash window B (record already round 2, lease pending) commits
 	expect(lastState(h).phase).toBe("finalizing");
 });
 
-test("liveness 5a: v2 repair_preparing without lease migrates out instead of deadlocking", async () => {
+test("liveness 5a: v2 repair_preparing without lease migrates to human recovery", async () => {
 	const h = createHarness();
 	await enterDocumentationBuild(h);
 	await completeBuildEvidence(h, "bun test live-five-a");
@@ -336,7 +343,7 @@ test("liveness 5a: v2 repair_preparing without lease migrates out instead of dea
 	});
 
 	expect(lastState(h).phase).toBe("awaiting_human");
-	expect(lastState(h).stateVersion).toBe(5);
+	expect(lastState(h).stateVersion).toBe(STATE_VERSION);
 });
 
 test("liveness 5b: v3 repair_preparing without lease self-heals from the durable record", async () => {
@@ -456,7 +463,7 @@ test("liveness 9: verification accepts approved command shapes and rejects dange
 		"bun test tests/a.test.ts\nrm -rf /",
 	]) {
 		const result = assessHandoff(handoffPlan(["- extensions/leanflow/index.ts"], [command]));
-		expect(result.blockers.map((blocker) => blocker.code)).toContain("VERIFICATION_MISSING");
+		expect(result.blockers.map((blocker) => blocker.code)).toContain("VERIFICATION_INVALID");
 	}
 });
 
