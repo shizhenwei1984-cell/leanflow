@@ -3,6 +3,7 @@ import {
 	STATE_VERSION,
 	type BlockedReasonCode,
 	type GateOutcome,
+	type GateRecoveryAction,
 	type LeanFlowState,
 	type RepositoryFingerprint,
 	type RunMarkerStatus,
@@ -50,10 +51,12 @@ export type GateEvent =
 			lspEvidencePresent: boolean;
 	  }
 	| { type: "repair_round_failed"; reason: string }
-	| { type: "snapshot_evidence_invalid"; reason: string }
-	| { type: "snapshot_record_invalid"; reason: string }
-	| { type: "snapshot_plan_drift"; reason: string }
-	| { type: "repository_changed_during_gate"; reason: string }
+	| { type: "snapshot_invalid"; reason: string }
+	| { type: "record_invalid"; reason: string; checkpointRecoverable: boolean }
+	| { type: "plan_drift"; reason: string }
+	| { type: "contract_invalid"; reason: string }
+	| { type: "lease_invalid"; reason: string }
+	| { type: "repository_changed"; reason: string }
 	| { type: "blocked_no_progress"; reason: string }
 	| { type: "human_continue"; now: number }
 	| { type: "human_finish_failed"; now: number };
@@ -64,8 +67,10 @@ export type GateEvent =
  */
 export type SnapshotFailureKind =
 	| "artifact_rebuildable"
+	| "manifest_missing"
 	| "record_invalid"
 	| "plan_drift"
+	| "validation_contract_invalid"
 	| "lease_invalid"
 	| "repository_changed"
 	| "snapshot_changed"
@@ -105,14 +110,18 @@ export function reduceGate(state: LeanFlowState, event: GateEvent): { effects: E
 			return reduceRepairRoundReady(state, event as Extract<GateEvent, { type: "repair_round_ready" }>);
 		case "repair_round_failed":
 			return reduceRepairRoundFailed(state, event);
-		case "snapshot_evidence_invalid":
-			return reduceSnapshotEvidenceInvalid(state, event);
-		case "snapshot_record_invalid":
-			return reduceSnapshotRecordInvalid(state, event);
-		case "snapshot_plan_drift":
-			return reduceSnapshotPlanDrift(state);
-		case "repository_changed_during_gate":
-			return reduceRepositoryChangedDuringGate(state, event);
+		case "snapshot_invalid":
+			return reduceSnapshotInvalid(state, event);
+		case "record_invalid":
+			return reduceRecordInvalid(state, event);
+		case "plan_drift":
+			return reducePlanOrContractInvalid(state, event, "repair_plan_and_reapprove");
+		case "contract_invalid":
+			return reducePlanOrContractInvalid(state, event, "repair_plan_and_reapprove");
+		case "lease_invalid":
+			return reduceLeaseInvalid(state, event);
+		case "repository_changed":
+			return reduceRepositoryChanged(state, event);
 		case "blocked_no_progress":
 			return reduceBlockedNoProgress(state, event);
 		case "human_continue":
@@ -269,6 +278,7 @@ function reduceGateDispatch(
 		repositoryFingerprint: event.repositoryFingerprint,
 	};
 	state.gateAttempt = cycle;
+	state.recoveryAction = undefined;
 	state.phase = "gating";
 	return { effects: [] };
 }
@@ -506,6 +516,7 @@ function reduceRepairRoundReady(
 		state.lspProbeStatus = lspRequired && !event.lspEvidencePresent ? "pending" : lspRequired ? "completed" : "not_required";
 	}
 	state.phase = "building";
+	state.recoveryAction = undefined;
 	state.repairLease = undefined;
 	return {
 		effects: [
@@ -543,32 +554,8 @@ function reduceRepairRoundFailed(
 }
 
 function reduceRestoreReconcile(state: LeanFlowState): { effects: Effect[] } {
-	if (state.phase === "gating" && (!state.gateLease || !state.finalizedGateSnapshot)) {
-		state.gateLease = undefined;
-		state.gateRetryMode = undefined;
-		state.operationalRetrySnapshot = undefined;
-		state.baselineCaptured = false;
-		state.phase = "awaiting_human";
-		return {
-			effects: [
-				{ kind: "write_marker", status: "paused" },
-				{ kind: "notify", level: "warning", message: "Gate provenance is incomplete; restored to human recovery." },
-			],
-		};
-	}
 	if (state.phase === "building" && state.lspProbeStatus === "pending") {
 		state.lspLease = undefined;
-	}
-	if (state.phase === "building" && state.gateRetryMode === "operational" && !state.operationalRetrySnapshot) {
-		state.gateRetryMode = undefined;
-		state.baselineCaptured = false;
-		state.phase = "awaiting_human";
-		return {
-			effects: [
-				{ kind: "write_marker", status: "paused" },
-				{ kind: "notify", level: "warning", message: "Operational retry identity is missing; restored to human recovery." },
-			],
-		};
 	}
 	return { effects: [] };
 }
@@ -583,8 +570,8 @@ function reduceHumanContinue(state: LeanFlowState): { effects: Effect[] } {
 	state.finalizedGateSnapshot = undefined;
 	state.operationalRetrySnapshot = undefined;
 	state.writtenArtifacts = [];
-	resetConsecutiveGateErrors(state);
 	resetBlockedRecovery(state);
+	state.recoveryAction = undefined;
 	const fromRound = state.currentBuildRound ?? state.gateAttempt;
 	state.repairLease = { fromRound, toRound: fromRound + 1, reason: "human_continue", startedAt: Date.now() };
 	state.phase = "repair_preparing";
@@ -596,44 +583,46 @@ function reduceHumanContinue(state: LeanFlowState): { effects: Effect[] } {
 	};
 }
 
-function reduceRepositoryChangedDuringGate(
-	state: LeanFlowState,
-	event: Extract<GateEvent, { type: "repository_changed_during_gate" }>,
-): { effects: Effect[] } {
-	if (state.phase !== "gating") return { effects: [] };
+
+function clearGateProvenanceForRecovery(state: LeanFlowState, resetBlockedBoundary: boolean): void {
 	state.gateLease = undefined;
+	state.repairLease = undefined;
 	state.gateRetryMode = undefined;
 	state.finalizedGateSnapshot = undefined;
 	state.operationalRetrySnapshot = undefined;
 	state.writtenArtifacts = [];
-	state.buildMutationObserved = true;
 	resetConsecutiveGateErrors(state);
-	resetBlockedRecovery(state);
+	if (resetBlockedBoundary) resetBlockedRecovery(state);
+}
+
+function reduceRepositoryChanged(
+	state: LeanFlowState,
+	event: Extract<GateEvent, { type: "repository_changed" }>,
+): { effects: Effect[] } {
+	if (state.phase !== "building" && state.phase !== "gating") return { effects: [] };
+	clearGateProvenanceForRecovery(state, false);
+	state.buildMutationObserved = true;
+	state.recoveryAction = undefined;
 	state.phase = "building";
 	return {
 		effects: [
 			{
 				kind: "notify",
 				level: "warning",
-				message: `Gate result was discarded because repository state changed during review: ${event.reason}`,
+				message: `Gate result was discarded because repository state changed: ${event.reason}`,
 			},
 		],
 	};
 }
 
-function reduceSnapshotEvidenceInvalid(
+function reduceSnapshotInvalid(
 	state: LeanFlowState,
-	event: Extract<GateEvent, { type: "snapshot_evidence_invalid" }>,
+	event: Extract<GateEvent, { type: "snapshot_invalid" }>,
 ): { effects: Effect[] } {
-	if (state.phase !== "gating") return { effects: [] };
-
-	state.gateLease = undefined;
+	if (state.phase !== "building" && state.phase !== "gating") return { effects: [] };
+	clearGateProvenanceForRecovery(state, false);
 	state.gateRetryMode = "evidence";
-	state.finalizedGateSnapshot = undefined;
-	state.operationalRetrySnapshot = undefined;
-	state.writtenArtifacts = [];
-	resetConsecutiveGateErrors(state);
-	resetBlockedRecovery(state);
+	state.recoveryAction = undefined;
 	state.phase = "building";
 	return {
 		effects: [
@@ -646,7 +635,7 @@ function reduceBlockedNoProgress(
 	state: LeanFlowState,
 	event: Extract<GateEvent, { type: "blocked_no_progress" }>,
 ): { effects: Effect[] } {
-	if (state.phase !== "building" || state.gateRetryMode !== "evidence" || !state.blockedRecovery) {
+	if (state.phase !== "building" || !state.blockedRecovery) {
 		return { effects: [] };
 	}
 	state.blockedRecovery.consecutiveEquivalentBlocked = MAX_SAME_SNAPSHOT_BLOCKED;
@@ -667,54 +656,91 @@ function reduceBlockedNoProgress(
 	};
 }
 
-function reduceSnapshotRecordInvalid(
+function reduceRecordInvalid(
 	state: LeanFlowState,
-	event: Extract<GateEvent, { type: "snapshot_record_invalid" }>,
+	event: Extract<GateEvent, { type: "record_invalid" }>,
 ): { effects: Effect[] } {
-	if (state.phase !== "gating") return { effects: [] };
-
-	state.gateLease = undefined;
-	state.repairLease = undefined;
-	state.gateRetryMode = undefined;
-	state.finalizedGateSnapshot = undefined;
-	state.operationalRetrySnapshot = undefined;
-	state.writtenArtifacts = [];
+	if (state.phase !== "building" && state.phase !== "gating") return { effects: [] };
+	clearGateProvenanceForRecovery(state, false);
+	if (event.checkpointRecoverable) {
+		state.gateRetryMode = "evidence";
+		state.recoveryAction = "refinalize_trusted_checkpoint";
+		state.phase = "building";
+		return {
+			effects: [
+				{
+					kind: "notify",
+					level: "warning",
+					message: `BUILD record no longer matches the Gate manifest: ${event.reason}; re-finalize the trusted checkpoint.`,
+				},
+			],
+		};
+	}
 	state.baselineCaptured = false;
-	resetConsecutiveGateErrors(state);
-	resetBlockedRecovery(state);
+	state.recoveryAction = "flowcontinue_rebuild_checkpoint";
 	state.phase = "awaiting_human";
 	return {
 		effects: [
 			{ kind: "write_marker", status: "paused" },
-			{ kind: "notify", level: "warning", message: `BUILD record invalid: ${event.reason}; use /flowcontinue or /flowcancel.` },
+			{
+				kind: "notify",
+				level: "warning",
+				message: `BUILD record invalid: ${event.reason}; use /flowcontinue to rebuild a fresh checkpoint.`,
+			},
 		],
 	};
 }
 
-function reduceSnapshotPlanDrift(state: LeanFlowState): { effects: Effect[] } {
-	if (state.phase !== "gating") return { effects: [] };
-
-	// The approved plan changed under an in-flight Gate: discard the whole
-	// Gate cycle so re-approval starts from a fresh BUILD record round. The
-	// captured baseline and any repair lease belong to the invalidated cycle;
-	// keeping them would violate checkInvariants once the run leaves the
-	// build phases via refreshCanonicalPlanState.
-	state.gateLease = undefined;
-	state.repairLease = undefined;
+function reducePlanOrContractInvalid(
+	state: LeanFlowState,
+	event: Extract<GateEvent, { type: "plan_drift" | "contract_invalid" }>,
+	recoveryAction: GateRecoveryAction,
+): { effects: Effect[] } {
+	if (state.phase !== "building" && state.phase !== "gating") return { effects: [] };
+	clearGateProvenanceForRecovery(state, true);
 	state.baselineCaptured = false;
-	state.gateCalls = 0;
-	state.gateAttempt = 0;
-	state.gateDispatches = 0;
-	state.gateRetryMode = undefined;
 	state.currentBuildRound = undefined;
 	state.approvedValidationContract = undefined;
 	state.approvedValidationDigest = undefined;
-	state.finalizedGateSnapshot = undefined;
-	state.operationalRetrySnapshot = undefined;
-	state.writtenArtifacts = [];
-	resetConsecutiveGateErrors(state);
-	resetBlockedRecovery(state);
-	return { effects: [] };
+	state.proposalBoundary = undefined;
+	state.approvalRepairBoundary = undefined;
+	state.proposedPlanArtifact = undefined;
+	state.proposedPlanDigest = undefined;
+	state.approvedPlanArtifact = undefined;
+	state.approvalInvalidated = true;
+	state.lspLease = undefined;
+	state.recoveryAction = recoveryAction;
+	state.phase = "planning";
+	return {
+		effects: [
+			{
+				kind: "notify",
+				level: "warning",
+				message: `${event.type === "plan_drift" ? "Canonical plan drifted" : "Approved validation contract is invalid"}: ${event.reason}; repair and re-propose the plan.`,
+			},
+		],
+	};
+}
+
+function reduceLeaseInvalid(
+	state: LeanFlowState,
+	event: Extract<GateEvent, { type: "lease_invalid" }>,
+): { effects: Effect[] } {
+	if (state.phase !== "building" && state.phase !== "gating") return { effects: [] };
+	clearGateProvenanceForRecovery(state, false);
+	state.baselineCaptured = false;
+	state.recoveryAction = "flowcontinue_after_lease_failure";
+	state.phase = "awaiting_human";
+	return {
+		effects: [
+			{ kind: "write_marker", status: "paused" },
+			{
+				kind: "notify",
+				level: "warning",
+				message: `Gate lease is invalid: ${event.reason}; use /flowcontinue after resolving the provenance issue.`,
+			},
+		],
+	};
 }
 
 function reduceHumanFinishFailed(state: LeanFlowState): { effects: Effect[] } {

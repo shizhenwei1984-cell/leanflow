@@ -1695,7 +1695,18 @@ test("snapshot preflight rejects a stale canonical plan without consuming Gate b
 		block: true,
 		reason: expect.stringContaining("canonical plan digest changed after finalization"),
 	});
-	expect(harness.states.at(-1)).toMatchObject({ phase: "building", gateCalls: 0, gateAttempt: 0 });
+	expect(harness.states.at(-1)).toMatchObject({
+		phase: "awaiting_approval",
+		gateCalls: 0,
+		gateAttempt: 0,
+		gateDispatches: 0,
+		approvedPlanArtifact: undefined,
+		approvedValidationContract: undefined,
+		finalizedGateSnapshot: undefined,
+		gateLease: undefined,
+		gateRetryMode: undefined,
+		recoveryAction: "repair_plan_and_reapprove",
+	});
 });
 
 test("snapshot preflight rejects a mismatched BUILD record without dispatching Gate", async () => {
@@ -1713,11 +1724,15 @@ test("snapshot preflight rejects a mismatched BUILD record without dispatching G
 		),
 	).toMatchObject({
 		block: true,
-		reason: expect.stringContaining("BUILD record digest does not match the finalized manifest"),
+		reason: expect.stringContaining("BUILD record"),
 	});
-	expect(harness.states.at(-1)).toMatchObject({ phase: "building", gateCalls: 0, gateAttempt: 0 });
+	expect(harness.states.at(-1)).toMatchObject({
+		phase: "awaiting_human",
+		gateCalls: 0,
+		gateDispatches: 0,
+		recoveryAction: "flowcontinue_rebuild_checkpoint",
+	});
 });
-
 test("repair record setup failure pauses for human recovery", async () => {
 	const harness = createHarness();
 	await enterDocumentationBuild(harness);
@@ -1807,6 +1822,51 @@ test("session restoration reconciles an interrupted Gate as an interruption", as
 	});
 });
 
+test("restore keeps an operational retry live through fingerprint transport failure and redispatches unchanged", async () => {
+	const harness = createHarness();
+	await enterDocumentationBuild(harness);
+	await completeBuildEvidence(harness, "bun test restore-transport");
+	const call = harness.handlers.get("tool_call")!;
+	const result = harness.handlers.get("tool_result")!;
+	await call({ toolName: "task", toolCallId: "restore-transport-first", input: gateCallInput() }, harness.ctx);
+	harness.execResults.push({
+		stdout: "",
+		stderr: "fingerprint transport unavailable",
+		code: 1,
+		killed: false,
+	});
+
+	await harness.handlers.get("session_switch")!({}, harness.ctx);
+	expect(harness.states.at(-1)).toMatchObject({
+		phase: "building",
+		gateRetryMode: "operational",
+		gateLease: undefined,
+		finalizedGateSnapshot: expect.any(Object),
+		gateCalls: 0,
+		gateDispatches: 1,
+	});
+
+	expect(
+		await call({ toolName: "task", toolCallId: "restore-transport-retry", input: gateCallInput() }, harness.ctx),
+	).toBeUndefined();
+	expect(harness.states.at(-1)).toMatchObject({ phase: "gating", gateRetryMode: "operational", gateAttempt: 1 });
+	await result(
+		{
+			toolName: "task",
+			toolCallId: "restore-transport-retry",
+			isError: false,
+			content: [{ type: "text", text: JSON.stringify({ verdict: "PASS", findings: [] }) }],
+		},
+		harness.ctx,
+	);
+	expect(harness.states.at(-1)).toMatchObject({
+		phase: "finalizing",
+		terminalOutcome: "pass",
+		gateCalls: 1,
+		gateDispatches: 2,
+	});
+});
+
 test("findings-first nested BLOCKED Gate result returns to evidence recovery without consuming verdict budget", async () => {
 	const harness = createHarness();
 	await enterDocumentationBuild(harness);
@@ -1884,6 +1944,49 @@ test("findings-first nested BLOCKED Gate result returns to evidence recovery wit
 		expect(harness.states).toHaveLength(stateCountBefore);
 		expect(JSON.stringify(harness.states.at(-1))).toBe(stateBefore);
 	}
+});
+
+test("artifact recovery preserves BLOCKED semantic boundary until a new validation makes progress", async () => {
+	const harness = createHarness();
+	await enterDocumentationBuild(harness);
+	await completeBuildEvidence(harness, "bun test blocked-boundary");
+	const call = harness.handlers.get("tool_call")!;
+	const result = harness.handlers.get("tool_result")!;
+	await call({ toolName: "task", toolCallId: "blocked-boundary-first", input: gateCallInput() }, harness.ctx);
+	await result(
+		{
+			toolName: "task",
+			toolCallId: "blocked-boundary-first",
+			isError: false,
+			content: [{ type: "text", text: blockedGateText(harness) }],
+		},
+		harness.ctx,
+	);
+	const originalBoundary = (harness.states.at(-1) as PersistedState & { blockedRecovery?: { semanticEvidenceDigest: string } })
+		.blockedRecovery?.semanticEvidenceDigest;
+	expect(originalBoundary).toBeDefined();
+
+	// The premature Gate attempt cannot use the stale manifest, but artifact
+	// recovery must not erase the semantic BLOCKED boundary.
+	expect(
+		await call({ toolName: "task", toolCallId: "blocked-boundary-premature", input: gateCallInput() }, harness.ctx),
+	).toMatchObject({ block: true });
+	expect(
+		(harness.states.at(-1) as PersistedState & { blockedRecovery?: { semanticEvidenceDigest: string } }).blockedRecovery
+			?.semanticEvidenceDigest,
+	).toBe(originalBoundary);
+
+	const finalized = await executeRegisteredTool(harness, "leanflow_finalize_artifacts", {});
+	expect(finalized.isError).not.toBe(true);
+	expect(
+		await call({ toolName: "task", toolCallId: "blocked-boundary-unchanged", input: gateCallInput() }, harness.ctx),
+	).toMatchObject({ block: true });
+	expect(harness.states.at(-1)).toMatchObject({
+		phase: "awaiting_human",
+		gateCalls: 0,
+		gateDispatches: 1,
+		gateRetryMode: undefined,
+	});
 });
 
 test("evidence recovery accepts only approved validation IDs while Gate is in flight", async () => {
@@ -2457,6 +2560,7 @@ test("flowstatus is read-only in every phase and reports deep Gate readiness", a
 			"- Written artifacts: 0/3 (none / build, diff, evidence)",
 			"- LSP probe: pending",
 			"- Human repair cycles: 0",
+			"- Recovery action: none",
 			"- Gate readiness: BLOCKED: active run identity or validation contract is incomplete",
 		].join("\n"),
 	);

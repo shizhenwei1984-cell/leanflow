@@ -279,6 +279,80 @@ test("BLOCKED returns to BUILD without consuming a verdict", () => {
 	expect(checkInvariants(state)).toEqual([]);
 });
 
+test("typed provenance recovery events accept BUILD, Gate, and operational BUILD sources without consuming verdicts", () => {
+	const repository = buildingState();
+	attachFinalizedSnapshot(repository);
+	repository.baselineCaptured = true;
+	repository.gateRetryMode = "operational";
+	repository.operationalRetrySnapshot = createOperationalRetrySnapshot(
+		{
+			toolCallId: "old-gate",
+			kind: "gate",
+			runId: GATE_RUN_ID,
+			cycle: 1,
+			startedAt: 1,
+			snapshotDigest: finalizedGateSnapshotDigest(repository.finalizedGateSnapshot!),
+			planDigest,
+			buildRecordRound: 1,
+			repositoryFingerprint: repositoryFingerprint(),
+		},
+		repository.finalizedGateSnapshot!,
+		"tool_error",
+	);
+	const repositoryCalls = repository.gateCalls;
+	const repositoryDispatches = repository.gateDispatches;
+	reduceGate(repository, { type: "repository_changed", reason: "working tree changed" });
+	expect(repository).toMatchObject({
+		phase: "building",
+		baselineCaptured: true,
+		buildMutationObserved: true,
+		gateRetryMode: undefined,
+		finalizedGateSnapshot: undefined,
+		gateCalls: repositoryCalls,
+		gateDispatches: repositoryDispatches,
+	});
+	expect(checkInvariants(repository)).toEqual([]);
+
+	const plan = dispatch();
+	plan.baselineCaptured = true;
+	plan.gateCalls = 1;
+	const planDispatches = plan.gateDispatches;
+	reduceGate(plan, { type: "plan_drift", reason: "canonical plan changed" });
+	expect(plan).toMatchObject({
+		phase: "planning",
+		baselineCaptured: false,
+		approvedPlanArtifact: undefined,
+		approvedValidationContract: undefined,
+		finalizedGateSnapshot: undefined,
+		gateRetryMode: undefined,
+		gateCalls: 1,
+		gateDispatches: planDispatches,
+		recoveryAction: "repair_plan_and_reapprove",
+	});
+	expect(checkInvariants(plan)).toEqual([]);
+
+	const operational = dispatch(buildingState(), "operational-source");
+	reduceGate(operational, operationalEvent(operational, "gate_error"));
+	expect(operational.gateRetryMode).toBe("operational");
+	reduceGate(operational, { type: "snapshot_invalid", reason: "manifest is missing" });
+	expect(operational).toMatchObject({
+		phase: "building",
+		gateRetryMode: "evidence",
+		finalizedGateSnapshot: undefined,
+		operationalRetrySnapshot: undefined,
+	});
+	expect(checkInvariants(operational)).toEqual([]);
+
+	const lease = dispatch();
+	reduceGate(lease, { type: "lease_invalid", reason: "durable lease changed" });
+	expect(lease).toMatchObject({
+		phase: "awaiting_human",
+		gateLease: undefined,
+		recoveryAction: "flowcontinue_after_lease_failure",
+	});
+	expect(checkInvariants(lease)).toEqual([]);
+});
+
 test("operational errors return to BUILD until the fourth error pauses the run", () => {
 	const state = buildingState();
 

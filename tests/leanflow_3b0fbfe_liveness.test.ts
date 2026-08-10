@@ -37,6 +37,7 @@ type Harness = {
 	handlers: Map<string, (event: Record<string, unknown>, ctx: TestContext) => Promise<unknown>>;
 	states: Record<string, unknown>[];
 	tools: Map<string, { execute: (id: string, params: Record<string, unknown>, signal: unknown, onUpdate: unknown, ctx: TestContext) => Promise<Record<string, unknown>> }>;
+	setRepositoryDiff: (diff: string) => void;
 };
 
 function createHarness(): Harness {
@@ -47,6 +48,7 @@ function createHarness(): Harness {
 	const states: Record<string, unknown>[] = [];
 	const editorTexts: string[] = [];
 	const notifications: string[] = [];
+	let repositoryDiff = "";
 	const artifactsDir = mkdtempSync(join(tmpdir(), "leanflow-live-"));
 	mkdirSync(join(artifactsDir, "local"), { recursive: true });
 	mkdirSync(join(artifactsDir, "work", "src"), { recursive: true });
@@ -76,7 +78,10 @@ function createHarness(): Harness {
 			if (args[0] === "rev-parse") return { stdout: `${"a".repeat(40)}\n`, stderr: "", code: 0, killed: false };
 			if (args[0] === "status" || args[0] === "ls-files") return { stdout: "", stderr: "", code: 0, killed: false };
 			if (args[0] === "diff" && args.includes("--no-index")) return { stdout: "diff --git a/dev/null b/untracked\n", stderr: "", code: 1, killed: false };
-			if (args[0] === "diff") return { stdout: "", stderr: "", code: 0, killed: false };
+			if (args[0] === "diff" && args.includes("--name-only")) {
+				return { stdout: repositoryDiff ? "src/example.ts\0" : "", stderr: "", code: 0, killed: false };
+			}
+			if (args[0] === "diff") return { stdout: repositoryDiff, stderr: "", code: 0, killed: false };
 			return { stdout: "", stderr: `unexpected: ${args.join(" ")}`, code: 2, killed: false };
 		},
 		appendEntry: (customType: string, state: Record<string, unknown>) => {
@@ -86,7 +91,19 @@ function createHarness(): Harness {
 		},
 	};
 	leanflow(pi as never);
-	return { branch, commands, ctx, editorTexts, handlers, notifications, states, tools };
+	return {
+		branch,
+		commands,
+		ctx,
+		editorTexts,
+		handlers,
+		notifications,
+		setRepositoryDiff: (diff) => {
+			repositoryDiff = diff;
+		},
+		states,
+		tools,
+	};
 }
 
 const EXAMPLE_TASK = "example";
@@ -175,6 +192,33 @@ async function enterDocumentationBuild(h: Harness) {
 	];
 	await h.handlers.get("context")!({ messages: approvalMessages }, h.ctx);
 }
+
+async function reapproveCurrentPlan(h: Harness) {
+	const current = lastState(h);
+	const slug = current.planSlug as string;
+	const artifact = `local://${slug}-plan.md`;
+	const toolCallId = `reapprove-${h.states.length}`;
+	await h.handlers.get("tool_call")!(
+		{ toolName: "write", toolCallId, input: { path: "xd://propose", content: slug } },
+		h.ctx,
+	);
+	await h.handlers.get("tool_result")!({ toolName: "write", toolCallId, isError: false }, h.ctx);
+	h.branch.push({ type: "mode_change", mode: "none" });
+	await h.handlers.get("context")!(
+		{
+			messages: [
+				{ role: "user", content: "repair the approved plan", timestamp: 1 },
+				{ role: "assistant", content: [{ type: "toolCall", name: "write", arguments: { path: "xd://propose", content: slug } }], timestamp: 2 },
+				{
+					role: "developer",
+					content: [{ type: "text", text: `Plan approved.\n<instruction>\nYou MUST read \`${artifact}\` before executing.</instruction>` }],
+					timestamp: 3,
+				},
+			],
+		},
+		h.ctx,
+	);
+}
 async function executeRegisteredTool(h: Harness, name: string, params: Record<string, unknown>, toolCallId = `${name}-${h.states.length}`) {
 	const guard = await h.handlers.get("tool_call")!({ toolName: name, toolCallId, input: params }, h.ctx);
 	if (guard && typeof guard === "object" && "block" in guard && (guard as Record<string, unknown>).block === true) throw new Error(`blocked: ${JSON.stringify(guard)}`);
@@ -244,13 +288,17 @@ test("liveness 2: corrupt BUILD record recovers through a self-contained /flowco
 	const h = createHarness();
 	await enterDocumentationBuild(h);
 	await completeBuildEvidence(h, "bun test live-two");
-	await dispatchGate(h, "live-gate-record");
 	const rp = buildRecordPath(h);
 	writeFileSync(rp, JSON.stringify({ ...JSON.parse(readFileSync(rp, "utf8")), round: 99 }));
-
-	await gatePass(h, "live-gate-record");
+	const preflight = await h.handlers.get("tool_call")!(
+		{ toolName: "task", toolCallId: "live-gate-record", input: gateCallInput() },
+		h.ctx,
+	);
+	expect(preflight).toMatchObject({ block: true });
 	expect(lastState(h).phase).toBe("awaiting_human");
+	expect(lastState(h).recoveryAction).toBe("flowcontinue_rebuild_checkpoint");
 	expect(lastState(h).gateCalls).toBe(0);
+	expect(lastState(h).gateDispatches).toBe(0);
 	expect(JSON.parse(readFileSync(runMarkerPath(h), "utf8")).status).toBe("paused");
 
 	// /flowcontinue recreates the damaged record and re-enforces capture-first.
@@ -556,4 +604,242 @@ test("liveness 9: building round reconciliation persists the corrected gateAttem
 	const persisted = h.branch.at(-1) as { type: string; customType: string; data: Record<string, unknown> };
 	expect(persisted.customType).toBe("leanflow-state");
 	expect(persisted.data.gateAttempt).toBe(1);
+});
+
+test("typed preflight plan drift invalidates approval and completes a fresh BUILD to PASS", async () => {
+	const h = createHarness();
+	await enterDocumentationBuild(h);
+	await completeBuildEvidence(h, "bun test preflight-plan-drift");
+	const planPath = resolveRunMarkerPath(h.ctx.localProtocolOptions, gateArtifacts().plan)!;
+	writeFileSync(planPath, `${readFileSync(planPath, "utf8")}\nRefined acceptance wording.`);
+
+	const preflight = await h.handlers.get("tool_call")!(
+		{ toolName: "task", toolCallId: "preflight-plan-drift", input: gateCallInput() },
+		h.ctx,
+	);
+	expect(preflight).toMatchObject({ block: true });
+	expect(lastState(h)).toMatchObject({
+		phase: "awaiting_approval",
+		approvedPlanArtifact: undefined,
+		approvedValidationContract: undefined,
+		recoveryAction: "repair_plan_and_reapprove",
+		gateCalls: 0,
+		gateDispatches: 0,
+	});
+	expect(checkInvariants(lastState(h) as never)).toEqual([]);
+
+	await reapproveCurrentPlan(h);
+	expect(lastState(h)).toMatchObject({ phase: "building", baselineCaptured: false });
+	await completeBuildEvidence(h, "bun test preflight-plan-drift-rebuilt");
+	await dispatchGate(h, "preflight-plan-drift-rebuilt");
+	await gatePass(h, "preflight-plan-drift-rebuilt");
+	expect(lastState(h)).toMatchObject({ phase: "finalizing", terminalOutcome: "pass" });
+});
+
+test("operational retry repository drift returns to ordinary BUILD and completes without stale redispatch", async () => {
+	const h = createHarness();
+	await enterDocumentationBuild(h);
+	await completeBuildEvidence(h, "bun test operational-repository");
+	await dispatchGate(h, "operational-repository-first");
+	await h.handlers.get("tool_result")!(
+		{ toolName: "task", toolCallId: "operational-repository-first", isError: true, content: [] },
+		h.ctx,
+	);
+	expect(lastState(h)).toMatchObject({ phase: "building", gateRetryMode: "operational", gateDispatches: 1 });
+
+	h.setRepositoryDiff("diff --git a/src/example.ts b/src/example.ts\n");
+	const preflight = await h.handlers.get("tool_call")!(
+		{ toolName: "task", toolCallId: "operational-repository-drift", input: gateCallInput() },
+		h.ctx,
+	);
+	expect(preflight).toMatchObject({ block: true });
+	expect(lastState(h)).toMatchObject({
+		phase: "building",
+		gateRetryMode: undefined,
+		buildMutationObserved: true,
+		finalizedGateSnapshot: undefined,
+		gateCalls: 0,
+		gateDispatches: 1,
+	});
+
+	await completeBuildEvidence(h, "bun test operational-repository-rebuilt");
+	await dispatchGate(h, "operational-repository-rebuilt");
+	await gatePass(h, "operational-repository-rebuilt");
+	expect(lastState(h)).toMatchObject({ phase: "finalizing", gateDispatches: 2, terminalOutcome: "pass" });
+});
+
+test("repository change then revert preserves BLOCKED boundary and pauses unchanged evidence", async () => {
+	const h = createHarness();
+	await enterDocumentationBuild(h);
+	await completeBuildEvidence(h, "bun test repository-blocked-boundary");
+	await dispatchGate(h, "repository-blocked-first");
+	const contract = z.object({ validations: z.array(z.object({ id: z.string() })).min(1) }).parse(lastState(h).approvedValidationContract);
+	const evidenceId = contract.validations[0]!.id;
+	await h.handlers.get("tool_result")!(
+		{
+			toolName: "task",
+			toolCallId: "repository-blocked-first",
+			isError: false,
+			content: [
+				{
+					type: "text",
+					text: JSON.stringify({
+						verdict: "BLOCKED",
+						findings: [
+							{
+								category: "validation_failure",
+								severity: "blocking",
+								file: "local://example-evidence.md",
+								location: "verification",
+								issue: "Required validation evidence is missing.",
+								required_fix: "Run the missing validation and finalize evidence again.",
+							},
+						],
+						reason_code: "missing_validation",
+						evidence_ids: [evidenceId],
+					}),
+				},
+			],
+		},
+		h.ctx,
+	);
+	const blockedBoundary = lastState(h).blockedRecovery;
+	expect(blockedBoundary).toBeDefined();
+	const unchangedBeforeDrift = await executeRegisteredTool(h, "leanflow_finalize_artifacts", {});
+	expect(unchangedBeforeDrift).not.toMatchObject({ isError: true });
+
+
+	h.setRepositoryDiff("diff --git a/src/example.ts b/src/example.ts\n");
+	expect(
+		await h.handlers.get("tool_call")!(
+			{ toolName: "task", toolCallId: "repository-blocked-changed", input: gateCallInput() },
+			h.ctx,
+		),
+	).toMatchObject({ block: true });
+	expect(lastState(h)).toMatchObject({
+		phase: "building",
+		gateRetryMode: undefined,
+		buildMutationObserved: true,
+		blockedRecovery: blockedBoundary,
+		gateCalls: 0,
+		gateDispatches: 1,
+	});
+
+	h.setRepositoryDiff("");
+	const refinalized = await executeRegisteredTool(h, "leanflow_finalize_artifacts", {});
+	expect(refinalized).not.toMatchObject({ isError: true });
+	expect(
+		await h.handlers.get("tool_call")!(
+			{ toolName: "task", toolCallId: "repository-blocked-reverted", input: gateCallInput() },
+			h.ctx,
+		),
+	).toMatchObject({ block: true });
+	expect(lastState(h)).toMatchObject({
+		phase: "awaiting_human",
+		gateCalls: 0,
+		gateDispatches: 1,
+		gateRetryMode: undefined,
+	});
+	expect(h.notifications.some((message) => message.includes("made no semantic progress"))).toBe(true);
+});
+
+test("operational retry plan drift reopens approval without consuming a Gate verdict", async () => {
+	const h = createHarness();
+	await enterDocumentationBuild(h);
+	await completeBuildEvidence(h, "bun test operational-plan");
+	await dispatchGate(h, "operational-plan-first");
+	await h.handlers.get("tool_result")!(
+		{ toolName: "task", toolCallId: "operational-plan-first", isError: true, content: [] },
+		h.ctx,
+	);
+	const planPath = resolveRunMarkerPath(h.ctx.localProtocolOptions, gateArtifacts().plan)!;
+	writeFileSync(planPath, `${readFileSync(planPath, "utf8")}\nPlan changed while the Gate transport retried.`);
+
+	const preflight = await h.handlers.get("tool_call")!(
+		{ toolName: "task", toolCallId: "operational-plan-drift", input: gateCallInput() },
+		h.ctx,
+	);
+	expect(preflight).toMatchObject({ block: true });
+	expect(lastState(h)).toMatchObject({
+		phase: "awaiting_approval",
+		gateCalls: 0,
+		gateDispatches: 1,
+		recoveryAction: "repair_plan_and_reapprove",
+	});
+
+	await reapproveCurrentPlan(h);
+	await completeBuildEvidence(h, "bun test operational-plan-rebuilt");
+	await dispatchGate(h, "operational-plan-rebuilt");
+	await gatePass(h, "operational-plan-rebuilt");
+	expect(lastState(h)).toMatchObject({ phase: "finalizing", terminalOutcome: "pass" });
+});
+
+test("artifact invalidity has one evidence-recovery class at preflight, settlement, and restore", async () => {
+	const preflight = createHarness();
+	await enterDocumentationBuild(preflight);
+	await completeBuildEvidence(preflight, "bun test artifact-preflight");
+	rmSync(resolveRunMarkerPath(preflight.ctx.localProtocolOptions, gateArtifacts().evidence)!);
+	const preflightGuard = await preflight.handlers.get("tool_call")!(
+		{ toolName: "task", toolCallId: "artifact-preflight", input: gateCallInput() },
+		preflight.ctx,
+	);
+	expect(preflightGuard).toMatchObject({ block: true });
+
+	const settlement = createHarness();
+	await enterDocumentationBuild(settlement);
+	await completeBuildEvidence(settlement, "bun test artifact-settlement");
+	await dispatchGate(settlement, "artifact-settlement");
+	rmSync(resolveRunMarkerPath(settlement.ctx.localProtocolOptions, gateArtifacts().evidence)!);
+	await gatePass(settlement, "artifact-settlement");
+
+	const restore = createHarness();
+	await enterDocumentationBuild(restore);
+	await completeBuildEvidence(restore, "bun test artifact-restore");
+	await dispatchGate(restore, "artifact-restore");
+	rmSync(resolveRunMarkerPath(restore.ctx.localProtocolOptions, gateArtifacts().evidence)!);
+	await restore.handlers.get("session_switch")!({}, restore.ctx);
+
+	for (const [h, id] of [
+		[preflight, "artifact-preflight-rebuilt"],
+		[settlement, "artifact-settlement-rebuilt"],
+		[restore, "artifact-restore-rebuilt"],
+	] as const) {
+		expect(lastState(h)).toMatchObject({
+			phase: "building",
+			gateRetryMode: "evidence",
+			finalizedGateSnapshot: undefined,
+			gateCalls: 0,
+		});
+		expect(checkInvariants(lastState(h) as never)).toEqual([]);
+		await completeBuildEvidence(h, `bun test ${id}`);
+		await dispatchGate(h, id);
+		await gatePass(h, id);
+		expect(lastState(h)).toMatchObject({ phase: "finalizing", terminalOutcome: "pass" });
+	}
+});
+
+test("a structurally valid BUILD checkpoint with only digest drift re-finalizes without a human pause", async () => {
+	const h = createHarness();
+	await enterDocumentationBuild(h);
+	await completeBuildEvidence(h, "bun test trusted-checkpoint");
+	const recordPath = buildRecordPath(h);
+	writeFileSync(recordPath, `${readFileSync(recordPath, "utf8")}\n`);
+
+	const preflight = await h.handlers.get("tool_call")!(
+		{ toolName: "task", toolCallId: "trusted-checkpoint", input: gateCallInput() },
+		h.ctx,
+	);
+	expect(preflight).toMatchObject({ block: true });
+	expect(lastState(h)).toMatchObject({
+		phase: "building",
+		gateRetryMode: "evidence",
+		recoveryAction: "refinalize_trusted_checkpoint",
+		gateCalls: 0,
+		gateDispatches: 0,
+	});
+
+	await completeBuildEvidence(h, "bun test trusted-checkpoint-refinalized");
+	await dispatchGate(h, "trusted-checkpoint-refinalized");
+	await gatePass(h, "trusted-checkpoint-refinalized");
+	expect(lastState(h)).toMatchObject({ phase: "finalizing", terminalOutcome: "pass" });
 });

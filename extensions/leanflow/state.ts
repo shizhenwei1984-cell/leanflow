@@ -146,6 +146,16 @@ export interface BlockedRecoveryState {
 	consecutiveEquivalentBlocked: number;
 }
 
+/**
+ * The next explicit operator action after a provenance recovery pauses or
+ * invalidates the active Gate cycle. It is persisted so restored sessions do
+ * not reduce a safe recovery to an unexplained dead end.
+ */
+export type GateRecoveryAction =
+	| "repair_plan_and_reapprove"
+	| "refinalize_trusted_checkpoint"
+	| "flowcontinue_rebuild_checkpoint"
+	| "flowcontinue_after_lease_failure";
 
 export interface LeanFlowState {
 	phase: LeanFlowPhase;
@@ -235,6 +245,8 @@ export interface LeanFlowState {
 	consecutiveGateErrors?: number;
 	/** Persisted repair transaction lease for crash recovery. */
 	repairLease?: RepairLease;
+	/** Explicit next action after provenance recovery; cleared on successful redispatch or repair. */
+	recoveryAction?: GateRecoveryAction;
 	/** Persisted workflow schema version; absence implies v1 (pre-7614368). */
 	stateVersion?: number;
 	/** Runtime token/context statistics for the current run. */
@@ -546,11 +558,6 @@ function normalizeState(value: unknown): LeanFlowState {
 		gateLease = undefined;
 		writtenArtifacts = [];
 	}
-	if (gateRetryMode === "operational" && !operationalRetrySnapshot) {
-		phase = "awaiting_human";
-		gateRetryMode = undefined;
-		baselineCaptured = false;
-	}
 
 	const inferredBuildRound =
 		finalizedGateSnapshot?.buildRecordRound ??
@@ -647,6 +654,13 @@ function normalizeState(value: unknown): LeanFlowState {
 		finalizedGateSnapshot,
 		operationalRetrySnapshot,
 		blockedRecovery,
+		recoveryAction:
+			state.recoveryAction === "repair_plan_and_reapprove" ||
+			state.recoveryAction === "refinalize_trusted_checkpoint" ||
+			state.recoveryAction === "flowcontinue_rebuild_checkpoint" ||
+			state.recoveryAction === "flowcontinue_after_lease_failure"
+				? state.recoveryAction
+				: undefined,
 		consecutiveGateErrors:
 			typeof state.consecutiveGateErrors === "number" &&
 			Number.isFinite(state.consecutiveGateErrors) &&
