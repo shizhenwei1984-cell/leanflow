@@ -59,6 +59,12 @@ export type GateEvent =
 	| { type: "repository_changed"; reason: string }
 	| { type: "blocked_no_progress"; reason: string }
 	| { type: "finalization_authority_invalid"; reason: string }
+	| {
+			type: "legacy_evidence_migration";
+			fromVersion: 1 | 2;
+			baselineCaptured: boolean;
+			resumeTerminalPass: boolean;
+	  }
 	| { type: "human_continue"; now: number }
 	| { type: "human_finish_failed"; now: number };
 
@@ -127,6 +133,8 @@ export function reduceGate(state: LeanFlowState, event: GateEvent): { effects: E
 			return reduceBlockedNoProgress(state, event);
 		case "finalization_authority_invalid":
 			return reduceFinalizationAuthorityInvalid(state, event);
+		case "legacy_evidence_migration":
+			return reduceLegacyEvidenceMigration(state, event);
 		case "human_continue":
 			return reduceHumanContinue(state);
 		case "human_finish_failed":
@@ -143,8 +151,12 @@ export function checkInvariants(state: LeanFlowState): string[] {
 
 	const gateLease = state.gateLease;
 	const finalized = state.finalizedGateSnapshot;
+	const gateReady = state.phase === "gating" || finalized !== undefined;
 	if (!finalized && state.finalizationCommitNonce !== undefined) {
 		violations.push("finalization commit nonce requires a finalized Gate snapshot");
+	}
+	if (gateReady && (!finalized || !state.finalizationCommitNonce)) {
+		violations.push("Gate-ready state requires nonce-bound finalized authority");
 	}
 	if (state.phase === "gating") {
 		if (!gateLease) violations.push("gating phase requires a gate lease");
@@ -153,19 +165,24 @@ export function checkInvariants(state: LeanFlowState): string[] {
 		if (
 			gateLease &&
 			finalized &&
-			(gateLease.snapshotDigest !== finalizedGateSnapshotDigest(finalized) ||
+			(gateLease.runId !== finalized.runId ||
+				gateLease.snapshotDigest !== finalizedGateSnapshotDigest(finalized) ||
 				gateLease.planDigest !== finalized.planDigest ||
 				gateLease.buildRecordRound !== finalized.buildRecordRound ||
 				gateLease.repositoryFingerprint?.combinedDigest !== finalized.repositoryFingerprint.combinedDigest)
 		) {
 			violations.push("gating lease must match the finalized Gate snapshot");
 		}
+	} else if (gateLease) {
+		violations.push("gate lease is only valid while gating");
 	}
 	if (state.phase === "repair_preparing") {
 		if (state.gateRetryMode !== "repair") violations.push("repair_preparing phase requires gateRetryMode=repair");
 		if ((state.writtenArtifacts?.length ?? 0) !== 0) violations.push("repair_preparing phase requires no written artifacts");
 		if (!state.repairLease) violations.push("repair_preparing phase requires a repair lease");
 		if (state.finalizedGateSnapshot) violations.push("repair_preparing phase must not retain a finalized snapshot");
+	} else if (state.repairLease) {
+		violations.push("repair lease is only valid while preparing a repair round");
 	}
 	if (state.phase === "awaiting_human" && state.terminalOutcome !== undefined) {
 		violations.push("awaiting_human phase must not have a terminal outcome");
@@ -225,6 +242,9 @@ export function checkInvariants(state: LeanFlowState): string[] {
 		} else if (retry.finalizedSnapshotDigest !== finalizedGateSnapshotDigest(finalized)) {
 			violations.push("operational retry must retain the original finalized snapshot identity");
 		}
+		if (state.phase !== "building" && state.phase !== "gating") {
+			violations.push("operational retry is only valid during BUILD or Gate");
+		}
 	} else if (state.operationalRetrySnapshot) {
 		violations.push("operational retry snapshot is only valid in operational retry mode");
 	}
@@ -269,9 +289,12 @@ function reduceGateDispatch(
 		state.phase !== "building" ||
 		!event.repositoryFingerprint ||
 		!state.finalizedGateSnapshot ||
+		state.finalizationCommitNonce !== state.finalizedGateSnapshot.finalizationCommitNonce ||
+		event.runId !== state.finalizedGateSnapshot.runId ||
 		event.snapshotDigest !== finalizedGateSnapshotDigest(state.finalizedGateSnapshot) ||
 		event.planDigest !== state.finalizedGateSnapshot.planDigest ||
 		event.buildRecordRound !== state.currentBuildRound ||
+		event.buildRecordRound !== state.finalizedGateSnapshot.buildRecordRound ||
 		event.repositoryFingerprint.combinedDigest !== state.finalizedGateSnapshot.repositoryFingerprint.combinedDigest
 	) {
 		return { effects: [] };
@@ -649,6 +672,32 @@ function reduceSnapshotInvalid(
 	};
 }
 
+function reduceLegacyEvidenceMigration(
+	state: LeanFlowState,
+	event: Extract<GateEvent, { type: "legacy_evidence_migration" }>,
+): { effects: Effect[] } {
+	if (state.phase !== "building" && state.phase !== "gating" && state.phase !== "finalizing") {
+		return { effects: [] };
+	}
+	clearGateProvenanceForRecovery(state, false);
+	state.terminalOutcome = undefined;
+	state.baselineCaptured = event.baselineCaptured;
+	state.gateRetryMode = "evidence";
+	state.recoveryAction = event.resumeTerminalPass
+		? "refinalize_legacy_pass"
+		: "refinalize_trusted_checkpoint";
+	state.phase = "building";
+	return {
+		effects: [
+			{
+				kind: "notify",
+				level: "info",
+				message: `BUILD evidence v${event.fromVersion} requires a one-time v3 re-finalization.`,
+			},
+		],
+	};
+}
+
 function reduceBlockedNoProgress(
 	state: LeanFlowState,
 	event: Extract<GateEvent, { type: "blocked_no_progress" }>,
@@ -683,7 +732,9 @@ function reduceRecordInvalid(
 	clearGateProvenanceForRecovery(state, false);
 	if (event.checkpointRecoverable) {
 		state.gateRetryMode = "evidence";
-		state.recoveryAction = "refinalize_trusted_checkpoint";
+		if (state.recoveryAction !== "refinalize_legacy_pass") {
+			state.recoveryAction = "refinalize_trusted_checkpoint";
+		}
 		state.phase = "building";
 		return {
 			effects: [

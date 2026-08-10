@@ -843,3 +843,67 @@ test("a structurally valid BUILD checkpoint with only digest drift re-finalizes 
 	await gatePass(h, "trusted-checkpoint-refinalized");
 	expect(lastState(h)).toMatchObject({ phase: "finalizing", terminalOutcome: "pass" });
 });
+
+test("legacy nonce-less Gate authority persists a live v7 recovery and re-gates", async () => {
+	const h = createHarness();
+	await enterDocumentationBuild(h);
+	await completeBuildEvidence(h, "bun test legacy-nonce");
+	const persistedBefore = h.states.length;
+
+	await restoreFromCrafted(h, (crafted) => {
+		crafted.stateVersion = 6;
+		crafted.phase = "finalizing";
+		crafted.terminalOutcome = "pass";
+		delete crafted.finalizationCommitNonce;
+		delete crafted.gateLease;
+	});
+	expect(h.states.length).toBeGreaterThan(persistedBefore);
+
+	expect(lastState(h)).toMatchObject({
+		stateVersion: STATE_VERSION,
+		phase: "awaiting_human",
+		terminalOutcome: undefined,
+		finalizedGateSnapshot: undefined,
+		finalizationCommitNonce: undefined,
+		recoveryAction: "flowcontinue_rebuild_checkpoint",
+	});
+	expect(checkInvariants(lastState(h) as never)).toEqual([]);
+
+	await h.commands.get("flowcontinue")!.handler("rebuild legacy nonce authority", h.ctx);
+	expect(lastState(h)).toMatchObject({ phase: "building", gateRetryMode: "repair" });
+	await completeBuildEvidence(h, "bun test legacy-nonce-rebuilt");
+	await dispatchGate(h, "legacy-nonce-rebuilt");
+	await gatePass(h, "legacy-nonce-rebuilt");
+	expect(lastState(h)).toMatchObject({ phase: "finalizing", terminalOutcome: "pass" });
+});
+
+test("legacy incomplete operational retry pauses without invalid authority and rebuilds live", async () => {
+	const h = createHarness();
+	await enterDocumentationBuild(h);
+	await completeBuildEvidence(h, "bun test legacy-operational");
+
+	await restoreFromCrafted(h, (crafted) => {
+		crafted.stateVersion = 6;
+		crafted.phase = "building";
+		crafted.gateRetryMode = "operational";
+		delete crafted.operationalRetrySnapshot;
+		delete crafted.gateLease;
+	});
+
+	expect(lastState(h)).toMatchObject({
+		stateVersion: STATE_VERSION,
+		phase: "awaiting_human",
+		gateRetryMode: undefined,
+		gateLease: undefined,
+		operationalRetrySnapshot: undefined,
+		finalizedGateSnapshot: undefined,
+		finalizationCommitNonce: undefined,
+	});
+	expect(checkInvariants(lastState(h) as never)).toEqual([]);
+
+	await h.commands.get("flowcontinue")!.handler("rebuild incomplete operational retry", h.ctx);
+	await completeBuildEvidence(h, "bun test legacy-operational-rebuilt");
+	await dispatchGate(h, "legacy-operational-rebuilt");
+	await gatePass(h, "legacy-operational-rebuilt");
+	expect(lastState(h)).toMatchObject({ phase: "finalizing", terminalOutcome: "pass" });
+});

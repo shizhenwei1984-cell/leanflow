@@ -7,12 +7,13 @@ import {
 	MAX_GATE_ARTIFACT_BYTES,
 	composeCompleteDiff,
 	createBuildEvidenceRecord,
+	migrateBuildEvidenceRecord,
 	parseBuildEvidenceRecord,
 	renderBuildArtifacts,
 	selectValidationObservations,
 	validationSemanticStates,
 } from "../extensions/leanflow/evidence";
-import type { BuildEvidenceObservationV2, GitCommandEvidence } from "../extensions/leanflow/evidence";
+import type { BuildEvidenceObservationV3, GitCommandEvidence } from "../extensions/leanflow/evidence";
 import {
 	createApprovedValidationContract,
 	parseApprovedValidation,
@@ -44,7 +45,7 @@ const identity = { runId, planSlug, planDigest, approvedValidationDigest: contra
 function successfulObservation(
 	text = "1 pass\n0 fail\n2 expect() calls\nRan 1 test across 1 file.",
 	toolCallId = "validation-1",
-): BuildEvidenceObservationV2 {
+): BuildEvidenceObservationV3 {
 	return {
 		toolCallId,
 		operationId: `operation-${toolCallId}`,
@@ -181,6 +182,78 @@ test("legacy validation observations parse as history but cannot authorize the c
 		runId: "3f414c4c-8f8f-4dca-8df3-9e0fabada555",
 	});
 	expect(() => parseBuildEvidenceRecord(record, identity)).toThrow("provenance does not match");
+});
+
+test("v1 and v2 records migrate to v3 without granting historical or foreign provenance authority", () => {
+	const v1 = {
+		version: 1,
+		runId,
+		planSlug,
+		planDigest,
+		round: 1,
+		observations: [
+			{
+				toolCallId: "v1-bash",
+				toolName: "bash" as const,
+				command: "git diff --check",
+				isError: false,
+				exitCode: 0,
+				text: "",
+			},
+		],
+	};
+	const migratedV1 = migrateBuildEvidenceRecord(v1, identity);
+	expect(migratedV1).toMatchObject({ version: 3, ...identity });
+	expect(migratedV1.observations).toEqual(v1.observations);
+	expect(parseBuildEvidenceRecord(migratedV1, identity)).toBe(migratedV1);
+
+	const historyOnly = successfulObservation("historical v2");
+	delete historyOnly.operationId;
+	delete historyOnly.runId;
+	delete historyOnly.round;
+	delete historyOnly.planDigest;
+	delete historyOnly.approvedValidationDigest;
+	const migratedV2 = migrateBuildEvidenceRecord(
+		{
+			...createBuildEvidenceRecord(identity),
+			version: 2,
+			observations: [historyOnly],
+		},
+		identity,
+	);
+	expect(migratedV2.version).toBe(3);
+	expect(validationSemanticStates(migratedV2, contract, repositoryFingerprint)).toEqual([
+		{ id: approved.id, status: "missing" },
+	]);
+	expect(() => selectValidationObservations(migratedV2, contract, repositoryFingerprint)).toThrow("missing");
+
+	expect(() =>
+		migrateBuildEvidenceRecord(
+			{
+				...createBuildEvidenceRecord(identity),
+				version: 2,
+				observations: [
+					{
+						...successfulObservation("foreign v2"),
+						runId: "3f414c4c-8f8f-4dca-8df3-9e0fabada555",
+					},
+				],
+			},
+			identity,
+		),
+	).toThrow("provenance does not match");
+
+	const partial = successfulObservation("partial v2");
+	delete partial.runId;
+	delete partial.round;
+	delete partial.planDigest;
+	delete partial.approvedValidationDigest;
+	expect(() =>
+		migrateBuildEvidenceRecord(
+			{ ...createBuildEvidenceRecord(identity), version: 2, observations: [partial] },
+			identity,
+		),
+	).toThrow("incomplete operation provenance");
 });
 
 test("failed validation can become passed progress while unapproved history grants no authority", () => {

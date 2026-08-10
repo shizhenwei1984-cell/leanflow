@@ -286,11 +286,14 @@ test("P2-1: gating without lease → legacy restore self-heals", async () => {
 	corruptedGating.phase = "gating";
 	corruptedGating.stateVersion = 3;
 	delete corruptedGating.gateLease;
+	delete corruptedGating.finalizationCommitNonce;
 	branch.push({ type: "custom", customType: "leanflow-state", data: corruptedGating });
 	await h.handlers.get("session_switch")!({}, h.ctx);
 	const after = h.states.at(-1) as Record<string, unknown>;
-	expect(after.phase).toBe("building");
-	expect(after.gateRetryMode).toBe("evidence");
+	expect(after.phase).toBe("awaiting_human");
+	expect(after.gateRetryMode).toBeUndefined();
+	expect(after.finalizedGateSnapshot).toBeUndefined();
+	expect(after.recoveryAction).toBe("flowcontinue_after_lease_failure");
 });
 
 test("P2-2: TBD placeholder handoff → NEEDS_UPDATE", () => {

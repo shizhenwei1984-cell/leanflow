@@ -154,6 +154,57 @@ test("dispatch records a persisted lease without consuming a Gate verdict", () =
 	expect(checkInvariants(state)).toEqual([]);
 });
 
+test("dispatch rejects a foreign run even when every artifact digest matches", () => {
+	const state = buildingState();
+	attachFinalizedSnapshot(state);
+	const snapshot = state.finalizedGateSnapshot!;
+	reduceGate(state, {
+		type: "gate_dispatch",
+		toolCallId: "foreign-gate",
+		runId: "11111111-1111-4111-8111-111111111111",
+		snapshotDigest: finalizedGateSnapshotDigest(snapshot),
+		planDigest,
+		buildRecordRound: state.currentBuildRound!,
+		repositoryFingerprint: repositoryFingerprint(),
+		reuseCycle: false,
+		now: 10,
+	});
+	expect(state).toMatchObject({ phase: "building", gateDispatches: 0, gateAttempt: 0 });
+	expect(state.gateLease).toBeUndefined();
+	expect(checkInvariants(state)).toEqual([]);
+});
+
+test("legacy evidence migration revokes old authority before re-finalization", () => {
+	const state = buildingState();
+	attachFinalizedSnapshot(state);
+	state.phase = "finalizing";
+	state.terminalOutcome = "pass";
+	state.baselineCaptured = false;
+	const { effects } = reduceGate(state, {
+		type: "legacy_evidence_migration",
+		fromVersion: 2,
+		baselineCaptured: true,
+		resumeTerminalPass: true,
+	});
+	expect(state).toMatchObject({
+		phase: "building",
+		terminalOutcome: undefined,
+		finalizedGateSnapshot: undefined,
+		finalizationCommitNonce: undefined,
+		gateRetryMode: "evidence",
+		recoveryAction: "refinalize_legacy_pass",
+		baselineCaptured: true,
+	});
+	expect(effects.map((effect) => effect.kind)).toEqual(["notify"]);
+	reduceGate(state, {
+		type: "record_invalid",
+		reason: "v2 to v3 rewrite failed",
+		checkpointRecoverable: true,
+	});
+	expect(state.recoveryAction).toBe("refinalize_legacy_pass");
+	expect(checkInvariants(state)).toEqual([]);
+});
+
 test("PASS settles a verdict, preserves repair attribution, and finalizes", () => {
 	const state = buildingState();
 	state.gateRetryMode = "repair";

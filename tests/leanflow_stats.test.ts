@@ -3,6 +3,9 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { filterForBuilder } from "../extensions/leanflow/context";
 import { checkAgentBudget, checkTaskGuard, extractAgentRoles } from "../extensions/leanflow/guard";
 
+import { checkInvariants } from "../extensions/leanflow/machine";
+import { createFinalizedGateSnapshot } from "../extensions/leanflow/provenance";
+import { createApprovedValidationContract, parseApprovedValidation } from "../extensions/leanflow/validation";
 import { CUSTOM_TYPE, STATE_VERSION, defaultState, restoreState } from "../extensions/leanflow/state";
 import {
 	addUsage,
@@ -146,6 +149,100 @@ test("restore pauses a successful finalizing state without nonce-bound authority
 		finalizationCommitNonce: undefined,
 		recoveryAction: "flowcontinue_rebuild_checkpoint",
 	});
+});
+
+test("state v6 migration invalidates foreign nonce authority and incomplete operational retry without invariant debt", () => {
+	const runId = "11111111-1111-4111-8111-111111111111";
+	const planDigest = "a".repeat(64);
+	const contract = createApprovedValidationContract(planDigest, [parseApprovedValidation("make test")!]);
+	const snapshot = createFinalizedGateSnapshot({
+		runId,
+		planSlug: "legacy",
+		planDigest,
+		approvedValidationDigest: contract.digest,
+		buildRecordRound: 1,
+		buildRecordDigest: "b".repeat(64),
+		buildArtifactDigest: "c".repeat(64),
+		diffArtifactDigest: "d".repeat(64),
+		evidenceArtifactDigest: "e".repeat(64),
+		repositoryFingerprint: {
+			head: "f".repeat(40),
+			trackedDiffDigest: "1".repeat(64),
+			untrackedDigest: "2".repeat(64),
+			combinedDigest: "3".repeat(64),
+		},
+		validationStates: [{ id: contract.validations[0]!.id, status: "passed", observationId: "validation-1" }],
+	});
+	const completeLegacy = {
+		...defaultState(),
+		stateVersion: 6,
+		phase: "finalizing" as const,
+		terminalOutcome: "pass" as const,
+		runId,
+		planSlug: "legacy",
+		planDigest,
+		approvedValidationContract: contract,
+		approvedValidationDigest: contract.digest,
+		currentBuildRound: 1,
+		finalizedGateSnapshot: snapshot,
+		finalizationCommitNonce: "22222222-2222-4222-8222-222222222222",
+	};
+	const nonceInvalid = restoreState([{ type: "custom", customType: CUSTOM_TYPE, data: completeLegacy }]);
+	expect(nonceInvalid).toMatchObject({
+		stateVersion: STATE_VERSION,
+		phase: "awaiting_human",
+		terminalOutcome: undefined,
+		finalizedGateSnapshot: undefined,
+		finalizationCommitNonce: undefined,
+		recoveryAction: "flowcontinue_rebuild_checkpoint",
+	});
+	expect(checkInvariants(nonceInvalid)).toEqual([]);
+
+	const nonceValid = restoreState([
+		{
+			type: "custom",
+			customType: CUSTOM_TYPE,
+			data: {
+				...completeLegacy,
+				finalizationCommitNonce: snapshot.finalizationCommitNonce,
+			},
+		},
+	]);
+	expect(nonceValid).toMatchObject({
+		stateVersion: STATE_VERSION,
+		phase: "finalizing",
+		terminalOutcome: "pass",
+		finalizedGateSnapshot: snapshot,
+		finalizationCommitNonce: snapshot.finalizationCommitNonce,
+	});
+	expect(checkInvariants(nonceValid)).toEqual([]);
+
+	const incompleteOperational = restoreState([
+		{
+			type: "custom",
+			customType: CUSTOM_TYPE,
+			data: {
+				...completeLegacy,
+				phase: "building",
+				terminalOutcome: undefined,
+				finalizationCommitNonce: snapshot.finalizationCommitNonce,
+				gateRetryMode: "operational",
+				baselineCaptured: true,
+				operationalRetrySnapshot: undefined,
+			},
+		},
+	]);
+	expect(incompleteOperational).toMatchObject({
+		stateVersion: STATE_VERSION,
+		phase: "awaiting_human",
+		gateRetryMode: undefined,
+		gateLease: undefined,
+		operationalRetrySnapshot: undefined,
+		finalizedGateSnapshot: undefined,
+		finalizationCommitNonce: undefined,
+		baselineCaptured: false,
+	});
+	expect(checkInvariants(incompleteOperational)).toEqual([]);
 });
 
 test("restore re-parses legacy approved validations into a canonical contract", () => {

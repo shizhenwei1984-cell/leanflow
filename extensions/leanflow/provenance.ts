@@ -11,6 +11,11 @@ export const OPERATIONAL_RETRY_SNAPSHOT_VERSION = 1 as const;
 
 export type OperationalInterruption = "tool_error" | "session_switch" | "transport_error" | "invalid_gate_output";
 
+/**
+ * Durable Gate authority. Finalization writes and rereads this manifest, then
+ * publishes its nonce-bound candidate state; stale or partial candidates never
+ * become live authority.
+ */
 export interface FinalizedGateSnapshot {
 	version: 2;
 	/** Cryptographically unpredictable commit binding shared only with the durable state entry. */

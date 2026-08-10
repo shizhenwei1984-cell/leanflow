@@ -6,7 +6,11 @@ import {
 	type ValidationSemanticState,
 } from "./validation";
 
-export const BUILD_EVIDENCE_RECORD_VERSION = 2 as const;
+/**
+ * Current durable BUILD record format. Versions 1 and 2 are readable only
+ * through `migrateBuildEvidenceRecord`; every newly created record is v3.
+ */
+export const BUILD_EVIDENCE_RECORD_VERSION = 3 as const;
 export const MAX_GATE_ARTIFACT_BYTES = 1024 * 1024;
 
 export interface ParsedLspRequest {
@@ -21,9 +25,13 @@ export interface ParsedLspRequest {
 	payload?: string;
 }
 
-export interface BuildEvidenceObservationV2 {
+/**
+ * One immutable BUILD operation result. The five provenance fields bind a
+ * current observation to a particular session/run/round/plan/contract. An
+ * observation lacking all five fields is retained strictly as legacy history.
+ */
+export interface BuildEvidenceObservationV3 {
 	toolCallId: string;
-	/** Immutable operation provenance; absent only on historical observations. */
 	operationId?: string;
 	runId?: string;
 	round?: number;
@@ -45,12 +53,40 @@ export interface BuildEvidenceObservationV2 {
 	text: string;
 }
 
-export interface BuildEvidenceBaselineV2 {
+/** v2 used the same observation fields but is a migration-only record format. */
+export type BuildEvidenceObservationV2 = BuildEvidenceObservationV3;
+
+/** v1 has no validation or operation-provenance fields and is history-only. */
+export interface BuildEvidenceObservationV1 {
+	toolCallId: string;
+	toolName: "bash" | "lsp";
+	command?: string;
+	lspRequest?: ParsedLspRequest;
+	isError: boolean;
+	exitCode?: number;
+	timedOut?: boolean;
+	text: string;
+}
+
+export interface BuildEvidenceBaselineV3 {
 	head: string;
 	status: string;
 	capturedAt: number;
 }
 
+/** Current record, keyed by immutable operation identity. */
+export interface BuildEvidenceRecordV3 {
+	version: 3;
+	runId: string;
+	planSlug: string;
+	planDigest: string;
+	approvedValidationDigest: string;
+	round: number;
+	baseline?: BuildEvidenceBaselineV3;
+	observations: BuildEvidenceObservationV3[];
+}
+
+/** v2 is accepted only as input to the explicit v2→v3 migration. */
 export interface BuildEvidenceRecordV2 {
 	version: 2;
 	runId: string;
@@ -58,10 +94,26 @@ export interface BuildEvidenceRecordV2 {
 	planDigest: string;
 	approvedValidationDigest: string;
 	round: number;
-	baseline?: BuildEvidenceBaselineV2;
+	baseline?: BuildEvidenceBaselineV3;
 	observations: BuildEvidenceObservationV2[];
 }
 
+/** v1 is accepted only as input to the explicit v1→v3 migration. */
+export interface BuildEvidenceRecordV1 {
+	version: 1;
+	runId: string;
+	planSlug: string;
+	planDigest: string;
+	round: number;
+	baseline?: BuildEvidenceBaselineV3;
+	observations: BuildEvidenceObservationV1[];
+}
+
+/**
+ * Immutable authority boundary for a BUILD record and every current
+ * validation observation. `operationId` is per async operation and belongs
+ * to the observation rather than this record-wide identity.
+ */
 export interface BuildRecordIdentity {
 	runId: string;
 	planSlug: string;
@@ -72,7 +124,7 @@ export interface BuildRecordIdentity {
 
 export interface SelectedValidation {
 	command: string;
-	observation: BuildEvidenceObservationV2;
+	observation: BuildEvidenceObservationV3;
 }
 
 export interface GitCommandEvidence {
@@ -94,7 +146,7 @@ export interface CompleteDiff {
 
 export interface RenderBuildArtifactsInput {
 	planArtifact: string;
-	record: BuildEvidenceRecordV2;
+	record: BuildEvidenceRecordV3;
 	finalHead: string;
 	finalStatus: string;
 	changedPaths: string[];
@@ -126,7 +178,7 @@ const RECORD_KEYS = [
 	"baseline",
 	"observations",
 ] as const;
-const LEGACY_RECORD_KEYS = ["version", "runId", "planSlug", "planDigest", "round", "baseline", "observations"] as const;
+const V1_RECORD_KEYS = ["version", "runId", "planSlug", "planDigest", "round", "baseline", "observations"] as const;
 const BASELINE_KEYS = ["head", "status", "capturedAt"] as const;
 const OBSERVATION_KEYS = [
 	"toolCallId",
@@ -150,7 +202,7 @@ const OBSERVATION_KEYS = [
 	"finishedAt",
 	"text",
 ] as const;
-const LEGACY_OBSERVATION_KEYS = [
+const V1_OBSERVATION_KEYS = [
 	"toolCallId",
 	"toolName",
 	"command",
@@ -192,7 +244,7 @@ function finiteInteger(value: unknown): value is number {
 	return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value);
 }
 
-function assertBaseline(value: unknown): asserts value is BuildEvidenceBaselineV2 {
+function assertBaseline(value: unknown): asserts value is BuildEvidenceBaselineV3 {
 	if (!isPlainRecord(value) || !hasOnlyKeys(value, BASELINE_KEYS)) {
 		throw new BuildEvidenceError("Internal build record has an invalid baseline.");
 	}
@@ -226,7 +278,7 @@ function assertParsedLspRequest(value: unknown): asserts value is ParsedLspReque
 	}
 }
 
-function assertObservation(value: unknown, expected?: BuildRecordIdentity): asserts value is BuildEvidenceObservationV2 {
+function assertObservation(value: unknown, expected?: BuildRecordIdentity): asserts value is BuildEvidenceObservationV3 {
 	if (!isPlainRecord(value) || !hasOnlyKeys(value, OBSERVATION_KEYS)) {
 		throw new BuildEvidenceError("Build record contains an invalid observation object.");
 	}
@@ -328,7 +380,7 @@ function assertObservationProvenance(value: Record<string, unknown>, expected?: 
 	}
 }
 
-export function createBuildEvidenceRecord(identity: BuildRecordIdentity): BuildEvidenceRecordV2 {
+export function createBuildEvidenceRecord(identity: BuildRecordIdentity): BuildEvidenceRecordV3 {
 	assertIdentity(identity);
 	return {
 		version: BUILD_EVIDENCE_RECORD_VERSION,
@@ -341,7 +393,7 @@ export function createBuildEvidenceRecord(identity: BuildRecordIdentity): BuildE
 	};
 }
 
-export function parseBuildEvidenceRecord(value: unknown, expected: BuildRecordIdentity): BuildEvidenceRecordV2 {
+export function parseBuildEvidenceRecord(value: unknown, expected: BuildRecordIdentity): BuildEvidenceRecordV3 {
 	assertIdentity(expected);
 	if (!isPlainRecord(value) || !hasOnlyKeys(value, RECORD_KEYS)) {
 		throw new BuildEvidenceError("Internal build record is missing or has an invalid shape.");
@@ -359,13 +411,13 @@ export function parseBuildEvidenceRecord(value: unknown, expected: BuildRecordId
 	}
 	if (value.baseline !== undefined) assertBaseline(value.baseline);
 	for (const observation of value.observations) assertObservation(observation, expected);
-	return value as unknown as BuildEvidenceRecordV2;
+	return value as unknown as BuildEvidenceRecordV3;
 }
 
 export function parseBuildEvidenceRecordWithoutRound(
 	value: unknown,
 	expected: Omit<BuildRecordIdentity, "round">,
-): BuildEvidenceRecordV2 {
+): BuildEvidenceRecordV3 {
 	if (!isPlainRecord(value) || !hasOnlyKeys(value, RECORD_KEYS)) {
 		throw new BuildEvidenceError("Internal build record is missing or has an invalid shape.");
 	}
@@ -391,47 +443,84 @@ export function parseBuildEvidenceRecordWithoutRound(
 		round: value.round as number,
 	};
 	for (const observation of value.observations) assertObservation(observation, recordIdentity);
-	return value as unknown as BuildEvidenceRecordV2;
+	return value as unknown as BuildEvidenceRecordV3;
 }
 
-export function migrateLegacyBuildEvidenceRecord(
-	value: unknown,
-	expected: BuildRecordIdentity,
-): BuildEvidenceRecordV2 {
+/**
+ * Upgrade the two historical record encodings without granting their
+ * provenance any new authority. v1 observations have no operation identity;
+ * v2 observations must already have either all identity fields or none.
+ */
+export function migrateBuildEvidenceRecord(value: unknown, expected: BuildRecordIdentity): BuildEvidenceRecordV3 {
 	assertIdentity(expected);
-	if (!isPlainRecord(value) || !hasOnlyKeys(value, LEGACY_RECORD_KEYS)) {
+	if (!isPlainRecord(value)) {
 		throw new BuildEvidenceError("Legacy build record is missing or has an invalid shape.");
 	}
-	if (
-		value.version !== 1 ||
-		value.runId !== expected.runId ||
-		value.planSlug !== expected.planSlug ||
-		value.planDigest !== expected.planDigest ||
-		value.round !== expected.round ||
-		!Array.isArray(value.observations)
-	) {
-		throw new BuildEvidenceError("Legacy build record identity does not match the active LeanFlow run.");
-	}
-	if (value.baseline !== undefined) assertBaseline(value.baseline);
-	const observations: BuildEvidenceObservationV2[] = [];
-	for (const candidate of value.observations) {
-		if (!isPlainRecord(candidate) || !hasOnlyKeys(candidate, LEGACY_OBSERVATION_KEYS)) {
-			throw new BuildEvidenceError("Legacy build record contains an invalid observation.");
+
+	if (value.version === 1) {
+		if (
+			!hasOnlyKeys(value, V1_RECORD_KEYS) ||
+			value.runId !== expected.runId ||
+			value.planSlug !== expected.planSlug ||
+			value.planDigest !== expected.planDigest ||
+			value.round !== expected.round ||
+			!Array.isArray(value.observations)
+		) {
+			throw new BuildEvidenceError("Legacy v1 build record identity does not match the active LeanFlow run.");
 		}
-		const migrated = { ...candidate } as unknown;
-		assertObservation(migrated);
-		observations.push(migrated);
+		if (value.baseline !== undefined) assertBaseline(value.baseline);
+		const observations: BuildEvidenceObservationV3[] = [];
+		for (const candidate of value.observations) {
+			if (!isPlainRecord(candidate) || !hasOnlyKeys(candidate, V1_OBSERVATION_KEYS)) {
+				throw new BuildEvidenceError("Legacy v1 build record contains an invalid observation.");
+			}
+			const migrated = { ...candidate } as unknown;
+			assertObservation(migrated);
+			observations.push(migrated);
+		}
+		return {
+			version: BUILD_EVIDENCE_RECORD_VERSION,
+			runId: expected.runId,
+			planSlug: expected.planSlug,
+			planDigest: expected.planDigest,
+			approvedValidationDigest: expected.approvedValidationDigest,
+			round: expected.round,
+			...(value.baseline ? { baseline: value.baseline as BuildEvidenceBaselineV3 } : {}),
+			observations,
+		};
 	}
-	return {
-		version: BUILD_EVIDENCE_RECORD_VERSION,
-		runId: expected.runId,
-		planSlug: expected.planSlug,
-		planDigest: expected.planDigest,
-		approvedValidationDigest: expected.approvedValidationDigest,
-		round: expected.round,
-		...(value.baseline ? { baseline: value.baseline as unknown as BuildEvidenceBaselineV2 } : {}),
-		observations,
-	};
+
+	if (value.version === 2) {
+		if (
+			!hasOnlyKeys(value, RECORD_KEYS) ||
+			value.runId !== expected.runId ||
+			value.planSlug !== expected.planSlug ||
+			value.planDigest !== expected.planDigest ||
+			value.approvedValidationDigest !== expected.approvedValidationDigest ||
+			value.round !== expected.round ||
+			!Array.isArray(value.observations)
+		) {
+			throw new BuildEvidenceError("Legacy v2 build record identity does not match the active LeanFlow run.");
+		}
+		if (value.baseline !== undefined) assertBaseline(value.baseline);
+		const observations: BuildEvidenceObservationV3[] = [];
+		for (const candidate of value.observations) {
+			assertObservation(candidate, expected);
+			observations.push({ ...candidate });
+		}
+		return {
+			version: BUILD_EVIDENCE_RECORD_VERSION,
+			runId: expected.runId,
+			planSlug: expected.planSlug,
+			planDigest: expected.planDigest,
+			approvedValidationDigest: expected.approvedValidationDigest,
+			round: expected.round,
+			...(value.baseline ? { baseline: value.baseline as BuildEvidenceBaselineV3 } : {}),
+			observations,
+		};
+	}
+
+	throw new BuildEvidenceError("BUILD record is not a migratable v1 or v2 schema.");
 }
 
 function assertIdentity(identity: BuildRecordIdentity): void {
@@ -449,8 +538,8 @@ function assertIdentity(identity: BuildRecordIdentity): void {
 
 /** Historical observations may remain readable, but cannot authorize a current BUILD validation. */
 export function hasAuthoritativeObservationProvenance(
-	observation: BuildEvidenceObservationV2,
-	record: BuildEvidenceRecordV2,
+	observation: BuildEvidenceObservationV3,
+	record: BuildEvidenceRecordV3,
 ): boolean {
 	return (
 		typeof observation.operationId === "string" &&
@@ -463,7 +552,7 @@ export function hasAuthoritativeObservationProvenance(
 }
 
 export function validationSemanticStates(
-	record: BuildEvidenceRecordV2,
+	record: BuildEvidenceRecordV3,
 	contract: ApprovedValidationContract,
 	repositoryFingerprint: string,
 ): ValidationSemanticState[] {
@@ -532,7 +621,7 @@ export function validationSemanticStates(
 }
 
 export function selectValidationObservations(
-	record: BuildEvidenceRecordV2,
+	record: BuildEvidenceRecordV3,
 	contract: ApprovedValidationContract,
 	repositoryFingerprint: string,
 ): SelectedValidation[] {
@@ -597,7 +686,7 @@ function headingText(value: string): string {
 	return value.replace(/[\r\n]+/g, " ↵ ").trim() || "(empty command)";
 }
 
-function renderObservation(observation: BuildEvidenceObservationV2): string[] {
+function renderObservation(observation: BuildEvidenceObservationV3): string[] {
 	const lines = [
 		`- tool call: \`${observation.toolCallId}\``,
 		`- error: ${observation.isError}`,

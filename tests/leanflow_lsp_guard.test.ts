@@ -1845,6 +1845,85 @@ test("session restoration reconciles an interrupted Gate as an interruption", as
 	});
 });
 
+test("state v6 in-flight Gate restores through operational interruption when evidence is already v3", async () => {
+	const harness = createHarness();
+	await enterDocumentationBuild(harness);
+	await completeBuildEvidence(harness, "bun test legacy-gate-state");
+	await harness.handlers.get("tool_call")!(
+		{ toolName: "task", toolCallId: "legacy-state-gate", input: gateCallInput() },
+		harness.ctx,
+	);
+	const legacy = structuredClone(harness.states.at(-1)) as PersistedState & Record<string, unknown>;
+	legacy.stateVersion = 6;
+	harness.branch.push({ type: "custom", customType: "leanflow-state", data: legacy });
+
+	await harness.handlers.get("session_switch")!({}, harness.ctx);
+	expect(harness.states.at(-1)).toMatchObject({
+		stateVersion: 7,
+		phase: "building",
+		gateRetryMode: "operational",
+		gateLease: undefined,
+		operationalRetrySnapshot: expect.any(Object),
+	});
+});
+
+test("state v6 in-flight Gate migrates v2 evidence before safe redispatch", async () => {
+	const harness = createHarness();
+	await enterDocumentationBuild(harness);
+	await completeBuildEvidence(harness, "bun test legacy-gate-evidence");
+	await harness.handlers.get("tool_call")!(
+		{ toolName: "task", toolCallId: "legacy-v2-gate", input: gateCallInput() },
+		harness.ctx,
+	);
+	const recordPath = buildRecordPath(harness);
+	const legacyRecord = JSON.parse(readFileSync(recordPath, "utf8")) as Record<string, unknown>;
+	legacyRecord.version = 2;
+	const legacyRecordText = JSON.stringify(legacyRecord);
+	writeFileSync(recordPath, legacyRecordText);
+	const manifestPath = finalizedManifestPath(harness);
+	const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as FinalizedGateSnapshot;
+	manifest.buildRecordDigest = createHash("sha256").update(legacyRecordText).digest("hex");
+	writeFileSync(manifestPath, JSON.stringify(manifest));
+	const legacy = structuredClone(harness.states.at(-1)) as PersistedState & Record<string, unknown>;
+	legacy.stateVersion = 6;
+	legacy.finalizedGateSnapshot = manifest;
+	legacy.finalizationCommitNonce = manifest.finalizationCommitNonce;
+	if (!legacy.gateLease) throw new Error("legacy Gate lease is unavailable");
+	legacy.gateLease = {
+		...legacy.gateLease,
+		snapshotDigest: finalizedGateSnapshotDigest(manifest),
+	};
+	harness.branch.push({ type: "custom", customType: "leanflow-state", data: legacy });
+
+	await harness.handlers.get("session_switch")!({}, harness.ctx);
+	expect(JSON.parse(readFileSync(recordPath, "utf8"))).toMatchObject({
+		version: 3,
+		observations: legacyRecord.observations,
+	});
+	expect(harness.states.at(-1)).toMatchObject({
+		phase: "building",
+		gateRetryMode: "evidence",
+		recoveryAction: "refinalize_trusted_checkpoint",
+		gateCalls: 0,
+		gateLease: undefined,
+		finalizedGateSnapshot: undefined,
+	});
+	expect((await executeRegisteredTool(harness, "leanflow_finalize_artifacts", {})).isError).not.toBe(true);
+	const call = harness.handlers.get("tool_call")!;
+	const result = harness.handlers.get("tool_result")!;
+	await call({ toolName: "task", toolCallId: "legacy-v2-redispatch", input: gateCallInput() }, harness.ctx);
+	await result(
+		{
+			toolName: "task",
+			toolCallId: "legacy-v2-redispatch",
+			isError: false,
+			content: [{ type: "text", text: JSON.stringify({ verdict: "PASS", findings: [] }) }],
+		},
+		harness.ctx,
+	);
+	expect(harness.states.at(-1)).toMatchObject({ phase: "finalizing", terminalOutcome: "pass", gateCalls: 1 });
+});
+
 test("restore keeps an operational retry live through fingerprint transport failure and redispatches unchanged", async () => {
 	const harness = createHarness();
 	await enterDocumentationBuild(harness);
@@ -4527,9 +4606,10 @@ test("legacy Gate-ready state invalidates missing manifest authority on restore"
 	harness.branch.push({ type: "custom", customType: "leanflow-state", data: legacy });
 	await harness.handlers.get("session_switch")!({}, harness.ctx);
 	expect(harness.states.at(-1)).toMatchObject({
-		phase: "building",
-		gateRetryMode: "evidence",
+		phase: "awaiting_human",
+		gateRetryMode: undefined,
 		gateLease: undefined,
+		recoveryAction: "flowcontinue_after_lease_failure",
 		writtenArtifacts: [],
 	});
 });
@@ -4537,10 +4617,111 @@ test("legacy Gate-ready state invalidates missing manifest authority on restore"
 test("new runs persist the current state schema version", async () => {
 	const harness = createHarness();
 	await harness.commands.get("flow")!.handler("schema version", harness.ctx);
-	expect(harness.states.at(-1)).toMatchObject({ phase: "planning", stateVersion: 6 });
+	expect(harness.states.at(-1)).toMatchObject({ phase: "planning", stateVersion: 7 });
 	const persisted = harness.branch.at(-1) as { customType: string; data: Record<string, unknown> };
 	expect(persisted.customType).toBe("leanflow-state");
-	expect(persisted.data.stateVersion).toBe(6);
+	expect(persisted.data.stateVersion).toBe(7);
+});
+
+test("state v6 successful finalization migrates v2 evidence and resumes without another Gate verdict", async () => {
+	const harness = createHarness();
+	await enterDocumentationBuild(harness);
+	await completeBuildEvidence(harness, "bun test legacy-finalization");
+	const call = harness.handlers.get("tool_call")!;
+	const result = harness.handlers.get("tool_result")!;
+	await call({ toolName: "task", toolCallId: "legacy-finalization-gate", input: gateCallInput() }, harness.ctx);
+	await result(
+		{
+			toolName: "task",
+			toolCallId: "legacy-finalization-gate",
+			isError: false,
+			content: [{ type: "text", text: JSON.stringify({ verdict: "PASS", findings: [] }) }],
+		},
+		harness.ctx,
+	);
+	expect(harness.states.at(-1)).toMatchObject({ phase: "finalizing", terminalOutcome: "pass", gateCalls: 1 });
+
+	const recordPath = buildRecordPath(harness);
+	const legacyRecord = JSON.parse(readFileSync(recordPath, "utf8")) as Record<string, unknown>;
+	legacyRecord.version = 2;
+	const legacyRecordText = JSON.stringify(legacyRecord);
+	writeFileSync(recordPath, legacyRecordText);
+	const manifestPath = finalizedManifestPath(harness);
+	const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as FinalizedGateSnapshot;
+	manifest.buildRecordDigest = createHash("sha256").update(legacyRecordText).digest("hex");
+	writeFileSync(manifestPath, JSON.stringify(manifest));
+	const legacyState = structuredClone(harness.states.at(-1)) as PersistedState & Record<string, unknown>;
+	legacyState.stateVersion = 6;
+	legacyState.gateCalls = 2;
+	legacyState.finalizedGateSnapshot = manifest;
+	legacyState.finalizationCommitNonce = manifest.finalizationCommitNonce;
+	harness.branch.push({ type: "custom", customType: "leanflow-state", data: legacyState });
+
+	await harness.handlers.get("session_switch")!({}, harness.ctx);
+	expect(JSON.parse(readFileSync(recordPath, "utf8"))).toMatchObject({
+		version: 3,
+		observations: legacyRecord.observations,
+	});
+	expect(harness.states.at(-1)).toMatchObject({
+		stateVersion: 7,
+		phase: "building",
+		gateRetryMode: "evidence",
+		recoveryAction: "refinalize_legacy_pass",
+		finalizedGateSnapshot: undefined,
+		finalizationCommitNonce: undefined,
+		gateCalls: 2,
+	});
+
+	const refinalized = await executeRegisteredTool(harness, "leanflow_finalize_artifacts", {});
+	expect(refinalized.isError).not.toBe(true);
+	expect(harness.states.at(-1)).toMatchObject({
+		phase: "finalizing",
+		terminalOutcome: "pass",
+		recoveryAction: undefined,
+		gateCalls: 2,
+		finalizedGateSnapshot: expect.any(Object),
+	});
+	await harness.handlers.get("agent_end")!({}, harness.ctx);
+	expect(harness.states.at(-1)?.phase).toBe("idle");
+});
+
+test("a persisted migration recovery state resumes an interrupted v2 record rewrite safely", async () => {
+	const harness = createHarness();
+	await enterDocumentationBuild(harness);
+	await completeBuildEvidence(harness, "bun test legacy-migration-resume");
+	const recordPath = buildRecordPath(harness);
+	const legacyRecord = JSON.parse(readFileSync(recordPath, "utf8")) as Record<string, unknown>;
+	legacyRecord.version = 2;
+	writeFileSync(recordPath, JSON.stringify(legacyRecord));
+	const recovery = structuredClone(harness.states.at(-1)) as PersistedState & Record<string, unknown>;
+	recovery.stateVersion = 7;
+	recovery.phase = "building";
+	recovery.gateRetryMode = "evidence";
+	recovery.recoveryAction = "refinalize_trusted_checkpoint";
+	recovery.baselineCaptured = true;
+	recovery.writtenArtifacts = [];
+	delete recovery.gateLease;
+	delete recovery.finalizedGateSnapshot;
+	delete recovery.finalizationCommitNonce;
+	harness.branch.push({ type: "custom", customType: "leanflow-state", data: recovery });
+
+	await harness.handlers.get("session_switch")!({}, harness.ctx);
+	expect(JSON.parse(readFileSync(recordPath, "utf8"))).toMatchObject({
+		version: 3,
+		observations: legacyRecord.observations,
+	});
+	expect(harness.states.at(-1)).toMatchObject({
+		phase: "building",
+		gateRetryMode: "evidence",
+		recoveryAction: "refinalize_trusted_checkpoint",
+		finalizedGateSnapshot: undefined,
+	});
+	const refinalized = await executeRegisteredTool(harness, "leanflow_finalize_artifacts", {});
+	expect(refinalized.isError).not.toBe(true);
+	expect(harness.states.at(-1)).toMatchObject({
+		phase: "building",
+		finalizedGateSnapshot: expect.any(Object),
+	});
 });
 
 test("structured BLOCKED run mismatch does not depend on finding prose keywords", async () => {

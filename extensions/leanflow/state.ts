@@ -7,6 +7,7 @@ import {
 } from "./validation";
 import {
 	isFinalizationCommitNonce,
+	finalizedGateSnapshotDigest,
 	parseFinalizedGateSnapshot,
 	parseOperationalRetrySnapshot,
 	type FinalizedGateSnapshot,
@@ -53,6 +54,11 @@ export type LspProbeStatus = "not_required" | "pending" | "completed";
 export type GateOutcome = "PASS" | "FAIL" | "BLOCKED";
 export type OperationLeaseKind = "gate" | "lsp";
 
+/**
+ * Stable repository identity: HEAD plus the binary tracked diff and sorted
+ * untracked entries. Entries bind a regular file's type, executable mode, and
+ * content digest, or a symlink's type and link target.
+ */
 export interface RepositoryFingerprint {
 	head: string;
 	trackedDiffDigest: string;
@@ -155,6 +161,7 @@ export interface BlockedRecoveryState {
 export type GateRecoveryAction =
 	| "repair_plan_and_reapprove"
 	| "refinalize_trusted_checkpoint"
+	| "refinalize_legacy_pass"
 	| "flowcontinue_rebuild_checkpoint"
 	| "flowcontinue_after_lease_failure";
 
@@ -250,7 +257,7 @@ export interface LeanFlowState {
 	repairLease?: RepairLease;
 	/** Explicit next action after provenance recovery; cleared on successful redispatch or repair. */
 	recoveryAction?: GateRecoveryAction;
-	/** Persisted workflow schema version; absence implies v1 (pre-7614368). */
+	/** Persisted workflow schema version; absence implies v1, and active output is always v7. */
 	stateVersion?: number;
 	/** Runtime token/context statistics for the current run. */
 	stats?: LeanFlowStats;
@@ -320,7 +327,12 @@ export function restoreState(branch: Iterable<BranchEntry>): LeanFlowState {
 	return normalizeState(latest);
 }
 
-export const STATE_VERSION = 6;
+/**
+ * v7 requires nonce-bound v2 Gate authority for every Gate-ready or successful
+ * finalizing state. Older state is normalized and persisted immediately by the
+ * restore flow; it is never allowed to regain authority by migration alone.
+ */
+export const STATE_VERSION = 7;
 
 function migrateLegacyGateState(
 	state: LeanFlowState,
@@ -514,6 +526,7 @@ function normalizeState(value: unknown): LeanFlowState {
 	let recoveryAction =
 		state.recoveryAction === "repair_plan_and_reapprove" ||
 		state.recoveryAction === "refinalize_trusted_checkpoint" ||
+		state.recoveryAction === "refinalize_legacy_pass" ||
 		state.recoveryAction === "flowcontinue_rebuild_checkpoint" ||
 		state.recoveryAction === "flowcontinue_after_lease_failure"
 			? state.recoveryAction
@@ -525,7 +538,7 @@ function normalizeState(value: unknown): LeanFlowState {
 		raw.approvedValidations,
 	);
 	const approvedValidationDigest = approvedValidationContract?.digest;
-	const repairLease = normalizeRepairLease(state.repairLease);
+	let repairLease = normalizeRepairLease(state.repairLease);
 	let gateLease = normalizeOperationLease(state.gateLease);
 	let finalizedGateSnapshot = parseFinalizedGateSnapshot(state.finalizedGateSnapshot);
 	let finalizationCommitNonce = isFinalizationCommitNonce(state.finalizationCommitNonce)
@@ -537,6 +550,28 @@ function normalizeState(value: unknown): LeanFlowState {
 	let writtenArtifacts = Array.isArray(state.writtenArtifacts)
 		? state.writtenArtifacts.filter((item): item is string => typeof item === "string")
 		: undefined;
+	const declaredBuildRound =
+		typeof state.currentBuildRound === "number" &&
+		Number.isInteger(state.currentBuildRound) &&
+		state.currentBuildRound >= 1
+			? state.currentBuildRound
+			: undefined;
+	const clearFinalizationAuthority = (): void => {
+		finalizedGateSnapshot = undefined;
+		finalizationCommitNonce = undefined;
+		operationalRetrySnapshot = undefined;
+	};
+	const pauseForRebuild = (): void => {
+		clearFinalizationAuthority();
+		gateLease = undefined;
+		repairLease = undefined;
+		gateRetryMode = undefined;
+		baselineCaptured = false;
+		writtenArtifacts = [];
+		terminalOutcome = undefined;
+		phase = "awaiting_human";
+		recoveryAction = "flowcontinue_rebuild_checkpoint";
+	};
 
 	if (
 		finalizedGateSnapshot &&
@@ -544,48 +579,91 @@ function normalizeState(value: unknown): LeanFlowState {
 			finalizedGateSnapshot.planSlug !== state.planSlug ||
 			finalizedGateSnapshot.planDigest !== planDigestValue ||
 			finalizedGateSnapshot.approvedValidationDigest !== approvedValidationDigest ||
-			finalizedGateSnapshot.finalizationCommitNonce !== finalizationCommitNonce)
+			finalizedGateSnapshot.finalizationCommitNonce !== finalizationCommitNonce ||
+			(declaredBuildRound !== undefined && finalizedGateSnapshot.buildRecordRound !== declaredBuildRound) ||
+			phase === "idle" ||
+			phase === "planning" ||
+			phase === "awaiting_approval" ||
+			phase === "repair_preparing" ||
+			phase === "awaiting_human" ||
+			finalizedGateSnapshot.validationStates.some((validation) => validation.status !== "passed"))
 	) {
-		finalizedGateSnapshot = undefined;
+		clearFinalizationAuthority();
+	}
+	if (
+		gateLease &&
+		(gateLease.kind !== "gate" ||
+			gateLease.runId !== state.runId ||
+			gateLease.planDigest !== planDigestValue ||
+			(declaredBuildRound !== undefined && gateLease.buildRecordRound !== declaredBuildRound) ||
+			(finalizedGateSnapshot &&
+				(gateLease.snapshotDigest !== finalizedGateSnapshotDigest(finalizedGateSnapshot) ||
+					gateLease.buildRecordRound !== finalizedGateSnapshot.buildRecordRound ||
+					gateLease.repositoryFingerprint?.combinedDigest !== finalizedGateSnapshot.repositoryFingerprint.combinedDigest)))
+	) {
+		gateLease = undefined;
 	}
 	if (
 		operationalRetrySnapshot &&
 		(!finalizedGateSnapshot ||
 			operationalRetrySnapshot.originalGateLease.runId !== state.runId ||
-			operationalRetrySnapshot.originalGateLease.planDigest !== planDigestValue)
+			operationalRetrySnapshot.originalGateLease.planDigest !== planDigestValue ||
+			operationalRetrySnapshot.originalGateLease.buildRecordRound !== finalizedGateSnapshot.buildRecordRound ||
+			operationalRetrySnapshot.originalGateLease.repositoryFingerprint?.combinedDigest !==
+				finalizedGateSnapshot.repositoryFingerprint.combinedDigest ||
+			operationalRetrySnapshot.finalizedSnapshotDigest !== finalizedGateSnapshotDigest(finalizedGateSnapshot))
 	) {
 		operationalRetrySnapshot = undefined;
 	}
 
+	// State v7 retains only a v2 snapshot whose nonce and full run identity
+	// already match. Older artifact marks and partial retry metadata are never
+	// promoted into authority by normalization.
 	if (legacySchema) {
-		finalizedGateSnapshot = undefined;
-		operationalRetrySnapshot = undefined;
 		blockedRecovery = undefined;
 		writtenArtifacts = [];
-		gateLease = undefined;
-		if (gateRetryMode === "operational") {
-			phase = "awaiting_human";
-			gateRetryMode = undefined;
-			baselineCaptured = false;
-		} else if (rawPhase === "gating") {
-			phase = "building";
-			gateRetryMode = "evidence";
+		if (!finalizedGateSnapshot) gateLease = undefined;
+		// v3 predated the persisted repair lease. This is a syntactically valid
+		// compatibility lease only: restore must still reconcile it against the
+		// BUILD record before it can advance a round.
+		if (persistedVersion === 3 && phase === "repair_preparing" && gateRetryMode === "repair" && !repairLease) {
+			const fromRound = declaredBuildRound ?? Math.max(0, numberOr(state.gateAttempt, 0));
+			repairLease = { fromRound, toRound: fromRound + 1, reason: "gate_fail", startedAt: Date.now() };
 		}
 	}
 	if (!finalizedGateSnapshot) finalizationCommitNonce = undefined;
+
+	if (gateRetryMode === "operational" && (!finalizedGateSnapshot || !operationalRetrySnapshot)) {
+		pauseForRebuild();
+	}
+	if (gateRetryMode !== "operational") operationalRetrySnapshot = undefined;
+
+	if (phase === "repair_preparing" && (!repairLease || gateRetryMode !== "repair")) {
+		pauseForRebuild();
+	}
+	if (phase !== "repair_preparing") repairLease = undefined;
+
 	if (phase === "finalizing" && terminalOutcome === "pass" && !finalizedGateSnapshot) {
-		phase = "awaiting_human";
-		terminalOutcome = undefined;
-		gateRetryMode = undefined;
-		baselineCaptured = false;
-		writtenArtifacts = [];
-		recoveryAction = "flowcontinue_rebuild_checkpoint";
+		pauseForRebuild();
 	}
 	if (phase === "gating" && (!gateLease || !finalizedGateSnapshot)) {
+		clearFinalizationAuthority();
 		phase = "building";
 		gateRetryMode = "evidence";
 		gateLease = undefined;
 		writtenArtifacts = [];
+		recoveryAction = undefined;
+	}
+	if (phase !== "gating") gateLease = undefined;
+
+	if (
+		baselineCaptured &&
+		phase !== "building" &&
+		phase !== "gating" &&
+		phase !== "awaiting_human" &&
+		phase !== "repair_preparing"
+	) {
+		baselineCaptured = false;
 	}
 
 	const inferredBuildRound =
@@ -599,13 +677,7 @@ function normalizeState(value: unknown): LeanFlowState {
 	const currentBuildRound =
 		phase === "planning" || phase === "awaiting_approval" || phase === "idle"
 			? undefined
-			: typeof state.currentBuildRound === "number" &&
-					Number.isInteger(state.currentBuildRound) &&
-					state.currentBuildRound >= 1
-				? state.currentBuildRound
-				: inferredBuildRound >= 1
-					? inferredBuildRound
-					: undefined;
+			: declaredBuildRound ?? (inferredBuildRound >= 1 ? inferredBuildRound : undefined);
 
 	return {
 		phase,

@@ -36,7 +36,7 @@ import { approvedPlanArtifact, filterForBuilder } from "./context";
 import {
 	composeCompleteDiff,
 	createBuildEvidenceRecord,
-	migrateLegacyBuildEvidenceRecord,
+	migrateBuildEvidenceRecord,
 	parseBuildEvidenceRecord,
 	parseBuildEvidenceRecordWithoutRound,
 	renderBuildArtifacts,
@@ -44,8 +44,8 @@ import {
 	validationSemanticStates,
 } from "./evidence";
 import type {
-	BuildEvidenceObservationV2,
-	BuildEvidenceRecordV2,
+	BuildEvidenceObservationV3,
+	BuildEvidenceRecordV3,
 	BuildRecordIdentity,
 	GitCommandEvidence,
 	ParsedLspRequest,
@@ -1050,7 +1050,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 		}
 	}
 
-	async function loadBuildRecordForIdentity(identity: BuildOperationIdentity): Promise<BuildEvidenceRecordV2> {
+	async function loadBuildRecordForIdentity(identity: BuildOperationIdentity): Promise<BuildEvidenceRecordV3> {
 		return parseBuildEvidenceRecord(await readBuildRecordValueAt(identity.recordPath), identity);
 	}
 
@@ -1058,11 +1058,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 		return readBuildRecordValueAt(activeBuildRecordPath(ctx));
 	}
 
-	async function loadBuildRecord(ctx: ExtensionContext, round: number): Promise<BuildEvidenceRecordV2> {
-		return parseBuildEvidenceRecord(await readBuildRecordValue(ctx), activeBuildIdentity(round));
-	}
-
-	async function readBuildRecordForReconciliation(ctx: ExtensionContext): Promise<BuildEvidenceRecordV2> {
+	async function readBuildRecordForReconciliation(ctx: ExtensionContext): Promise<BuildEvidenceRecordV3> {
 		const value = await readBuildRecordValue(ctx);
 		const identity = activeBuildIdentity(state.currentBuildRound ?? Math.max(1, state.gateAttempt));
 		try {
@@ -1074,8 +1070,14 @@ export default function leanflow(pi: ExtensionAPI): void {
 			});
 		} catch (error) {
 			const legacyRound = isPlainRecord(value) && Number.isInteger(value.round) ? (value.round as number) : undefined;
-			if (value && isPlainRecord(value) && value.version === 1 && legacyRound !== undefined && legacyRound >= 1) {
-				const migrated = migrateLegacyBuildEvidenceRecord(value, activeBuildIdentity(legacyRound));
+			if (
+				value &&
+				isPlainRecord(value) &&
+				(value.version === 1 || value.version === 2) &&
+				legacyRound !== undefined &&
+				legacyRound >= 1
+			) {
+				const migrated = migrateBuildEvidenceRecord(value, activeBuildIdentity(legacyRound));
 				await writeJsonAtomically(activeBuildRecordPath(ctx), migrated);
 				return migrated;
 			}
@@ -1096,7 +1098,8 @@ export default function leanflow(pi: ExtensionAPI): void {
 		build: string;
 		diff: string;
 		evidence: string;
-		record: BuildEvidenceRecordV2;
+		record: BuildEvidenceRecordV3;
+		legacyRecordVersion?: 1 | 2;
 	};
 
 	type GateSnapshotFailure = {
@@ -1148,6 +1151,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 	async function verifyDurableFinalizedSnapshot(
 		ctx: ExtensionContext,
 		lease?: NonNullable<LeanFlowState["gateLease"]>,
+		allowLegacyRecord = false,
 	): Promise<{ ok: true; value: VerifiedGateSnapshot } | GateSnapshotFailure> {
 		if (
 			!ctx.localProtocolOptions ||
@@ -1277,11 +1281,22 @@ export default function leanflow(pi: ExtensionAPI): void {
 		if (!evidence.ok) return { ok: false, kind: "artifact_rebuildable", reason: evidence.reason };
 
 		let repositoryFingerprint: RepositoryFingerprint;
-		let record: BuildEvidenceRecordV2;
+		let record: BuildEvidenceRecordV3;
+		let legacyRecordVersion: 1 | 2 | undefined;
 		try {
 			const recordText = await fs.readFile(activeBuildRecordPath(ctx), "utf8");
 			const recordDigestMatches = sha256Hex(recordText) === manifest.buildRecordDigest;
-			record = parseBuildEvidenceRecord(JSON.parse(recordText), activeBuildIdentity(manifest.buildRecordRound));
+			const recordValue: unknown = JSON.parse(recordText);
+			if (
+				allowLegacyRecord &&
+				isPlainRecord(recordValue) &&
+				(recordValue.version === 1 || recordValue.version === 2)
+			) {
+				legacyRecordVersion = recordValue.version;
+				record = migrateBuildEvidenceRecord(recordValue, activeBuildIdentity(manifest.buildRecordRound));
+			} else {
+				record = parseBuildEvidenceRecord(recordValue, activeBuildIdentity(manifest.buildRecordRound));
+			}
 			const semanticStates = validationSemanticStates(
 				record,
 				state.approvedValidationContract!,
@@ -1354,8 +1369,33 @@ export default function leanflow(pi: ExtensionAPI): void {
 				diff: diff.content,
 				evidence: evidence.content,
 				record,
+				legacyRecordVersion,
 			},
 		};
+	}
+
+	async function recoverLegacyEvidenceRecord(
+		ctx: ExtensionContext,
+		verified: VerifiedGateSnapshot,
+		resumeTerminalPass: boolean,
+	): Promise<boolean> {
+		if (verified.legacyRecordVersion === undefined) return false;
+		await applyGateRecoveryEvent(ctx, {
+			type: "legacy_evidence_migration",
+			fromVersion: verified.legacyRecordVersion,
+			baselineCaptured: verified.record.baseline !== undefined,
+			resumeTerminalPass,
+		});
+		try {
+			await readBuildRecordForReconciliation(ctx);
+		} catch (error) {
+			await applyGateRecoveryEvent(ctx, {
+				type: "record_invalid",
+				reason: `legacy BUILD record migration failed: ${evidenceFailureMessage(error)}`,
+				checkpointRecoverable: true,
+			});
+		}
+		return true;
 	}
 
 	/**
@@ -1450,7 +1490,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 		const toRound = lease ? lease.toRound : fromRound + 1;
 		let recoveryEligible = false;
 		try {
-			let actual: BuildEvidenceRecordV2;
+			let actual: BuildEvidenceRecordV3;
 			try {
 				actual = await readBuildRecordForReconciliation(ctx);
 			} catch (error) {
@@ -1470,7 +1510,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 				recoveryEligible = true;
 				throw new Error(`BUILD record round ${actual.round} does not match expected ${fromRound} → ${toRound}`);
 			}
-			const nextRecord: BuildEvidenceRecordV2 = {
+			const nextRecord: BuildEvidenceRecordV3 = {
 				...actual,
 				round: toRound,
 				observations: [],
@@ -1515,7 +1555,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 	async function appendBuildObservationUnlocked(
 		ctx: ExtensionContext,
 		identity: BuildOperationIdentity,
-		observation: BuildEvidenceObservationV2,
+		observation: BuildEvidenceObservationV3,
 	): Promise<boolean> {
 		if (!isBuildOperationCurrent(ctx, identity)) return false;
 		const record = await loadBuildRecordForIdentity(identity);
@@ -1528,7 +1568,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 	async function appendBuildObservation(
 		ctx: ExtensionContext,
 		identity: BuildOperationIdentity,
-		observation: BuildEvidenceObservationV2,
+		observation: BuildEvidenceObservationV3,
 	): Promise<boolean> {
 		const release = await acquireBuildRecordLock(identity);
 		try {
@@ -2524,8 +2564,14 @@ export default function leanflow(pi: ExtensionAPI): void {
 			}
 			return undefined;
 		})();
-		const wasGatingRaw =
-			rawBeforeRestore?.phase === "gating" && rawBeforeRestore.stateVersion === STATE_VERSION;
+		const rawStateVersion = rawBeforeRestore?.stateVersion;
+		const supportedRawStateVersion =
+			rawStateVersion === undefined ||
+			(typeof rawStateVersion === "number" &&
+				Number.isInteger(rawStateVersion) &&
+				rawStateVersion >= 1 &&
+				rawStateVersion <= STATE_VERSION);
+		const wasGatingRaw = rawBeforeRestore?.phase === "gating" && supportedRawStateVersion;
 		state = restoreState(branch);
 		pendingPlanRefreshes.clear();
 		pendingLspProbes.clear();
@@ -2540,8 +2586,10 @@ export default function leanflow(pi: ExtensionAPI): void {
 		const { effects } = reduceGate(state, { type: "restore_reconcile", now: Date.now() });
 		await executeGateEffects(ctx, effects);
 		if (state.phase === "finalizing" && state.terminalOutcome === "pass") {
-			const finalized = await verifyDurableFinalizedSnapshot(ctx);
-			if (!finalized.ok) {
+			const finalized = await verifyDurableFinalizedSnapshot(ctx, undefined, true);
+			if (finalized.ok) {
+				await recoverLegacyEvidenceRecord(ctx, finalized.value, true);
+			} else {
 				await applyGateRecoveryEvent(ctx, {
 					type: "finalization_authority_invalid",
 					reason: finalized.reason,
@@ -2563,15 +2611,19 @@ export default function leanflow(pi: ExtensionAPI): void {
 					"restore",
 				);
 			} else {
-				const verified = await verifyDurableFinalizedSnapshot(ctx, state.gateLease);
-				await routeGateSnapshotFailure(
-					ctx,
-					verified.ok
-						? { ok: false, kind: "transport_error", reason: "Gate was interrupted by session restoration" }
-						: verified,
-					verified.ok ? "session_interruption" : "restore",
-					verified.ok ? "session_switch" : "transport_error",
-				);
+				const verified = await verifyDurableFinalizedSnapshot(ctx, state.gateLease, true);
+				const migrated =
+					verified.ok && (await recoverLegacyEvidenceRecord(ctx, verified.value, false));
+				if (!migrated) {
+					await routeGateSnapshotFailure(
+						ctx,
+						verified.ok
+							? { ok: false, kind: "transport_error", reason: "Gate was interrupted by session restoration" }
+							: verified,
+						verified.ok ? "session_interruption" : "restore",
+						verified.ok ? "session_switch" : "transport_error",
+					);
+				}
 				restoredGateBecameOperational =
 					(state.phase as LeanFlowState["phase"]) === "building" &&
 					state.gateRetryMode === "operational" &&
@@ -2590,8 +2642,12 @@ export default function leanflow(pi: ExtensionAPI): void {
 					"restore",
 				);
 			} else {
-				const verified = await verifyDurableFinalizedSnapshot(ctx);
-				if (!verified.ok) await routeGateSnapshotFailure(ctx, verified, "restore", "transport_error");
+				const verified = await verifyDurableFinalizedSnapshot(ctx, undefined, true);
+				const migrated =
+					verified.ok && (await recoverLegacyEvidenceRecord(ctx, verified.value, false));
+				if (!migrated && !verified.ok) {
+					await routeGateSnapshotFailure(ctx, verified, "restore", "transport_error");
+				}
 			}
 		}
 
@@ -2975,7 +3031,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 				if (!isBuildOperationCurrent(ctx, identity) || authorityController.signal.aborted) {
 					return discardedBuildOperation("validation");
 				}
-				const observation: BuildEvidenceObservationV2 = {
+				const observation: BuildEvidenceObservationV3 = {
 					toolCallId,
 					operationId: identity.operationId,
 					runId: identity.runId,
@@ -3261,12 +3317,23 @@ export default function leanflow(pi: ExtensionAPI): void {
 				if (!persistedManifest || finalizedGateSnapshotDigest(persistedManifest) !== finalizedGateSnapshotDigest(manifest)) {
 					throw new Error("finalized Gate manifest failed atomic persistence verification");
 				}
+				const resumeLegacyPass = state.recoveryAction === "refinalize_legacy_pass";
 				const candidate: LeanFlowState = {
 					...state,
 					finalizedGateSnapshot: persistedManifest,
 					finalizationCommitNonce: persistedManifest.finalizationCommitNonce,
 					operationalRetrySnapshot: undefined,
 					writtenArtifacts: [...REQUIRED_ARTIFACTS],
+					...(resumeLegacyPass
+						? {
+								phase: "finalizing" as const,
+								terminalOutcome: "pass" as const,
+								baselineCaptured: false,
+								gateRetryMode: undefined,
+								recoveryAction: undefined,
+								blockedRecovery: undefined,
+							}
+						: {}),
 				};
 				try {
 					persistCandidateState(candidate);
@@ -3640,7 +3707,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 				!asyncRunning
 					? 0
 					: explicitExitCode;
-			const observation: BuildEvidenceObservationV2 = {
+			const observation: BuildEvidenceObservationV3 = {
 				toolCallId: event.toolCallId,
 				operationId: pendingObservation.identity.operationId,
 				runId: pendingObservation.identity.runId,
