@@ -48,15 +48,15 @@ The LeanFlow extension (`extensions/leanflow/`) provides:
 
 ### BUILD
 
-After approval, the same Main Session becomes Builder. For source plans it first runs the required LSP diagnostics probe, then calls `leanflow_capture_baseline({})`; documentation/resource-only plans skip only the probe. Main implements the approved plan and runs synchronous validation commands. It then calls `leanflow_finalize_artifacts({ validationCommands: [...] })` with the exact commands already observed. The extension generates and verifies `local://<slug>-build.md`, `local://<slug>-diff.md`, and `local://<slug>-evidence.md`; Main cannot write them directly. A repair keeps the original baseline, starts a new evidence round, and reruns validation. No code-writing subagent exists.
+After approval, the same Main Session becomes Builder. For source plans it first runs the required LSP diagnostics probe, then calls `leanflow_capture_baseline({})`; documentation/resource-only plans skip only the probe. Main implements the approved plan and runs synchronous validation commands. It then calls `leanflow_finalize_artifacts({ validationCommands: [...] })` with the exact commands already observed. The extension generates and verifies `local://<slug>-build.md`, `local://<slug>-diff.md`, and `local://<slug>-evidence.md`; Main cannot write them directly. A repair keeps the original baseline, starts a new evidence round, and reruns validation. Evidence recovery permits only exact approved Verification commands that were successfully recorded for the active BUILD round; no code-writing subagent exists.
 
 ### GATE
 
 One independent Gate reads the canonical plan, final diff, build record, and runtime evidence by reference. Gate has no shell access; all runtime facts come from the extension-generated evidence artifact. Its strict verdict schema is owned by `agents/gate.md`, and callers send one canonical batch item without `outputSchema`.
 - PASS moves to `finalizing`; the compact context remains active through the terminal response, then the run becomes idle.
 - First valid FAIL is repaired by Main with refreshed validation/evidence, then one Gate retry is allowed.
-- A Gate operational error preserves evidence and permits a bounded review retry without counting an implementation repair.
-- Second FAIL or second operational failure is reported; no reviewer or audit chain is created.
+- A Gate operational error preserves the existing artifacts and returns to BUILD for a bounded retry without counting an implementation repair; after four consecutive operational errors, LeanFlow pauses in `awaiting_human`.
+- `BLOCKED` does not consume a verdict attempt. LeanFlow returns to BUILD to rerun only exact approved Verification commands, record a new successful approved-validation observation, and regenerate evidence without source changes. A second identical `BLOCKED` finding with unchanged plan, repository fingerprint, and approved-validation evidence pauses in `awaiting_human`; unrelated LSP observations are not progress.
 
 ## Statistics semantics
 
@@ -89,7 +89,7 @@ commands/flow.md
 agents/scout.md
 agents/gate.md
 skills/leanflow/SKILL.md
-extensions/leanflow/          (directory: index.ts, state.ts, guard.ts, handoff.ts, context.ts)
+extensions/leanflow/          (directory: index.ts, state.ts, guard.ts, handoff.ts, validation.ts, context.ts)
 ```
 
 Use `python3 scripts/install_leanflow.py --scope user --apply` to install them under the user OMP agent directory. The default is symlink mode on POSIX and copy mode on Windows.
