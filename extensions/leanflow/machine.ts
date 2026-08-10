@@ -58,6 +58,7 @@ export type GateEvent =
 	| { type: "lease_invalid"; reason: string }
 	| { type: "repository_changed"; reason: string }
 	| { type: "blocked_no_progress"; reason: string }
+	| { type: "finalization_authority_invalid"; reason: string }
 	| { type: "human_continue"; now: number }
 	| { type: "human_finish_failed"; now: number };
 
@@ -124,6 +125,8 @@ export function reduceGate(state: LeanFlowState, event: GateEvent): { effects: E
 			return reduceRepositoryChanged(state, event);
 		case "blocked_no_progress":
 			return reduceBlockedNoProgress(state, event);
+		case "finalization_authority_invalid":
+			return reduceFinalizationAuthorityInvalid(state, event);
 		case "human_continue":
 			return reduceHumanContinue(state);
 		case "human_finish_failed":
@@ -140,6 +143,9 @@ export function checkInvariants(state: LeanFlowState): string[] {
 
 	const gateLease = state.gateLease;
 	const finalized = state.finalizedGateSnapshot;
+	if (!finalized && state.finalizationCommitNonce !== undefined) {
+		violations.push("finalization commit nonce requires a finalized Gate snapshot");
+	}
 	if (state.phase === "gating") {
 		if (!gateLease) violations.push("gating phase requires a gate lease");
 		if (!gateLease?.repositoryFingerprint) violations.push("gating phase requires a repository fingerprint");
@@ -167,6 +173,9 @@ export function checkInvariants(state: LeanFlowState): string[] {
 	if (state.phase === "finalizing" && state.terminalOutcome === undefined) {
 		violations.push("finalizing phase requires a terminal outcome");
 	}
+	if (state.phase === "finalizing" && state.terminalOutcome === "pass" && (!finalized || !state.finalizationCommitNonce)) {
+		violations.push("successful finalization requires nonce-bound Gate authority");
+	}
 	if (state.gateCalls < 0 || state.gateCalls > MAX_GATE_VERDICTS) {
 		violations.push(`gateCalls must be between 0 and ${MAX_GATE_VERDICTS}`);
 	}
@@ -191,6 +200,9 @@ export function checkInvariants(state: LeanFlowState): string[] {
 		violations.push("active BUILD lifecycle requires currentBuildRound");
 	}
 	if (finalized) {
+		if (state.finalizationCommitNonce !== finalized.finalizationCommitNonce) {
+			violations.push("finalized snapshot nonce must match state");
+		}
 		if (state.currentBuildRound !== finalized.buildRecordRound) {
 			violations.push("finalized snapshot round must match currentBuildRound");
 		}
@@ -313,6 +325,7 @@ function reduceGateSettlement(
 			state.gateCalls++;
 			state.lastGateFindings = truncateFindings(event.findingsJson);
 			state.finalizedGateSnapshot = undefined;
+			state.finalizationCommitNonce = undefined;
 			state.operationalRetrySnapshot = undefined;
 			resetBlockedRecovery(state);
 			if (state.gateCalls < MAX_GATE_VERDICTS) {
@@ -360,6 +373,7 @@ function reduceGateSettlement(
 				!event.semanticEvidenceDigest
 			) {
 				state.finalizedGateSnapshot = undefined;
+				state.finalizationCommitNonce = undefined;
 				state.operationalRetrySnapshot = undefined;
 				state.gateRetryMode = undefined;
 				state.baselineCaptured = false;
@@ -389,6 +403,7 @@ function reduceGateSettlement(
 				consecutiveEquivalentBlocked,
 			};
 			state.finalizedGateSnapshot = undefined;
+			state.finalizationCommitNonce = undefined;
 			state.operationalRetrySnapshot = undefined;
 			state.writtenArtifacts = [];
 			state.gateRetryMode = "evidence";
@@ -504,6 +519,7 @@ function reduceRepairRoundReady(
 	state.currentBuildRound = event.round;
 	state.gateRetryMode = "repair";
 	state.finalizedGateSnapshot = undefined;
+	state.finalizationCommitNonce = undefined;
 	state.operationalRetrySnapshot = undefined;
 	state.writtenArtifacts = [];
 	resetBlockedRecovery(state);
@@ -568,6 +584,7 @@ function reduceHumanContinue(state: LeanFlowState): { effects: Effect[] } {
 	state.gateRetryMode = "repair";
 	state.terminalOutcome = undefined;
 	state.finalizedGateSnapshot = undefined;
+	state.finalizationCommitNonce = undefined;
 	state.operationalRetrySnapshot = undefined;
 	state.writtenArtifacts = [];
 	resetBlockedRecovery(state);
@@ -589,6 +606,7 @@ function clearGateProvenanceForRecovery(state: LeanFlowState, resetBlockedBounda
 	state.repairLease = undefined;
 	state.gateRetryMode = undefined;
 	state.finalizedGateSnapshot = undefined;
+	state.finalizationCommitNonce = undefined;
 	state.operationalRetrySnapshot = undefined;
 	state.writtenArtifacts = [];
 	resetConsecutiveGateErrors(state);
@@ -641,6 +659,7 @@ function reduceBlockedNoProgress(
 	state.blockedRecovery.consecutiveEquivalentBlocked = MAX_SAME_SNAPSHOT_BLOCKED;
 	state.gateRetryMode = undefined;
 	state.finalizedGateSnapshot = undefined;
+	state.finalizationCommitNonce = undefined;
 	state.operationalRetrySnapshot = undefined;
 	state.baselineCaptured = false;
 	state.phase = "awaiting_human";
@@ -743,6 +762,28 @@ function reduceLeaseInvalid(
 	};
 }
 
+function reduceFinalizationAuthorityInvalid(
+	state: LeanFlowState,
+	event: Extract<GateEvent, { type: "finalization_authority_invalid" }>,
+): { effects: Effect[] } {
+	if (state.phase !== "finalizing" || state.terminalOutcome !== "pass") return { effects: [] };
+	clearGateProvenanceForRecovery(state, true);
+	state.terminalOutcome = undefined;
+	state.baselineCaptured = false;
+	state.recoveryAction = "flowcontinue_rebuild_checkpoint";
+	state.phase = "awaiting_human";
+	return {
+		effects: [
+			{ kind: "write_marker", status: "paused" },
+			{
+				kind: "notify",
+				level: "warning",
+				message: `Successful Gate finalization lost durable authority: ${event.reason}; use /flowcontinue to rebuild the checkpoint.`,
+			},
+		],
+	};
+}
+
 function reduceHumanFinishFailed(state: LeanFlowState): { effects: Effect[] } {
 	if (state.phase !== "awaiting_human") return { effects: [] };
 
@@ -750,6 +791,7 @@ function reduceHumanFinishFailed(state: LeanFlowState): { effects: Effect[] } {
 	recordTerminalFailure(state);
 	state.baselineCaptured = false;
 	state.finalizedGateSnapshot = undefined;
+	state.finalizationCommitNonce = undefined;
 	state.operationalRetrySnapshot = undefined;
 	state.gateRetryMode = undefined;
 	resetBlockedRecovery(state);

@@ -123,6 +123,31 @@ test("restore normalizes an older persisted state without new metric fields", ()
 	expect(restored.stats?.gateBlocked).toBe(0);
 });
 
+test("restore pauses a successful finalizing state without nonce-bound authority", () => {
+	const restored = restoreState([
+		{
+			type: "custom",
+			customType: CUSTOM_TYPE,
+			data: {
+				...defaultState(),
+				stateVersion: STATE_VERSION,
+				phase: "finalizing",
+				terminalOutcome: "pass",
+				gateAttempt: 1,
+				currentBuildRound: 1,
+			},
+		},
+	]);
+
+	expect(restored).toMatchObject({
+		phase: "awaiting_human",
+		terminalOutcome: undefined,
+		finalizedGateSnapshot: undefined,
+		finalizationCommitNonce: undefined,
+		recoveryAction: "flowcontinue_rebuild_checkpoint",
+	});
+});
+
 test("restore re-parses legacy approved validations into a canonical contract", () => {
 	const planDigest = "a".repeat(64);
 	const restored = restoreState([

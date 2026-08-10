@@ -6,6 +6,7 @@ import {
 	type ValidationSemanticState,
 } from "./validation";
 import {
+	isFinalizationCommitNonce,
 	parseFinalizedGateSnapshot,
 	parseOperationalRetrySnapshot,
 	type FinalizedGateSnapshot,
@@ -237,6 +238,8 @@ export interface LeanFlowState {
 	writtenArtifacts?: string[];
 	/** Atomic durable provenance manifest written after all Gate artifacts verify. */
 	finalizedGateSnapshot?: FinalizedGateSnapshot;
+	/** Cryptographic commit binding that makes the durable manifest authoritative for this state entry. */
+	finalizationCommitNonce?: string;
 	/** Identity retained only while retrying an operationally interrupted Gate. */
 	operationalRetrySnapshot?: OperationalRetrySnapshot;
 	/** Semantic BLOCKED identity and validation-state boundary. */
@@ -502,6 +505,19 @@ function normalizeState(value: unknown): LeanFlowState {
 		state.gateRetryMode === "repair" || state.gateRetryMode === "evidence" || state.gateRetryMode === "operational"
 			? state.gateRetryMode
 			: undefined;
+	let terminalOutcome =
+		state.terminalOutcome === "pass" ||
+		state.terminalOutcome === "fail_after_retry" ||
+		state.terminalOutcome === "gate_operational_failure"
+			? state.terminalOutcome
+			: undefined;
+	let recoveryAction =
+		state.recoveryAction === "repair_plan_and_reapprove" ||
+		state.recoveryAction === "refinalize_trusted_checkpoint" ||
+		state.recoveryAction === "flowcontinue_rebuild_checkpoint" ||
+		state.recoveryAction === "flowcontinue_after_lease_failure"
+			? state.recoveryAction
+			: undefined;
 	const planDigestValue = typeof state.planDigest === "string" ? state.planDigest : undefined;
 	const approvedValidationContract = normalizeApprovedValidationContract(
 		state.approvedValidationContract,
@@ -512,6 +528,9 @@ function normalizeState(value: unknown): LeanFlowState {
 	const repairLease = normalizeRepairLease(state.repairLease);
 	let gateLease = normalizeOperationLease(state.gateLease);
 	let finalizedGateSnapshot = parseFinalizedGateSnapshot(state.finalizedGateSnapshot);
+	let finalizationCommitNonce = isFinalizationCommitNonce(state.finalizationCommitNonce)
+		? state.finalizationCommitNonce
+		: undefined;
 	let operationalRetrySnapshot = parseOperationalRetrySnapshot(state.operationalRetrySnapshot);
 	let blockedRecovery = normalizeBlockedRecovery(state.blockedRecovery);
 	let baselineCaptured = state.baselineCaptured === true;
@@ -524,7 +543,8 @@ function normalizeState(value: unknown): LeanFlowState {
 		(finalizedGateSnapshot.runId !== state.runId ||
 			finalizedGateSnapshot.planSlug !== state.planSlug ||
 			finalizedGateSnapshot.planDigest !== planDigestValue ||
-			finalizedGateSnapshot.approvedValidationDigest !== approvedValidationDigest)
+			finalizedGateSnapshot.approvedValidationDigest !== approvedValidationDigest ||
+			finalizedGateSnapshot.finalizationCommitNonce !== finalizationCommitNonce)
 	) {
 		finalizedGateSnapshot = undefined;
 	}
@@ -551,6 +571,15 @@ function normalizeState(value: unknown): LeanFlowState {
 			phase = "building";
 			gateRetryMode = "evidence";
 		}
+	}
+	if (!finalizedGateSnapshot) finalizationCommitNonce = undefined;
+	if (phase === "finalizing" && terminalOutcome === "pass" && !finalizedGateSnapshot) {
+		phase = "awaiting_human";
+		terminalOutcome = undefined;
+		gateRetryMode = undefined;
+		baselineCaptured = false;
+		writtenArtifacts = [];
+		recoveryAction = "flowcontinue_rebuild_checkpoint";
 	}
 	if (phase === "gating" && (!gateLease || !finalizedGateSnapshot)) {
 		phase = "building";
@@ -613,12 +642,7 @@ function normalizeState(value: unknown): LeanFlowState {
 		approvalRepairBoundary: optionalNumber(state.approvalRepairBoundary),
 		runMarkerArtifact: typeof state.runMarkerArtifact === "string" ? state.runMarkerArtifact : undefined,
 		runMarkerStatus: isRunMarkerStatus(state.runMarkerStatus) ? state.runMarkerStatus : undefined,
-		terminalOutcome:
-			state.terminalOutcome === "pass" ||
-			state.terminalOutcome === "fail_after_retry" ||
-			state.terminalOutcome === "gate_operational_failure"
-				? state.terminalOutcome
-				: undefined,
+		terminalOutcome,
 		persistenceDegraded: state.persistenceDegraded === true,
 		persistenceFailureStage:
 			state.persistenceFailureStage === "precondition" ||
@@ -652,15 +676,10 @@ function normalizeState(value: unknown): LeanFlowState {
 		buildMutationObserved: state.buildMutationObserved === true,
 		writtenArtifacts,
 		finalizedGateSnapshot,
+		finalizationCommitNonce,
 		operationalRetrySnapshot,
 		blockedRecovery,
-		recoveryAction:
-			state.recoveryAction === "repair_plan_and_reapprove" ||
-			state.recoveryAction === "refinalize_trusted_checkpoint" ||
-			state.recoveryAction === "flowcontinue_rebuild_checkpoint" ||
-			state.recoveryAction === "flowcontinue_after_lease_failure"
-				? state.recoveryAction
-				: undefined,
+		recoveryAction,
 		consecutiveGateErrors:
 			typeof state.consecutiveGateErrors === "number" &&
 			Number.isFinite(state.consecutiveGateErrors) &&

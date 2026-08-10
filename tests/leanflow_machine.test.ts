@@ -74,6 +74,7 @@ function attachFinalizedSnapshot(state: LeanFlowState): void {
 			},
 		],
 	});
+	state.finalizationCommitNonce = state.finalizedGateSnapshot.finalizationCommitNonce;
 }
 
 function operationalEvent(state: LeanFlowState, type: "gate_error" | "gate_interrupted"): GateEvent {
@@ -187,6 +188,7 @@ test("first FAIL starts a repair round with artifacts cleared before initializat
 		lastGateFindings: '{"id":"first"}',
 		writtenArtifacts: [],
 	});
+	expect(state.finalizationCommitNonce).toBeUndefined();
 	expect(state.stats).toMatchObject({ gateVerdictFailures: 1, repairRounds: 1 });
 	expect(state.consecutiveGateErrors).toBe(0);
 	expect(effects.map((effect) => effect.kind)).toEqual(["clear_artifacts", "notify", "begin_repair_round"]);
@@ -274,6 +276,7 @@ test("BLOCKED returns to BUILD without consuming a verdict", () => {
 	const { effects } = reduceGate(state, blockedEvent());
 
 	expect(state).toMatchObject({ phase: "building", gateCalls: 0, gateRetryMode: "evidence", gateLease: undefined });
+	expect(state.finalizationCommitNonce).toBeUndefined();
 	expect(state.stats).toMatchObject({ gateBlocked: 1 });
 	expect(effects.map((effect) => effect.kind)).toEqual(["clear_artifacts", "notify"]);
 	expect(checkInvariants(state)).toEqual([]);

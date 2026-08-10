@@ -671,6 +671,44 @@ function isRunMarker(value: unknown, approvedArtifact: string): value is RunMark
 		(marker.lspProbeStatus === "not_required" || marker.lspProbeStatus === "pending")
 	);
 }
+const DIRECTORY_SYNC_UNSUPPORTED_CODES: Record<string, true> = {
+	EINVAL: true,
+	ENOTSUP: true,
+	EOPNOTSUPP: true,
+	ENOSYS: true,
+	EPERM: true,
+};
+
+async function syncParentDirectoryBestEffort(filePath: string): Promise<void> {
+	if (process.platform === "win32") return;
+	let handle: fs.FileHandle | undefined;
+	try {
+		handle = await fs.open(path.dirname(filePath), "r");
+		await handle.sync();
+	} catch (error) {
+		const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
+		if (typeof code === "string" && DIRECTORY_SYNC_UNSUPPORTED_CODES[code] === true) return;
+		throw error;
+	} finally {
+		await handle?.close();
+	}
+}
+
+function syncParentDirectoryBestEffortSync(filePath: string): void {
+	if (process.platform === "win32") return;
+	let descriptor: number | undefined;
+	try {
+		descriptor = fsSync.openSync(path.dirname(filePath), "r");
+		fsSync.fsyncSync(descriptor);
+	} catch (error) {
+		const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
+		if (typeof code === "string" && DIRECTORY_SYNC_UNSUPPORTED_CODES[code] === true) return;
+		throw error;
+	} finally {
+		if (descriptor !== undefined) fsSync.closeSync(descriptor);
+	}
+}
+
 async function writeTextAtomically(filePath: string, content: string): Promise<void> {
 	await fs.mkdir(path.dirname(filePath), { recursive: true });
 	const temporary = `${filePath}.tmp-${process.pid}-${randomUUID()}`;
@@ -683,6 +721,7 @@ async function writeTextAtomically(filePath: string, content: string): Promise<v
 			await handle.close();
 		}
 		await fs.rename(temporary, filePath);
+		await syncParentDirectoryBestEffort(filePath);
 	} catch (error) {
 		await fs.rm(temporary, { force: true });
 		throw error;
@@ -766,6 +805,24 @@ export default function leanflow(pi: ExtensionAPI): void {
 	function persist(): void {
 		pi.appendEntry(CUSTOM_TYPE, state);
 		hasPersistedLeanFlowState = true;
+	}
+
+	/** Atomically publishes a complete state candidate without exposing it as live authority first. */
+	function persistCandidateState(candidate: LeanFlowState): void {
+		pi.appendEntry(CUSTOM_TYPE, candidate);
+		hasPersistedLeanFlowState = true;
+	}
+	function branchContainsFinalizationCandidate(ctx: ExtensionContext, candidate: LeanFlowState): boolean {
+		if (!candidate.finalizedGateSnapshot || !candidate.finalizationCommitNonce) return false;
+		const restored = restoreState(ctx.sessionManager.getBranch());
+		return (
+			restored.runId === candidate.runId &&
+			restored.currentBuildRound === candidate.currentBuildRound &&
+			restored.finalizationCommitNonce === candidate.finalizationCommitNonce &&
+			restored.finalizedGateSnapshot !== undefined &&
+			finalizedGateSnapshotDigest(restored.finalizedGateSnapshot) ===
+				finalizedGateSnapshotDigest(candidate.finalizedGateSnapshot)
+		);
 	}
 
 	/** Statistics observation and its standalone persistence are non-blocking. */
@@ -937,6 +994,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 		return finalizedSnapshotPathFor(ctx, state.runId);
 	}
 
+
 	async function writeBuildTextAtomically(
 		ctx: ExtensionContext,
 		identity: BuildOperationIdentity,
@@ -967,6 +1025,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 			// The final authority check and rename are synchronous: no lifecycle
 			// activation can interleave and publish an operation after replacement.
 			fsSync.renameSync(temporary, filePath);
+			syncParentDirectoryBestEffortSync(filePath);
 			return true;
 		} catch (error) {
 			await fs.rm(temporary, { force: true });
@@ -1147,9 +1206,15 @@ export default function leanflow(pi: ExtensionAPI): void {
 		const snapshotDigest = finalizedGateSnapshotDigest(manifest);
 		if (
 			!state.finalizedGateSnapshot ||
+			!state.finalizationCommitNonce ||
+			state.finalizationCommitNonce !== manifest.finalizationCommitNonce ||
 			finalizedGateSnapshotDigest(state.finalizedGateSnapshot) !== snapshotDigest
 		) {
-			return { ok: false, kind: "artifact_rebuildable", reason: "persisted finalized Gate manifest does not match state" };
+			return {
+				ok: false,
+				kind: "artifact_rebuildable",
+				reason: "persisted finalized Gate manifest does not match state commit binding",
+			};
 		}
 		if (manifest.runId !== state.runId || manifest.planSlug !== state.planSlug || manifest.planDigest !== state.planDigest) {
 			return { ok: false, kind: "plan_drift", reason: "finalized Gate manifest does not match the approved plan" };
@@ -1363,6 +1428,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 			state.writtenArtifacts = [];
 			state.recoveryAction = undefined;
 			state.finalizedGateSnapshot = undefined;
+			state.finalizationCommitNonce = undefined;
 			state.operationalRetrySnapshot = undefined;
 			resetBlockedRecovery(state);
 			return { ok: true, round: 1, baselinePresent: false, freshRecord: true, lspEvidencePresent: false };
@@ -1564,13 +1630,13 @@ export default function leanflow(pi: ExtensionAPI): void {
 			.filter((relative) => relative !== ".leanflow" && !relative.startsWith(".leanflow/"))
 			.sort((left, right) => Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8")));
 		for (const relative of untrackedPaths) {
-			const { absolute } = await validateUntrackedPath(ctx, relative);
-			const stat = await fs.lstat(absolute);
+			const { absolute, stat } = await validateUntrackedPath(ctx, relative);
 			if (stat.isSymbolicLink()) {
 				untrackedEntries.push(`${relative}\0symlink\0${await fs.readlink(absolute)}`);
 			} else {
+				const executable = (stat.mode & 0o111) === 0 ? "-" : "x";
 				const digest = createHash("sha256").update(await fs.readFile(absolute)).digest("hex");
-				untrackedEntries.push(`${relative}\0file\0${digest}`);
+				untrackedEntries.push(`${relative}\0file\0${executable}\0${digest}`);
 			}
 		}
 		const trackedDiffDigest = sha256Hex(trackedDiff);
@@ -1596,7 +1662,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 	async function validateUntrackedPath(
 		ctx: ExtensionContext,
 		relative: string,
-	): Promise<{ absolute: string; size: number }> {
+	): Promise<{ absolute: string; size: number; stat: fsSync.Stats }> {
 		if (
 			relative.includes("\0") ||
 			path.isAbsolute(relative) ||
@@ -1612,15 +1678,21 @@ export default function leanflow(pi: ExtensionAPI): void {
 		if (absolute === root || !absolute.startsWith(`${root}${path.sep}`)) {
 			throw new Error(`untracked path escapes the repository: ${JSON.stringify(relative)}`);
 		}
-		const real = await fs.realpath(absolute);
-		if (real !== root && !real.startsWith(`${root}${path.sep}`)) {
-			throw new Error(`untracked path resolves outside the repository: ${JSON.stringify(relative)}`);
+		const realRoot = await fs.realpath(root);
+		const realParent = await fs.realpath(path.dirname(absolute));
+		if (realParent !== realRoot && !realParent.startsWith(`${realRoot}${path.sep}`)) {
+			throw new Error(`untracked path parent resolves outside the repository: ${JSON.stringify(relative)}`);
 		}
 		const stat = await fs.lstat(absolute);
-		if (!stat.isFile() && !stat.isSymbolicLink()) {
-			throw new Error(`untracked path is not a file: ${JSON.stringify(relative)}`);
+		if (stat.isSymbolicLink()) return { absolute, size: stat.size, stat };
+		if (!stat.isFile()) {
+			throw new Error(`untracked path has an unsupported special-file type: ${JSON.stringify(relative)}`);
 		}
-		return { absolute, size: stat.size };
+		const real = await fs.realpath(absolute);
+		if (real !== realRoot && !real.startsWith(`${realRoot}${path.sep}`)) {
+			throw new Error(`untracked path resolves outside the repository: ${JSON.stringify(relative)}`);
+		}
+		return { absolute, size: stat.size, stat };
 	}
 	async function writeRunMarker(ctx: ExtensionContext, status: NonNullable<LeanFlowState["runMarkerStatus"]>): Promise<boolean> {
 		if (!state.runId || !state.planSlug || !state.planArtifact || !state.planDigest || !state.startedAt || !state.stats) {
@@ -2429,6 +2501,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 			approvedValidationContract: value.approvedValidationContract,
 			approvedValidationDigest: value.approvedValidationDigest,
 			finalizedGateSnapshot: value.finalizedGateSnapshot,
+			finalizationCommitNonce: value.finalizationCommitNonce,
 			operationalRetrySnapshot: value.operationalRetrySnapshot,
 			blockedRecovery: value.blockedRecovery,
 		});
@@ -2466,6 +2539,16 @@ export default function leanflow(pi: ExtensionAPI): void {
 		const fingerprintBeforeReconcile = reconciliationFingerprint(state);
 		const { effects } = reduceGate(state, { type: "restore_reconcile", now: Date.now() });
 		await executeGateEffects(ctx, effects);
+		if (state.phase === "finalizing" && state.terminalOutcome === "pass") {
+			const finalized = await verifyDurableFinalizedSnapshot(ctx);
+			if (!finalized.ok) {
+				await applyGateRecoveryEvent(ctx, {
+					type: "finalization_authority_invalid",
+					reason: finalized.reason,
+				});
+			}
+		}
+
 
 		let restoredGateBecameOperational = false;
 		if (wasGatingRaw) {
@@ -2847,6 +2930,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 					(state.writtenArtifacts?.length ?? 0) > 0
 				) {
 					state.finalizedGateSnapshot = undefined;
+					state.finalizationCommitNonce = undefined;
 					state.operationalRetrySnapshot = undefined;
 					state.writtenArtifacts = [];
 					try {
@@ -2922,6 +3006,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 				}
 				if (!isBuildOperationCurrent(ctx, identity)) return discardedBuildOperation("validation");
 				state.finalizedGateSnapshot = undefined;
+				state.finalizationCommitNonce = undefined;
 				state.writtenArtifacts = [];
 				if (!after || before.combinedDigest !== after.combinedDigest) {
 					state.buildMutationObserved = true;
@@ -3130,9 +3215,6 @@ export default function leanflow(pi: ExtensionAPI): void {
 				] as const;
 
 				if (!isBuildOperationCurrent(ctx, operation)) return discardedBuildOperation("artifact finalization");
-				state.writtenArtifacts = [];
-				state.finalizedGateSnapshot = undefined;
-				persist();
 
 				const verified: string[] = [];
 				const artifactDigests = new Map<string, string>();
@@ -3179,10 +3261,24 @@ export default function leanflow(pi: ExtensionAPI): void {
 				if (!persistedManifest || finalizedGateSnapshotDigest(persistedManifest) !== finalizedGateSnapshotDigest(manifest)) {
 					throw new Error("finalized Gate manifest failed atomic persistence verification");
 				}
-				state.finalizedGateSnapshot = persistedManifest;
-				state.operationalRetrySnapshot = undefined;
-				state.writtenArtifacts = [...REQUIRED_ARTIFACTS];
-				persist();
+				const candidate: LeanFlowState = {
+					...state,
+					finalizedGateSnapshot: persistedManifest,
+					finalizationCommitNonce: persistedManifest.finalizationCommitNonce,
+					operationalRetrySnapshot: undefined,
+					writtenArtifacts: [...REQUIRED_ARTIFACTS],
+				};
+				try {
+					persistCandidateState(candidate);
+				} catch (error) {
+					if (!branchContainsFinalizationCandidate(ctx, candidate)) {
+						throw new Error(`finalized Gate authority could not be persisted: ${evidenceFailureMessage(error)}`);
+					}
+					// appendEntry may commit and then throw. The exact nonce-bound
+					// branch entry proves durable success despite the ambiguous return.
+					hasPersistedLeanFlowState = true;
+				}
+				state = candidate;
 				return {
 					content: [
 						{

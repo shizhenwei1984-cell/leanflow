@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { expect, test } from "bun:test";
@@ -71,6 +71,7 @@ type PersistedState = {
 	persistenceFailureMessage?: string;
 	writtenArtifacts?: string[];
 	finalizedGateSnapshot?: unknown;
+	finalizationCommitNonce?: string;
 	gateRetryMode?: "repair" | "operational" | "evidence";
 	humanRepairCycles?: number;
 	lastGateFindings?: string;
@@ -94,6 +95,8 @@ type Harness = {
 type HarnessOptions = {
 	execResults?: ExecResult[];
 	exec?: (call: ExecCall) => ExecResult | Promise<ExecResult> | undefined;
+	onAppendEntry?: (candidate: PersistedState) => void;
+	afterAppendEntry?: (candidate: PersistedState) => void;
 };
 
 function createHarness(options: HarnessOptions = {}): Harness {
@@ -153,8 +156,10 @@ function createHarness(options: HarnessOptions = {}): Harness {
 		},
 		appendEntry: (customType: string, state: PersistedState) => {
 			const snapshot = structuredClone(state);
+			options.onAppendEntry?.(snapshot);
 			states.push(snapshot);
 			branch.push({ type: "custom", customType, data: snapshot });
+			options.afterAppendEntry?.(snapshot);
 		},
 	};
 	leanflow(pi as never);
@@ -169,6 +174,23 @@ function createHarness(options: HarnessOptions = {}): Harness {
 		notifications,
 		states,
 		tools,
+	};
+}
+
+function untrackedRepositoryExec(relative: string, duringValidation?: () => void): (call: ExecCall) => ExecResult {
+	return ({ command, args }) => {
+		if (command !== "git") {
+			duringValidation?.();
+			return { stdout: "1 pass\n0 fail\n", stderr: "", code: 0, killed: false };
+		}
+		if (args[0] === "rev-parse") return { stdout: `${"a".repeat(40)}\n`, stderr: "", code: 0, killed: false };
+		if (args[0] === "status") return { stdout: `?? ${relative}\n`, stderr: "", code: 0, killed: false };
+		if (args[0] === "ls-files") return { stdout: `${relative}\0`, stderr: "", code: 0, killed: false };
+		if (args[0] === "diff" && args.includes("--no-index")) {
+			return { stdout: `diff --git a/dev/null b/${relative}\n`, stderr: "", code: 1, killed: false };
+		}
+		if (args[0] === "diff") return { stdout: "", stderr: "", code: 0, killed: false };
+		return { stdout: "", stderr: `unexpected git arguments: ${args.join(" ")}`, code: 2, killed: false };
 	};
 }
 
@@ -1608,6 +1630,7 @@ test("accepts one strict Gate call with canonical artifact references", async ()
 			harness.states.at(-1) as PersistedState & { finalizedGateSnapshot?: FinalizedGateSnapshot }
 		).finalizedGateSnapshot;
 		if (!finalizedSnapshot) throw new Error("finalized Gate snapshot is unavailable");
+		expect(harness.states.at(-1)!.finalizationCommitNonce).toBe(finalizedSnapshot.finalizationCommitNonce);
 		const expectedSnapshot = finalizedGateSnapshotDigest(finalizedSnapshot);
 		expect(harness.states.at(-1)).toMatchObject({
 			phase: "gating",
@@ -2465,6 +2488,177 @@ test("partial artifact writes never mark Gate evidence ready", async () => {
 	expect(finalized.isError).toBe(true);
 	expect(harness.states.at(-1)!.writtenArtifacts).toEqual([]);
 	expect(existsSync(resolveRunMarkerPath(harness.ctx.localProtocolOptions, EXAMPLE_BUILD_ARTIFACT)!)).toBe(true);
+});
+
+test("candidate persistence failure leaves a written manifest non-authoritative", async () => {
+	const harness = createHarness({
+		onAppendEntry: (candidate) => {
+			if (candidate.finalizedGateSnapshot) throw new Error("injected candidate append failure");
+		},
+	});
+	await enterDocumentationBuild(harness);
+	expect((await executeRegisteredTool(harness, "leanflow_capture_baseline", {})).isError).not.toBe(true);
+	await recordSuccessfulValidation(harness, "bun test candidate-append-failure");
+	const stateCountBeforeFinalization = harness.states.length;
+
+	const finalized = await executeRegisteredTool(harness, "leanflow_finalize_artifacts", {});
+	expect(finalized.isError).toBe(true);
+	expect(harness.states).toHaveLength(stateCountBeforeFinalization);
+	expect(JSON.stringify(finalized.content)).toContain("candidate append failure");
+	expect(harness.states.at(-1)).toMatchObject({
+		finalizedGateSnapshot: undefined,
+		finalizationCommitNonce: undefined,
+		writtenArtifacts: [],
+	});
+	const manifestPath = resolveRunMarkerPath(
+		harness.ctx.localProtocolOptions,
+		`local://.leanflow/runs/${harness.states.at(-1)!.runId!}-finalized-gate.json`,
+	)!;
+	expect(existsSync(manifestPath)).toBe(true);
+	await harness.handlers.get("session_switch")!({}, harness.ctx);
+	expect(harness.states.at(-1)).toMatchObject({
+		finalizedGateSnapshot: undefined,
+		finalizationCommitNonce: undefined,
+		writtenArtifacts: [],
+	});
+
+	expect(
+		await harness.handlers.get("tool_call")!(
+			{ toolName: "task", toolCallId: "gate-after-candidate-append-failure", input: gateCallInput() },
+			harness.ctx,
+		),
+	).toMatchObject({ block: true });
+	expect(harness.states.at(-1)!.gateDispatches ?? 0).toBe(0);
+});
+
+test("append-then-throw reconciles an exact nonce-bound finalization commit", async () => {
+	let throwAfterCandidate = true;
+	const harness = createHarness({
+		afterAppendEntry: (candidate) => {
+			if (throwAfterCandidate && candidate.finalizedGateSnapshot) {
+				throwAfterCandidate = false;
+				throw new Error("injected post-append ambiguity");
+			}
+		},
+	});
+	await enterDocumentationBuild(harness);
+	await completeBuildEvidence(harness, "bun test append-then-throw");
+
+	const committed = harness.states.at(-1)!;
+	expect(committed.finalizedGateSnapshot).toBeDefined();
+	expect(committed.finalizationCommitNonce).toBeDefined();
+	expect(
+		await harness.handlers.get("tool_call")!(
+			{ toolName: "task", toolCallId: "gate-after-ambiguous-append", input: gateCallInput() },
+			harness.ctx,
+		),
+	).toBeUndefined();
+	expect(harness.states.at(-1)?.phase).toBe("gating");
+});
+
+test("restored successful finalization without its durable manifest pauses safely", async () => {
+	const harness = createHarness();
+	await enterDocumentationBuild(harness);
+	await completeBuildEvidence(harness, "bun test finalizing-restore-authority");
+	await harness.handlers.get("tool_call")!(
+		{ toolName: "task", toolCallId: "finalizing-authority-gate", input: gateCallInput() },
+		harness.ctx,
+	);
+	await harness.handlers.get("tool_result")!(
+		{
+			toolName: "task",
+			toolCallId: "finalizing-authority-gate",
+			isError: false,
+			content: [{ type: "text", text: JSON.stringify({ verdict: "PASS", findings: [] }) }],
+		},
+		harness.ctx,
+	);
+	expect(harness.states.at(-1)).toMatchObject({ phase: "finalizing", terminalOutcome: "pass" });
+
+	rmSync(finalizedManifestPath(harness), { force: true });
+	await harness.handlers.get("session_switch")!({}, harness.ctx);
+	expect(harness.states.at(-1)).toMatchObject({
+		phase: "awaiting_human",
+		terminalOutcome: undefined,
+		finalizedGateSnapshot: undefined,
+		finalizationCommitNonce: undefined,
+		recoveryAction: "flowcontinue_rebuild_checkpoint",
+	});
+	await harness.handlers.get("agent_end")!({}, harness.ctx);
+	expect(harness.states.at(-1)?.phase).toBe("awaiting_human");
+});
+
+test("untracked executable state invalidates finalized Gate provenance", async () => {
+	const harness = createHarness({ exec: untrackedRepositoryExec("script.sh") });
+	const scriptPath = join(harness.ctx.cwd, "script.sh");
+	writeFileSync(scriptPath, "#!/bin/sh\nexit 0\n");
+	chmodSync(scriptPath, 0o644);
+	await enterDocumentationBuild(harness);
+	await completeBuildEvidence(harness);
+
+	chmodSync(scriptPath, 0o755);
+	expect(
+		await harness.handlers.get("tool_call")!(
+			{ toolName: "task", toolCallId: "gate-after-untracked-chmod", input: gateCallInput() },
+			harness.ctx,
+		),
+	).toMatchObject({ block: true, reason: expect.stringContaining("repository state changed") });
+});
+
+test("an approved validation that only chmods an untracked file is stale", async () => {
+	let scriptPath = "";
+	const harness = createHarness({
+		exec: untrackedRepositoryExec("validation.sh", () => chmodSync(scriptPath, 0o755)),
+	});
+	scriptPath = join(harness.ctx.cwd, "validation.sh");
+	writeFileSync(scriptPath, "#!/bin/sh\nexit 0\n");
+	chmodSync(scriptPath, 0o644);
+	await enterDocumentationBuild(harness);
+	expect((await executeRegisteredTool(harness, "leanflow_capture_baseline", {})).isError).not.toBe(true);
+
+	const validation = await executeRegisteredTool(harness, "leanflow_run_validation", {
+		validationId: (harness.states.at(-1) as PersistedState & {
+			approvedValidationContract: { validations: Array<{ id: string }> };
+		}).approvedValidationContract.validations[0]!.id,
+	});
+	expect(validation.isError).toBe(true);
+	expect(JSON.stringify(validation.content)).toContain("mutated repository state; its evidence is stale");
+	const record = JSON.parse(readFileSync(buildRecordPath(harness), "utf8"));
+	expect(record.observations.at(-1)).toMatchObject({ isError: false });
+	expect(record.observations.at(-1).repositoryFingerprintBefore).not.toBe(record.observations.at(-1).repositoryFingerprintAfter);
+	expect(harness.states.at(-1)!.buildMutationObserved).toBe(true);
+});
+
+test("untracked symlink target changes invalidate finalized Gate provenance", async () => {
+	const harness = createHarness({ exec: untrackedRepositoryExec("linked") });
+	const linkPath = join(harness.ctx.cwd, "linked");
+	symlinkSync("../outside-first", linkPath);
+	await enterDocumentationBuild(harness);
+	await completeBuildEvidence(harness);
+
+	rmSync(linkPath);
+	symlinkSync("../outside-second", linkPath);
+	expect(
+		await harness.handlers.get("tool_call")!(
+			{ toolName: "task", toolCallId: "gate-after-symlink-target-change", input: gateCallInput() },
+			harness.ctx,
+		),
+	).toMatchObject({ block: true, reason: expect.stringContaining("repository state changed") });
+});
+
+test("untracked special files fail closed during fingerprint capture", async () => {
+	const harness = createHarness({ exec: untrackedRepositoryExec("unsupported") });
+	mkdirSync(join(harness.ctx.cwd, "unsupported"));
+	await enterDocumentationBuild(harness);
+	expect((await executeRegisteredTool(harness, "leanflow_capture_baseline", {})).isError).not.toBe(true);
+
+	const validation = await executeRegisteredTool(harness, "leanflow_run_validation", {
+		validationId: (harness.states.at(-1) as PersistedState & {
+			approvedValidationContract: { validations: Array<{ id: string }> };
+		}).approvedValidationContract.validations[0]!.id,
+	});
+	expect(validation.isError).toBe(true);
+	expect(JSON.stringify(validation.content)).toContain("unsupported special-file type");
 });
 
 test("duplicate and fenced LSP declarations fail safe as required", async () => {

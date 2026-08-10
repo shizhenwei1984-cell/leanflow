@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { OperationLease, RepositoryFingerprint } from "./state";
 import {
 	validationStatesDigest,
@@ -6,13 +6,15 @@ import {
 	type ValidationSemanticStatus,
 } from "./validation";
 
-export const FINALIZED_GATE_SNAPSHOT_VERSION = 1 as const;
+export const FINALIZED_GATE_SNAPSHOT_VERSION = 2 as const;
 export const OPERATIONAL_RETRY_SNAPSHOT_VERSION = 1 as const;
 
 export type OperationalInterruption = "tool_error" | "session_switch" | "transport_error" | "invalid_gate_output";
 
 export interface FinalizedGateSnapshot {
-	version: 1;
+	version: 2;
+	/** Cryptographically unpredictable commit binding shared only with the durable state entry. */
+	finalizationCommitNonce: string;
 	runId: string;
 	planSlug: string;
 	planDigest: string;
@@ -41,6 +43,7 @@ const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const FINALIZED_KEYS = [
 	"version",
+	"finalizationCommitNonce",
 	"runId",
 	"planSlug",
 	"planDigest",
@@ -104,6 +107,10 @@ function nonEmpty(value: unknown): value is string {
 
 function isSha(value: unknown): value is string {
 	return typeof value === "string" && SHA256_PATTERN.test(value);
+}
+
+export function isFinalizationCommitNonce(value: unknown): value is string {
+	return typeof value === "string" && RUN_ID_PATTERN.test(value);
 }
 
 function parseRepositoryFingerprint(value: unknown): RepositoryFingerprint | undefined {
@@ -224,11 +231,12 @@ export function semanticEvidenceDigest(
 export function createFinalizedGateSnapshot(
 	input: Omit<
 		FinalizedGateSnapshot,
-		"version" | "validationStatesDigest" | "semanticEvidenceDigest" | "finalizedAt"
-	> & { finalizedAt?: string },
+		"version" | "finalizationCommitNonce" | "validationStatesDigest" | "semanticEvidenceDigest" | "finalizedAt"
+	> & { finalizedAt?: string; finalizationCommitNonce?: string },
 ): FinalizedGateSnapshot {
 	const snapshot: FinalizedGateSnapshot = {
 		version: FINALIZED_GATE_SNAPSHOT_VERSION,
+		finalizationCommitNonce: input.finalizationCommitNonce ?? randomUUID(),
 		runId: input.runId,
 		planSlug: input.planSlug,
 		planDigest: input.planDigest,
@@ -259,6 +267,7 @@ export function parseFinalizedGateSnapshot(value: unknown): FinalizedGateSnapsho
 	const validationStates = parseValidationStates(value.validationStates);
 	if (
 		value.version !== FINALIZED_GATE_SNAPSHOT_VERSION ||
+		!isFinalizationCommitNonce(value.finalizationCommitNonce) ||
 		!nonEmpty(value.runId) ||
 		!RUN_ID_PATTERN.test(value.runId) ||
 		!nonEmpty(value.planSlug) ||
@@ -281,6 +290,7 @@ export function parseFinalizedGateSnapshot(value: unknown): FinalizedGateSnapsho
 	}
 	const parsed: FinalizedGateSnapshot = {
 		version: FINALIZED_GATE_SNAPSHOT_VERSION,
+		finalizationCommitNonce: value.finalizationCommitNonce,
 		runId: value.runId,
 		planSlug: value.planSlug,
 		planDigest: value.planDigest,

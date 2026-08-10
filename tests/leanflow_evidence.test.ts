@@ -276,6 +276,13 @@ test("finalized manifest schema binds every provenance digest and rejects tamper
 		finalizedAt: "2026-08-10T00:00:00.000Z",
 	});
 	expect(parseFinalizedGateSnapshot(JSON.parse(JSON.stringify(manifest)))).toEqual(manifest);
+	expect(manifest.version).toBe(2);
+	expect(manifest.finalizationCommitNonce).toMatch(
+		/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+	);
+	expect(parseFinalizedGateSnapshot({ ...manifest, version: 1 })).toBeUndefined();
+	const { finalizationCommitNonce: _legacyNonce, ...legacyManifest } = manifest;
+	expect(parseFinalizedGateSnapshot(legacyManifest)).toBeUndefined();
 	const repeatedOutput = createFinalizedGateSnapshot({
 		runId,
 		planSlug,
