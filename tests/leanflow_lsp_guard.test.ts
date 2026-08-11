@@ -6,7 +6,15 @@ import { expect, test } from "bun:test";
 import { z } from "zod";
 import { canonicalGateTask } from "../extensions/leanflow/guard";
 import { assessHandoff, formatHandoffNotification } from "../extensions/leanflow/handoff";
-import leanflow, { resolveRunMarkerPath, setBuildPublicationStageHookForTest } from "../extensions/leanflow/index";
+import leanflow, {
+	resolveRunMarkerPath,
+	setAtomicPublicationAfterCloseHookForTest,
+	setBuildPublicationStageHookForTest,
+	setFreshRecoveryLookupHookForTest,
+	setGatePreflightHookForTest,
+	setProposalLookupHookForTest,
+	setRestoreSessionHookForTest,
+} from "../extensions/leanflow/index";
 import { finalizedGateSnapshotDigest, type FinalizedGateSnapshot } from "../extensions/leanflow/provenance";
 
 type TestContext = {
@@ -1012,6 +1020,319 @@ test("session restoration clears a pending LSP lease and ignores its late result
 	});
 });
 
+test("control operation identities discard callbacks from a cancelled run after replacement", async () => {
+	const planHarness = createHarness();
+	const planCall = planHarness.handlers.get("tool_call")!;
+	const planResult = planHarness.handlers.get("tool_result")!;
+	await writeInitialPlan(planHarness);
+	await planCall(
+		{ toolName: "write", toolCallId: "late-plan-mutation", input: { path: EXAMPLE_PLAN_ARTIFACT, content: "replacement" } },
+		planHarness.ctx,
+	);
+	await planHarness.commands.get("flowcancel")!.handler("", planHarness.ctx);
+	await planHarness.commands.get("flow")!.handler("replacement plan", planHarness.ctx);
+	const replacementPlan = planHarness.states.at(-1)!;
+	const planStateCount = planHarness.states.length;
+	await planResult({ toolName: "write", toolCallId: "late-plan-mutation", isError: false }, planHarness.ctx);
+	expect(planHarness.states).toHaveLength(planStateCount);
+	expect(planHarness.states.at(-1)).toMatchObject({ phase: "planning", runId: replacementPlan.runId });
+
+	const approvalHarness = createHarness();
+	const approvalCall = approvalHarness.handlers.get("tool_call")!;
+	const approvalResult = approvalHarness.handlers.get("tool_result")!;
+	await writeInitialPlan(approvalHarness);
+	await approvalCall(
+		{ toolName: "write", toolCallId: "late-approval", input: { path: "xd://propose", content: EXAMPLE_SLUG } },
+		approvalHarness.ctx,
+	);
+	await approvalHarness.commands.get("flowcancel")!.handler("", approvalHarness.ctx);
+	await approvalHarness.commands.get("flow")!.handler("replacement approval", approvalHarness.ctx);
+	const replacementApproval = approvalHarness.states.at(-1)!;
+	const staleMarkerPath = resolveRunMarkerPath(
+		approvalHarness.ctx.localProtocolOptions,
+		hashedPointerArtifact(EXAMPLE_SLUG),
+	)!;
+	const markerBeforeLateApproval = readFileSync(staleMarkerPath, "utf8");
+	const approvalStateCount = approvalHarness.states.length;
+	await approvalResult({ toolName: "write", toolCallId: "late-approval", isError: false }, approvalHarness.ctx);
+	expect(approvalHarness.states).toHaveLength(approvalStateCount);
+	expect(approvalHarness.states.at(-1)).toMatchObject({ phase: "planning", runId: replacementApproval.runId });
+	expect(readFileSync(staleMarkerPath, "utf8")).toBe(markerBeforeLateApproval);
+
+	const lspHarness = createHarness();
+	const lspCall = lspHarness.handlers.get("tool_call")!;
+	const lspResult = lspHarness.handlers.get("tool_result")!;
+	await enterDocumentationBuild(lspHarness);
+	await lspCall(
+		{ toolName: "write", toolCallId: "late-lsp", input: { path: "xd://lsp", content: JSON.stringify({ action: "diagnostics", file: "src/example.ts" }) } },
+		lspHarness.ctx,
+	);
+	await lspHarness.commands.get("flowcancel")!.handler("", lspHarness.ctx);
+	await lspHarness.commands.get("flow")!.handler("replacement lsp", lspHarness.ctx);
+	const replacementLsp = lspHarness.states.at(-1)!;
+	const lspStateCount = lspHarness.states.length;
+	await lspResult({ toolName: "write", toolCallId: "late-lsp", isError: false }, lspHarness.ctx);
+	expect(lspHarness.states).toHaveLength(lspStateCount);
+	expect(lspHarness.states.at(-1)).toMatchObject({ phase: "planning", runId: replacementLsp.runId });
+
+	const gateHarness = createHarness();
+	const gateCall = gateHarness.handlers.get("tool_call")!;
+	const gateResult = gateHarness.handlers.get("tool_result")!;
+	await enterDocumentationBuild(gateHarness);
+	await completeBuildEvidence(gateHarness, "bun test control-identity");
+	await gateCall({ toolName: "task", toolCallId: "late-gate", input: gateCallInput() }, gateHarness.ctx);
+	await gateHarness.commands.get("flowcancel")!.handler("", gateHarness.ctx);
+	await gateHarness.commands.get("flow")!.handler("replacement gate", gateHarness.ctx);
+	const replacementGate = gateHarness.states.at(-1)!;
+	const gateStateCount = gateHarness.states.length;
+	await gateResult(
+		{ toolName: "task", toolCallId: "late-gate", isError: false, content: [{ type: "text", text: JSON.stringify({ verdict: "PASS", findings: [] }) }] },
+		gateHarness.ctx,
+	);
+	expect(gateHarness.states).toHaveLength(gateStateCount);
+	expect(gateHarness.states.at(-1)).toMatchObject({ phase: "planning", runId: replacementGate.runId });
+});
+
+test("an older same-run plan callback cannot overwrite a newer canonical revision", async () => {
+	const harness = createHarness();
+	const call = harness.handlers.get("tool_call")!;
+	const result = harness.handlers.get("tool_result")!;
+	await writeInitialPlan(harness);
+	const planPath = resolveRunMarkerPath(harness.ctx.localProtocolOptions, EXAMPLE_PLAN_ARTIFACT)!;
+
+	await call(
+		{ toolName: "write", toolCallId: "older-plan-write", input: { path: EXAMPLE_PLAN_ARTIFACT, content: "older revision" } },
+		harness.ctx,
+	);
+	writeFileSync(planPath, `${readFileSync(planPath, "utf8")}\n\n## Revision\n- Keep the newer canonical plan.`);
+	await call(
+		{ toolName: "write", toolCallId: "newer-plan-write", input: { path: EXAMPLE_PLAN_ARTIFACT, content: "newer revision" } },
+		harness.ctx,
+	);
+	await result({ toolName: "write", toolCallId: "newer-plan-write", isError: false }, harness.ctx);
+	const newerState = harness.states.at(-1)!;
+	const stateCount = harness.states.length;
+
+	await result({ toolName: "write", toolCallId: "older-plan-write", isError: false }, harness.ctx);
+	expect(harness.states).toHaveLength(stateCount);
+	expect(harness.states.at(-1)).toMatchObject({
+		runId: newerState.runId,
+		planDigest: newerState.planDigest,
+		phase: "awaiting_approval",
+	});
+});
+
+test("a marker publication suspended after close cannot overwrite a replacement pointer", async () => {
+	const entered = createDeferred<void>();
+	const released = createDeferred<void>();
+	const harness = createHarness();
+	const call = harness.handlers.get("tool_call")!;
+	const result = harness.handlers.get("tool_result")!;
+	await writeInitialPlan(harness);
+	await call(
+		{ toolName: "write", toolCallId: "deferred-marker-proposal", input: { path: "xd://propose", content: EXAMPLE_SLUG } },
+		harness.ctx,
+	);
+	const pointerPath = resolveRunMarkerPath(harness.ctx.localProtocolOptions, hashedPointerArtifact(EXAMPLE_SLUG))!;
+	let suspended = false;
+	setAtomicPublicationAfterCloseHookForTest(async (filePath) => {
+		if (!suspended && filePath === pointerPath) {
+			suspended = true;
+			entered.resolve();
+			await released.promise;
+		}
+	});
+	try {
+		const settlement = result(
+			{ toolName: "write", toolCallId: "deferred-marker-proposal", isError: false },
+			harness.ctx,
+		);
+		await entered.promise;
+		await harness.commands.get("flowcancel")!.handler("", harness.ctx);
+		await harness.commands.get("flow")!.handler(EXAMPLE_TASK, harness.ctx);
+		const replacementPointer = readFileSync(pointerPath, "utf8");
+		released.resolve();
+		await settlement;
+		expect(readFileSync(pointerPath, "utf8")).toBe(replacementPointer);
+	} finally {
+		setAtomicPublicationAfterCloseHookForTest(undefined);
+	}
+});
+
+test("a suspended approval BUILD-record initialization cannot mutate a replacement run", async () => {
+	const entered = createDeferred<void>();
+	const released = createDeferred<void>();
+	const harness = createHarness();
+	const call = harness.handlers.get("tool_call")!;
+	const result = harness.handlers.get("tool_result")!;
+	await writeInitialPlan(harness);
+	await call(
+		{ toolName: "write", toolCallId: "deferred-build-proposal", input: { path: "xd://propose", content: EXAMPLE_SLUG } },
+		harness.ctx,
+	);
+	await result({ toolName: "write", toolCallId: "deferred-build-proposal", isError: false }, harness.ctx);
+	harness.branch.push({ type: "mode_change", mode: "none" });
+	const recordPath = buildRecordPath(harness);
+	let suspended = false;
+	setAtomicPublicationAfterCloseHookForTest(async (filePath) => {
+		if (!suspended && filePath === recordPath) {
+			suspended = true;
+			entered.resolve();
+			await released.promise;
+		}
+	});
+	try {
+		const approval = harness.handlers.get("context")!({ messages: approvalMessages }, harness.ctx);
+		await entered.promise;
+		await harness.commands.get("flowcancel")!.handler("", harness.ctx);
+		await harness.commands.get("flow")!.handler(EXAMPLE_TASK, harness.ctx);
+		const replacement = harness.states.at(-1)!;
+		const stateCount = harness.states.length;
+		released.resolve();
+		await approval;
+		expect(harness.states).toHaveLength(stateCount);
+		expect(harness.states.at(-1)).toMatchObject({ phase: "planning", runId: replacement.runId });
+	} finally {
+		setAtomicPublicationAfterCloseHookForTest(undefined);
+	}
+});
+
+test("concurrent session restoration is serialized so the later request runs last", async () => {
+	const entered = createDeferred<void>();
+	const released = createDeferred<void>();
+	const harness = createHarness();
+	await enterDocumentationBuild(harness);
+	let calls = 0;
+	setRestoreSessionHookForTest(async () => {
+		calls += 1;
+		if (calls === 1) {
+			entered.resolve();
+			await released.promise;
+		}
+	});
+	try {
+		const first = harness.handlers.get("session_switch")!({}, harness.ctx);
+		await entered.promise;
+		let secondCompleted = false;
+		const second = harness.handlers.get("session_switch")!({}, harness.ctx).then(() => {
+			secondCompleted = true;
+		});
+		await Promise.resolve();
+		expect(secondCompleted).toBe(false);
+		released.resolve();
+		await Promise.all([first, second]);
+		expect(calls).toBe(2);
+		expect(harness.states.at(-1)).toMatchObject({ phase: "building" });
+	} finally {
+		setRestoreSessionHookForTest(undefined);
+	}
+});
+
+test("a Gate settlement suspended after registry consumption cannot mutate a replacement run", async () => {
+	const fingerprintEntered = createDeferred<void>();
+	const fingerprintReleased = createDeferred<ExecResult>();
+	let deferFingerprint = false;
+	let fingerprintDeferred = false;
+	const harness = createHarness({
+		exec: (call) => {
+			if (deferFingerprint && !fingerprintDeferred && call.command === "git" && call.args[0] === "rev-parse") {
+				fingerprintDeferred = true;
+				fingerprintEntered.resolve();
+				return fingerprintReleased.promise;
+			}
+			return undefined;
+		},
+	});
+	await enterDocumentationBuild(harness);
+	await completeBuildEvidence(harness, "bun test deferred-gate-settlement");
+	const call = harness.handlers.get("tool_call")!;
+	const result = harness.handlers.get("tool_result")!;
+	await call({ toolName: "task", toolCallId: "deferred-gate", input: gateCallInput() }, harness.ctx);
+	deferFingerprint = true;
+	const settlement = result(
+		{ toolName: "task", toolCallId: "deferred-gate", isError: false, content: [{ type: "text", text: JSON.stringify({ verdict: "PASS", findings: [] }) }] },
+		harness.ctx,
+	);
+	await fingerprintEntered.promise;
+
+	await harness.commands.get("flowcancel")!.handler("", harness.ctx);
+	await harness.commands.get("flow")!.handler("replacement after deferred gate", harness.ctx);
+	const replacement = harness.states.at(-1)!;
+	const replacementStateCount = harness.states.length;
+	const activePointer = readFileSync(
+		resolveRunMarkerPath(harness.ctx.localProtocolOptions, hashedPointerArtifact(EXAMPLE_SLUG))!,
+		"utf8",
+	);
+
+	fingerprintReleased.resolve({ stdout: `${"a".repeat(40)}\n`, stderr: "", code: 0, killed: false });
+	await settlement;
+
+	expect(harness.states).toHaveLength(replacementStateCount);
+	expect(harness.states.at(-1)).toMatchObject({ phase: "planning", runId: replacement.runId });
+
+	expect(
+		readFileSync(resolveRunMarkerPath(harness.ctx.localProtocolOptions, hashedPointerArtifact(EXAMPLE_SLUG))!, "utf8"),
+	).toBe(activePointer);
+});
+test("a suspended Gate preflight cannot dispatch into a replacement run", async () => {
+	const entered = createDeferred<void>();
+	const released = createDeferred<void>();
+	const harness = createHarness();
+	await enterDocumentationBuild(harness);
+	await completeBuildEvidence(harness, "bun test deferred-gate-preflight");
+	setGatePreflightHookForTest(async () => {
+		entered.resolve();
+		await released.promise;
+	});
+	try {
+		const gateCall = harness.handlers.get("tool_call")!({
+			toolName: "task",
+			toolCallId: "deferred-gate-preflight",
+			input: gateCallInput(),
+		}, harness.ctx);
+		await entered.promise;
+		await harness.commands.get("flowcancel")!.handler("", harness.ctx);
+		await harness.commands.get("flow")!.handler("replacement during Gate preflight", harness.ctx);
+		const replacement = harness.states.at(-1)!;
+		const stateCount = harness.states.length;
+		released.resolve();
+		await expect(gateCall).resolves.toMatchObject({ block: true });
+		expect(harness.states).toHaveLength(stateCount);
+		expect(harness.states.at(-1)).toMatchObject({ phase: "planning", runId: replacement.runId });
+	} finally {
+		setGatePreflightHookForTest(undefined);
+	}
+});
+
+test("a suspended proposal preflight cannot register approval authority for a replacement run", async () => {
+	const entered = createDeferred<void>();
+	const released = createDeferred<void>();
+	const harness = createHarness();
+	await writeInitialPlan(harness);
+	setProposalLookupHookForTest(async () => {
+		entered.resolve();
+		await released.promise;
+	});
+	try {
+		const proposal = harness.handlers.get("tool_call")!({
+			toolName: "write",
+			toolCallId: "deferred-proposal",
+			input: { path: "xd://propose", content: EXAMPLE_SLUG },
+		}, harness.ctx);
+		await entered.promise;
+		await harness.commands.get("flowcancel")!.handler("", harness.ctx);
+		await harness.commands.get("flow")!.handler("replacement during proposal", harness.ctx);
+		const replacement = harness.states.at(-1)!;
+		const stateCount = harness.states.length;
+		released.resolve();
+		await expect(proposal).resolves.toMatchObject({ block: true });
+		expect(harness.states).toHaveLength(stateCount);
+		expect(harness.states.at(-1)).toMatchObject({ phase: "planning", runId: replacement.runId });
+	} finally {
+		setProposalLookupHookForTest(undefined);
+	}
+});
+
 test("the observed xd LSP dispatch and issue report remain reachable before the baseline", async () => {
 	const harness = createHarness();
 	await writeInitialPlan(harness);
@@ -1845,7 +2166,7 @@ test("session restoration reconciles an interrupted Gate as an interruption", as
 	});
 });
 
-test("state v6 in-flight Gate restores through operational interruption when evidence is already v3", async () => {
+test("state v7 in-flight Gate restores through operational interruption without inheriting callback authority", async () => {
 	const harness = createHarness();
 	await enterDocumentationBuild(harness);
 	await completeBuildEvidence(harness, "bun test legacy-gate-state");
@@ -1854,12 +2175,14 @@ test("state v6 in-flight Gate restores through operational interruption when evi
 		harness.ctx,
 	);
 	const legacy = structuredClone(harness.states.at(-1)) as PersistedState & Record<string, unknown>;
-	legacy.stateVersion = 6;
+	legacy.stateVersion = 7;
+	delete legacy.controlSessionId;
+	delete legacy.controlOperationEpoch;
 	harness.branch.push({ type: "custom", customType: "leanflow-state", data: legacy });
 
 	await harness.handlers.get("session_switch")!({}, harness.ctx);
 	expect(harness.states.at(-1)).toMatchObject({
-		stateVersion: 7,
+		stateVersion: 8,
 		phase: "building",
 		gateRetryMode: "operational",
 		gateLease: undefined,
@@ -4033,6 +4356,39 @@ test("marker durability is required before proposal and BUILD setup failures kee
 	}
 });
 
+test("a suspended fresh recovery cannot claim a replacement run", async () => {
+	const entered = createDeferred<void>();
+	const released = createDeferred<void>();
+	const harness = createHarness();
+	const freshRunId = "4f414c4c-8f8f-4dca-8df3-9e0fabada555";
+	writeFreshArtifacts(harness, {
+		planContent: completeHandoffPlan(
+			[
+				"Update src/example.ts and run focused tests.",
+				`LeanFlow run ID: ${freshRunId}`,
+				"LSP applicability: required",
+			].join("\n"),
+		),
+	});
+	setFreshRecoveryLookupHookForTest(async () => {
+		entered.resolve();
+		await released.promise;
+	});
+	try {
+		const recovery = harness.handlers.get("context")!({ messages: legacyApprovalMessages }, harness.ctx);
+		await entered.promise;
+		await harness.commands.get("flow")!.handler("replacement during recovery", harness.ctx);
+		const replacement = harness.states.at(-1)!;
+		const stateCount = harness.states.length;
+		released.resolve();
+		await recovery;
+		expect(harness.states).toHaveLength(stateCount);
+		expect(harness.states.at(-1)).toMatchObject({ phase: "planning", runId: replacement.runId });
+	} finally {
+		setFreshRecoveryLookupHookForTest(undefined);
+	}
+});
+
 test("expired orphan markers do not claim ordinary native approvals", async () => {
 	const harness = createHarness();
 	const runId = "4f414c4c-8f8f-4dca-8df3-9e0fabada555";
@@ -4617,10 +4973,10 @@ test("legacy Gate-ready state invalidates missing manifest authority on restore"
 test("new runs persist the current state schema version", async () => {
 	const harness = createHarness();
 	await harness.commands.get("flow")!.handler("schema version", harness.ctx);
-	expect(harness.states.at(-1)).toMatchObject({ phase: "planning", stateVersion: 7 });
+	expect(harness.states.at(-1)).toMatchObject({ phase: "planning", stateVersion: 8 });
 	const persisted = harness.branch.at(-1) as { customType: string; data: Record<string, unknown> };
 	expect(persisted.customType).toBe("leanflow-state");
-	expect(persisted.data.stateVersion).toBe(7);
+	expect(persisted.data.stateVersion).toBe(8);
 });
 
 test("state v6 successful finalization migrates v2 evidence and resumes without another Gate verdict", async () => {
@@ -4663,7 +5019,7 @@ test("state v6 successful finalization migrates v2 evidence and resumes without 
 		observations: legacyRecord.observations,
 	});
 	expect(harness.states.at(-1)).toMatchObject({
-		stateVersion: 7,
+		stateVersion: 8,
 		phase: "building",
 		gateRetryMode: "evidence",
 		recoveryAction: "refinalize_legacy_pass",

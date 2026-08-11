@@ -62,6 +62,14 @@ import { CUSTOM_TYPE, STATE_VERSION, defaultState, defaultStats, hasPersistedSta
 import type { BlockedReasonCode, GateOutcome, LeanFlowState, RepositoryFingerprint } from "./state";
 import { checkInvariants, reduceGate, resetBlockedRecovery } from "./machine";
 import type { Effect, SnapshotFailureKind } from "./machine";
+import {
+	canCommitOperation,
+	createControlOperationIdentity,
+	isControlOperationContinuationCurrent,
+	isControlOperationCurrent,
+	PendingOperationRegistry,
+} from "./control-operation";
+import type { ActiveControlAuthority, ControlOperationIdentity } from "./control-operation";
 import { checkAgentBudget, checkTaskGuard, extractAgentRoles, validateGateTaskCall } from "./guard";
 import type { GateArtifacts, LeanFlowAgentRole } from "./guard";
 import { assessHandoff, formatHandoffNotification } from "./handoff";
@@ -679,20 +687,6 @@ const DIRECTORY_SYNC_UNSUPPORTED_CODES: Record<string, true> = {
 	EPERM: true,
 };
 
-async function syncParentDirectoryBestEffort(filePath: string): Promise<void> {
-	if (process.platform === "win32") return;
-	let handle: fs.FileHandle | undefined;
-	try {
-		handle = await fs.open(path.dirname(filePath), "r");
-		await handle.sync();
-	} catch (error) {
-		const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
-		if (typeof code === "string" && DIRECTORY_SYNC_UNSUPPORTED_CODES[code] === true) return;
-		throw error;
-	} finally {
-		await handle?.close();
-	}
-}
 
 function syncParentDirectoryBestEffortSync(filePath: string): void {
 	if (process.platform === "win32") return;
@@ -709,27 +703,56 @@ function syncParentDirectoryBestEffortSync(filePath: string): void {
 	}
 }
 
-async function writeTextAtomically(filePath: string, content: string): Promise<void> {
+let atomicPublicationAfterCloseHook: ((filePath: string) => Promise<void>) | undefined;
+
+/** Test-only seam: pauses after close and before the final authority check. */
+export function setAtomicPublicationAfterCloseHookForTest(hook: ((filePath: string) => Promise<void>) | undefined): void {
+	atomicPublicationAfterCloseHook = hook;
+}
+
+async function writeTextAtomically(
+	filePath: string,
+	content: string,
+	isCurrent?: () => boolean,
+): Promise<boolean> {
 	await fs.mkdir(path.dirname(filePath), { recursive: true });
+	if (isCurrent && !isCurrent()) return false;
 	const temporary = `${filePath}.tmp-${process.pid}-${randomUUID()}`;
 	try {
 		const handle = await fs.open(temporary, "wx");
+		let staged = true;
 		try {
 			await handle.writeFile(content, "utf8");
-			await handle.sync();
+			staged = !isCurrent || isCurrent();
+			if (staged) {
+				await handle.sync();
+				staged = !isCurrent || isCurrent();
+			}
 		} finally {
 			await handle.close();
 		}
-		await fs.rename(temporary, filePath);
-		await syncParentDirectoryBestEffort(filePath);
+		if (atomicPublicationAfterCloseHook) await atomicPublicationAfterCloseHook(filePath);
+		if (!staged || (isCurrent && !isCurrent())) {
+			await fs.rm(temporary, { force: true });
+			return false;
+		}
+		// The final authority check and publication are synchronous: a stale
+		// asynchronous control operation cannot publish after replacement.
+		fsSync.renameSync(temporary, filePath);
+		syncParentDirectoryBestEffortSync(filePath);
+		return true;
 	} catch (error) {
 		await fs.rm(temporary, { force: true });
 		throw error;
 	}
 }
 
-async function writeJsonAtomically(filePath: string, value: unknown): Promise<void> {
-	await writeTextAtomically(filePath, JSON.stringify(value));
+async function writeJsonAtomically(
+	filePath: string,
+	value: unknown,
+	isCurrent?: () => boolean,
+): Promise<boolean> {
+	return writeTextAtomically(filePath, JSON.stringify(value), isCurrent);
 }
 
 let buildPublicationStageHook: ((filePath: string) => Promise<void>) | undefined;
@@ -739,15 +762,46 @@ export function setBuildPublicationStageHookForTest(hook: ((filePath: string) =>
 	buildPublicationStageHook = hook;
 }
 
+let restoreSessionHook: (() => Promise<void>) | undefined;
+
+/** Test-only seam: pauses one serialized restoration inside its critical section. */
+export function setRestoreSessionHookForTest(hook: (() => Promise<void>) | undefined): void {
+	restoreSessionHook = hook;
+}
+
+let freshRecoveryLookupHook: (() => Promise<void>) | undefined;
+
+/** Test-only seam: pauses an idle fresh-recovery lookup before it can claim state. */
+export function setFreshRecoveryLookupHookForTest(hook: (() => Promise<void>) | undefined): void {
+	freshRecoveryLookupHook = hook;
+}
+
+let gatePreflightHook: (() => Promise<void>) | undefined;
+
+/** Test-only seam: pauses Gate preflight after authority capture. */
+export function setGatePreflightHookForTest(hook: (() => Promise<void>) | undefined): void {
+	gatePreflightHook = hook;
+}
+
+let proposalLookupHook: (() => Promise<void>) | undefined;
+
+/** Test-only seam: pauses proposal preflight after authority capture. */
+export function setProposalLookupHookForTest(hook: (() => Promise<void>) | undefined): void {
+	proposalLookupHook = hook;
+}
+
 export default function leanflow(pi: ExtensionAPI): void {
 	let state: LeanFlowState = defaultState();
 	let hasPersistedLeanFlowState = false;
-	// Correlate pre-scheduled calls with their eventual results without trusting result-hook inputs.
-	const pendingPlanRefreshes = new Set<string>(); // successful canonical write/edit → reread and reassess
-	const pendingLspProbes = new Map<string, string>(); // toolCallId → diagnostics target
-	const pendingApprovalWrites = new Map<string, string>(); // toolCallId → exact plan artifact
-	const pendingGateCalls = new Set<string>(); // toolCallIds
-	const pendingGatePlanDigests = new Map<string, string>(); // toolCallId → dispatch-time canonical plan digest
+	let restoreTail = Promise.resolve();
+	// toolCallId is transport correlation only. Every asynchronous control
+	// callback obtains immutable authority from this registry before it can
+	const pendingControlOperations = new PendingOperationRegistry<PendingControlPayload>();
+	type PendingControlPayload = {
+		artifact?: string;
+		lspTarget?: string;
+		snapshotDigest?: string;
+	};
 	type BuildOperationIdentity = Readonly<
 		BuildRecordIdentity & {
 			operationId: string;
@@ -795,11 +849,20 @@ export default function leanflow(pi: ExtensionAPI): void {
 		};
 	}
 
-	function advanceBuildActivation(): void {
+	function invalidateControlOperations(_reason: string): void {
+		const previousEpoch = activationEpoch;
+		const previousRunId = state.runId;
 		activationEpoch += 1;
+		pendingControlOperations.invalidateEpoch(previousEpoch);
+		if (previousRunId) pendingControlOperations.invalidateRun(previousRunId);
 		pendingEvidenceObservations.clear();
 		for (const controller of validationAbortControllers.values()) controller.abort();
 		validationAbortControllers.clear();
+		state.controlOperationEpoch = activationEpoch;
+	}
+
+	function advanceBuildActivation(): void {
+		invalidateControlOperations("activation replacement");
 	}
 
 	function persist(): void {
@@ -926,6 +989,68 @@ export default function leanflow(pi: ExtensionAPI): void {
 			return `activation-${activationEpoch}`;
 		}
 	}
+
+	function controlAuthority(ctx: ExtensionContext): ActiveControlAuthority {
+		return {
+			sessionId: buildSessionId(ctx),
+			runId: state.runId,
+			activationEpoch: state.controlOperationEpoch ?? activationEpoch,
+			phase: state.phase,
+			planDigest: state.planDigest,
+		};
+	}
+
+	function captureControlOperation(
+		ctx: ExtensionContext,
+		artifactIdentity?: string,
+		operationId?: string,
+	): ControlOperationIdentity {
+		return createControlOperationIdentity(controlAuthority(ctx), artifactIdentity, operationId);
+	}
+
+	function controlOperationIsCurrent(
+		ctx: ExtensionContext,
+		identity: ControlOperationIdentity,
+		artifactIdentity?: string,
+	): boolean {
+		return (
+			canCommitOperation(identity, state) &&
+			isControlOperationCurrent(identity, controlAuthority(ctx)) &&
+			(artifactIdentity === undefined || identity.artifactIdentity === artifactIdentity)
+		);
+	}
+
+	function controlOperationContinuationIsCurrent(ctx: ExtensionContext, identity: ControlOperationIdentity): boolean {
+		return isControlOperationContinuationCurrent(identity, controlAuthority(ctx));
+	}
+
+	function prospectiveRecoveryRunId(ctx: ExtensionContext, artifact: string): string {
+		return `prospective:${sha256Hex(`${buildSessionId(ctx)}\u0000${activationEpoch}\u0000${artifact}`)}`;
+	}
+
+	function captureFreshRecoveryOperation(ctx: ExtensionContext, artifact: string): ControlOperationIdentity {
+		return createControlOperationIdentity(
+			{
+				...controlAuthority(ctx),
+				runId: state.runId ?? prospectiveRecoveryRunId(ctx, artifact),
+			},
+			artifact,
+		);
+	}
+
+	function freshRecoveryOperationIsCurrent(
+		ctx: ExtensionContext,
+		operation: ControlOperationIdentity,
+		artifact: string,
+	): boolean {
+		const prospectiveRunId = prospectiveRecoveryRunId(ctx, artifact);
+		return (
+			state.runId === undefined &&
+			operation.runId === prospectiveRunId &&
+			operation.artifactIdentity === artifact &&
+			isControlOperationCurrent(operation, { ...controlAuthority(ctx), runId: prospectiveRunId })
+		);
+	}
 	function captureBuildOperationIdentity(ctx: ExtensionContext, round: number): BuildOperationIdentity {
 		const identity = activeBuildIdentity(round);
 		return Object.freeze({
@@ -935,6 +1060,20 @@ export default function leanflow(pi: ExtensionAPI): void {
 			sessionId: buildSessionId(ctx),
 			recordPath: buildRecordPathFor(ctx, identity.runId),
 		});
+	}
+
+	function gateControlOperationIsCurrent(
+		ctx: ExtensionContext,
+		operation: ControlOperationIdentity,
+		toolCallId: string,
+	): boolean {
+		return (
+			controlOperationIsCurrent(ctx, operation, operation.artifactIdentity) &&
+			state.phase === "gating" &&
+			state.gateLease?.toolCallId === toolCallId &&
+			state.gateLease.snapshotDigest === operation.artifactIdentity &&
+			state.gateLease.planDigest === operation.planDigest
+		);
 	}
 
 	function captureFinalizationOperation(ctx: ExtensionContext, round: number): FinalizationOperation {
@@ -1458,11 +1597,18 @@ export default function leanflow(pi: ExtensionAPI): void {
 		}
 	}
 
-	async function initializeBuildRecord(ctx: ExtensionContext): Promise<BuildRecordSetupResult> {
+	async function initializeBuildRecord(
+		ctx: ExtensionContext,
+		identity: BuildRecordIdentity,
+		operation: ControlOperationIdentity,
+	): Promise<BuildRecordSetupResult> {
+		const isCurrent = () => controlOperationIsCurrent(ctx, operation, operation.artifactIdentity);
+		if (!isCurrent()) return { ok: false, reason: "control operation authority changed" };
 		try {
-			const record = createBuildEvidenceRecord(activeBuildIdentity(1));
-			await writeJsonAtomically(activeBuildRecordPath(ctx), record);
-			state.currentBuildRound = 1;
+			const record = createBuildEvidenceRecord(identity);
+			const written = await writeJsonAtomically(buildRecordPathFor(ctx, identity.runId), record, isCurrent);
+			if (!written || !isCurrent()) return { ok: false, reason: "control operation authority changed" };
+			state.currentBuildRound = identity.round;
 			state.baselineCaptured = false;
 			state.buildMutationObserved = false;
 			state.writtenArtifacts = [];
@@ -1471,10 +1617,10 @@ export default function leanflow(pi: ExtensionAPI): void {
 			state.finalizationCommitNonce = undefined;
 			state.operationalRetrySnapshot = undefined;
 			resetBlockedRecovery(state);
-			return { ok: true, round: 1, baselinePresent: false, freshRecord: true, lspEvidencePresent: false };
+			return { ok: true, round: identity.round, baselinePresent: false, freshRecord: true, lspEvidencePresent: false };
 		} catch (error) {
 			const reason = evidenceFailureMessage(error);
-			if (ctx.hasUI) {
+			if (isCurrent() && ctx.hasUI) {
 				ctx.ui.notify(
 					`LeanFlow: failed to initialize the extension-owned BUILD record: ${reason}`,
 					"warning",
@@ -1734,7 +1880,11 @@ export default function leanflow(pi: ExtensionAPI): void {
 		}
 		return { absolute, size: stat.size, stat };
 	}
-	async function writeRunMarker(ctx: ExtensionContext, status: NonNullable<LeanFlowState["runMarkerStatus"]>): Promise<boolean> {
+	async function writeRunMarker(
+		ctx: ExtensionContext,
+		status: NonNullable<LeanFlowState["runMarkerStatus"]>,
+		operation?: ControlOperationIdentity,
+	): Promise<boolean> {
 		if (!state.runId || !state.planSlug || !state.planArtifact || !state.planDigest || !state.startedAt || !state.stats) {
 			setPersistenceFailure(
 				ctx,
@@ -1758,6 +1908,9 @@ export default function leanflow(pi: ExtensionAPI): void {
 		}
 		const artifact = runMarkerArtifact(state.planSlug, state.runId);
 		const pointerArtifact = activePointerArtifact(state.planSlug);
+		const markerOperation = operation ?? captureControlOperation(ctx, `${artifact}\u0000${pointerArtifact}`);
+		const isCurrent = () => controlOperationIsCurrent(ctx, markerOperation);
+		if (!isCurrent()) return false;
 		state.runMarkerArtifact = artifact;
 		state.runMarkerStatus = status;
 		const markerPath = resolveRunMarkerPath(options, artifact);
@@ -1806,21 +1959,22 @@ export default function leanflow(pi: ExtensionAPI): void {
 			status === "awaiting_approval" ? "marker" : "pointer";
 		let failurePath = status === "awaiting_approval" ? markerPath : pointerPath;
 		try {
-			if (status === "awaiting_approval") {
-				await writeJsonAtomically(markerPath, marker);
-				failureStage = "pointer";
-				failurePath = pointerPath;
-				await writeJsonAtomically(pointerPath, pointer);
-			} else {
-				await writeJsonAtomically(pointerPath, pointer);
-				failureStage = "marker";
-				failurePath = markerPath;
-				await writeJsonAtomically(markerPath, marker);
-			}
+			const markerFirst = status === "awaiting_approval";
+			const firstPath = markerFirst ? markerPath : pointerPath;
+			const firstValue = markerFirst ? marker : pointer;
+			if (!(await writeJsonAtomically(firstPath, firstValue, isCurrent))) return false;
+			failureStage = markerFirst ? "pointer" : "marker";
+			failurePath = markerFirst ? pointerPath : markerPath;
+			const secondPath = markerFirst ? pointerPath : markerPath;
+			const secondValue = markerFirst ? pointer : marker;
+			if (!(await writeJsonAtomically(secondPath, secondValue, isCurrent))) return false;
+			if (!isCurrent()) return false;
+			state.runMarkerArtifact = artifact;
+			state.runMarkerStatus = status;
 			clearPersistenceFailure();
 			return true;
 		} catch (error) {
-			setPersistenceFailure(ctx, failureStage, failurePath, error);
+			if (isCurrent()) setPersistenceFailure(ctx, failureStage, failurePath, error);
 			return false;
 		}
 	}
@@ -1947,10 +2101,13 @@ export default function leanflow(pi: ExtensionAPI): void {
 	async function refreshCanonicalPlanState(
 		ctx: ExtensionContext,
 		reason: "mutation" | "proposal" | "approval" | "recovery",
+		operation?: ControlOperationIdentity,
 	): Promise<boolean> {
 		const artifact = expectedPlanArtifact(state);
 		const options = ctx.localProtocolOptions;
 		if (!artifact || !options || !state.runId) return false;
+		const authority = operation ?? captureControlOperation(ctx, artifact);
+		if (!controlOperationIsCurrent(ctx, authority, artifact)) return false;
 		const filePath = resolveRunMarkerPath(options, artifact);
 		if (!filePath) return false;
 		let content: string;
@@ -1959,6 +2116,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 		} catch {
 			return false;
 		}
+		if (!controlOperationIsCurrent(ctx, authority, artifact)) return false;
 
 		const assessed = assessHandoff(content);
 		const currentPlanDigest = planDigest(content);
@@ -2004,7 +2162,9 @@ export default function leanflow(pi: ExtensionAPI): void {
 				}
 			}
 			transitionPhase(state, "planning");
-			await writeRunMarker(ctx, "invalidated");
+			const markerOperation = captureControlOperation(ctx, artifact);
+			await writeRunMarker(ctx, "invalidated", markerOperation);
+			if (!controlOperationIsCurrent(ctx, markerOperation, artifact)) return false;
 			persist();
 			updateStatus(ctx);
 			ctx.ui.notify(
@@ -2016,7 +2176,9 @@ export default function leanflow(pi: ExtensionAPI): void {
 
 		state.approvalInvalidated = false;
 		if (reason === "mutation") transitionPhase(state, "awaiting_approval");
-		const markerWritten = await writeRunMarker(ctx, "awaiting_approval");
+		const markerOperation = captureControlOperation(ctx, artifact);
+		const markerWritten = await writeRunMarker(ctx, "awaiting_approval", markerOperation);
+		if (!controlOperationIsCurrent(ctx, markerOperation, artifact)) return false;
 		if (!markerWritten && (reason === "mutation" || reason === "proposal")) {
 			transitionPhase(state, "planning");
 			persist();
@@ -2050,16 +2212,20 @@ export default function leanflow(pi: ExtensionAPI): void {
 			approvedArtifactAfter(branch, state.proposalBoundary);
 		if (promptArtifact !== artifact) return false;
 		if (!(await refreshCanonicalPlanState(ctx, "approval"))) return false;
-
+		const approvalOperation = captureControlOperation(ctx, artifact);
+		const buildIdentity = activeBuildIdentity(1);
 		state.approvedPlanArtifact = artifact;
 		state.proposedPlanDigest = state.planDigest;
-		const buildRecord = await initializeBuildRecord(ctx);
+		const buildRecord = await initializeBuildRecord(ctx, buildIdentity, approvalOperation);
+		if (!controlOperationIsCurrent(ctx, approvalOperation, artifact)) return false;
 		if (!buildRecord.ok) {
 			ctx.ui.notify(`LeanFlow: Cannot enter BUILD: ${buildRecord.reason}`, "warning");
 			return false;
 		}
 		transitionPhase(state, "building");
-		await writeRunMarker(ctx, "building");
+		const markerOperation = captureControlOperation(ctx, artifact);
+		if (!(await writeRunMarker(ctx, "building", markerOperation))) return false;
+		if (!controlOperationIsCurrent(ctx, markerOperation, artifact)) return false;
 		persist();
 		return true;
 	}
@@ -2068,6 +2234,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 		ctx: ExtensionContext,
 		artifact: string,
 		lookup: Extract<FreshRecoveryLookup, { kind: "invalid" }>,
+		operation: ControlOperationIdentity,
 	): Promise<void> {
 		const now = Date.now();
 		const slug = planSlugFromArtifact(artifact);
@@ -2082,6 +2249,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 				// The locked repair prompt will require restoring the canonical plan.
 			}
 		}
+		if (!freshRecoveryOperationIsCurrent(ctx, operation, artifact)) return;
 		advanceBuildActivation();
 		state = {
 			...defaultState(),
@@ -2089,6 +2257,8 @@ export default function leanflow(pi: ExtensionAPI): void {
 			stateVersion: STATE_VERSION,
 			phaseStartedAt: now,
 			runId,
+			controlSessionId: buildSessionId(ctx),
+			controlOperationEpoch: activationEpoch,
 			scoutCalls: 0,
 			gateCalls: 0,
 			gateAttempt: 0,
@@ -2103,7 +2273,9 @@ export default function leanflow(pi: ExtensionAPI): void {
 			approvalRepairBoundary: ctx.sessionManager.getBranch().length,
 			stats: defaultStats(),
 		};
-		await writeRunMarker(ctx, "invalidated");
+		const markerOperation = captureControlOperation(ctx, artifact);
+		await writeRunMarker(ctx, "invalidated", markerOperation);
+		if (!controlOperationIsCurrent(ctx, markerOperation, artifact)) return;
 		persist();
 		updateStatus(ctx);
 		if (ctx.hasUI) {
@@ -2121,10 +2293,13 @@ export default function leanflow(pi: ExtensionAPI): void {
 			undefined,
 		);
 		if (!artifact) return false;
+		const operation = captureFreshRecoveryOperation(ctx, artifact);
+		if (freshRecoveryLookupHook) await freshRecoveryLookupHook();
 		const lookup = await lookupFreshRecovery(ctx, artifact);
+		if (!freshRecoveryOperationIsCurrent(ctx, operation, artifact)) return false;
 		if (lookup.kind === "none") return false;
 		if (lookup.kind === "invalid") {
-			await lockFreshRecovery(ctx, artifact, lookup);
+			await lockFreshRecovery(ctx, artifact, lookup, operation);
 			return true;
 		}
 		const marker = lookup.marker;
@@ -2160,22 +2335,37 @@ export default function leanflow(pi: ExtensionAPI): void {
 				},
 			},
 		]);
-		if (!(await refreshCanonicalPlanState(ctx, "recovery"))) return true;
+		state.controlSessionId = buildSessionId(ctx);
+		state.controlOperationEpoch = activationEpoch;
+		const recoveryOperation = captureControlOperation(ctx, artifact);
+		if (!(await refreshCanonicalPlanState(ctx, "recovery", recoveryOperation))) return true;
+		const buildSetupOperation = captureControlOperation(ctx, artifact);
+		const buildIdentity = activeBuildIdentity(1);
 		state.approvedPlanArtifact = marker.planArtifact;
 		state.proposedPlanDigest = state.planDigest;
-		const buildRecord = await initializeBuildRecord(ctx);
+		const buildRecord = await initializeBuildRecord(ctx, buildIdentity, buildSetupOperation);
+		if (!controlOperationIsCurrent(ctx, buildSetupOperation, artifact)) return true;
 		if (!buildRecord.ok) {
 			ctx.ui.notify(`LeanFlow: Cannot enter BUILD: ${buildRecord.reason}`, "warning");
 			return true;
 		}
 		transitionPhase(state, "building", now);
-		await writeRunMarker(ctx, "building");
+		const markerOperation = captureControlOperation(ctx, artifact);
+		if (!(await writeRunMarker(ctx, "building", markerOperation))) return true;
+		if (!controlOperationIsCurrent(ctx, markerOperation, artifact)) return true;
 		persist();
 		return true;
 	}
 
-	async function executeGateEffects(ctx: ExtensionContext, effects: Effect[]): Promise<{ ok: true } | { ok: false; reason?: string }> {
+	async function executeGateEffects(
+		ctx: ExtensionContext,
+		effects: Effect[],
+		operation?: ControlOperationIdentity,
+	): Promise<{ ok: true } | { ok: false; reason?: string }> {
 		for (const effect of effects) {
+			if (operation && !controlOperationContinuationIsCurrent(ctx, operation)) {
+				return { ok: false, reason: "control operation authority changed" };
+			}
 			switch (effect.kind) {
 				case "clear_artifacts":
 					state.writtenArtifacts = [];
@@ -2183,12 +2373,18 @@ export default function leanflow(pi: ExtensionAPI): void {
 				case "begin_repair_round": {
 					persist();
 					const buildRecord = await beginRepairBuildRound(ctx);
+					if (operation && !controlOperationContinuationIsCurrent(ctx, operation)) {
+						return { ok: false, reason: "control operation authority changed" };
+					}
 					if (!buildRecord.ok) {
 						const { effects: repairEffects } = reduceGate(state, {
 							type: "repair_round_failed",
 							reason: buildRecord.reason,
 						});
-						await executeGateEffects(ctx, repairEffects);
+						const repaired = await executeGateEffects(ctx, repairEffects, operation);
+						if (!repaired.ok || (operation && !controlOperationContinuationIsCurrent(ctx, operation))) {
+							return { ok: false, reason: "control operation authority changed" };
+						}
 						persist();
 						updateStatus(ctx);
 						const violations = checkInvariants(state);
@@ -2205,14 +2401,22 @@ export default function leanflow(pi: ExtensionAPI): void {
 							freshRecord: buildRecord.freshRecord,
 							lspEvidencePresent: buildRecord.lspEvidencePresent,
 						});
-						await executeGateEffects(ctx, readyEffects);
+						const ready = await executeGateEffects(ctx, readyEffects, operation);
+						if (!ready.ok || (operation && !controlOperationContinuationIsCurrent(ctx, operation))) {
+							return { ok: false, reason: "control operation authority changed" };
+						}
 						persist();
 					}
 					break;
 				}
-				case "write_marker":
-					await writeRunMarker(ctx, effect.status);
+				case "write_marker": {
+					const markerOperation = operation ? captureControlOperation(ctx) : undefined;
+					await writeRunMarker(ctx, effect.status, markerOperation);
+					if (operation && !controlOperationContinuationIsCurrent(ctx, operation)) {
+						return { ok: false, reason: "control operation authority changed" };
+					}
 					break;
+				}
 				case "notify":
 					ctx.ui.notify(`LeanFlow: ${effect.message}`, effect.level);
 					break;
@@ -2223,15 +2427,22 @@ export default function leanflow(pi: ExtensionAPI): void {
 
 	type GateSnapshotFailureSource = "preflight" | "settlement" | "gate_tool_error" | "session_interruption" | "restore";
 
-	async function applyGateRecoveryEvent(ctx: ExtensionContext, event: Parameters<typeof reduceGate>[1]): Promise<void> {
+	async function applyGateRecoveryEvent(
+		ctx: ExtensionContext,
+		event: Parameters<typeof reduceGate>[1],
+		operation?: ControlOperationIdentity,
+	): Promise<boolean> {
+		if (operation && !controlOperationContinuationIsCurrent(ctx, operation)) return false;
 		const { effects } = reduceGate(state, event);
-		await executeGateEffects(ctx, effects);
+		const executed = await executeGateEffects(ctx, effects, operation);
+		if (!executed.ok || (operation && !controlOperationContinuationIsCurrent(ctx, operation))) return false;
 		persist();
 		updateStatus(ctx);
 		const violations = checkInvariants(state);
 		if (violations.length > 0) {
 			ctx.ui.notify(`LeanFlow invariant violation: ${violations.join("; ")}`, "warning");
 		}
+		return true;
 	}
 
 	/**
@@ -2244,38 +2455,48 @@ export default function leanflow(pi: ExtensionAPI): void {
 		failure: GatePreparationFailure,
 		source: GateSnapshotFailureSource,
 		interruption: OperationalInterruption = "tool_error",
+		operation?: ControlOperationIdentity,
 	): Promise<void> {
+		if (operation && !controlOperationContinuationIsCurrent(ctx, operation)) return;
 		switch (failure.kind) {
 			case "pending_evidence":
 				// BUILD is still active; no provenance state has become invalid.
 				return;
 			case "no_semantic_progress":
-				await applyGateRecoveryEvent(ctx, { type: "blocked_no_progress", reason: failure.reason });
+				await applyGateRecoveryEvent(ctx, { type: "blocked_no_progress", reason: failure.reason }, operation);
 				return;
 			case "repository_changed":
-				await applyGateRecoveryEvent(ctx, { type: "repository_changed", reason: failure.reason });
+				await applyGateRecoveryEvent(ctx, { type: "repository_changed", reason: failure.reason }, operation);
 				return;
 			case "artifact_rebuildable":
 			case "manifest_missing":
 			case "snapshot_changed":
-				await applyGateRecoveryEvent(ctx, { type: "snapshot_invalid", reason: failure.reason });
+				await applyGateRecoveryEvent(ctx, { type: "snapshot_invalid", reason: failure.reason }, operation);
 				return;
 			case "record_invalid":
-				await applyGateRecoveryEvent(ctx, {
-					type: "record_invalid",
-					reason: failure.reason,
-					checkpointRecoverable: failure.checkpointRecoverable === true,
-				});
+				await applyGateRecoveryEvent(
+					ctx,
+					{
+						type: "record_invalid",
+						reason: failure.reason,
+						checkpointRecoverable: failure.checkpointRecoverable === true,
+					},
+					operation,
+				);
 				return;
 			case "lease_invalid":
-				await applyGateRecoveryEvent(ctx, { type: "lease_invalid", reason: failure.reason });
+				await applyGateRecoveryEvent(ctx, { type: "lease_invalid", reason: failure.reason }, operation);
 				return;
 			case "plan_drift":
 			case "validation_contract_invalid": {
-				await applyGateRecoveryEvent(ctx, {
-					type: failure.kind === "plan_drift" ? "plan_drift" : "contract_invalid",
-					reason: failure.reason,
-				});
+				await applyGateRecoveryEvent(
+					ctx,
+					{
+						type: failure.kind === "plan_drift" ? "plan_drift" : "contract_invalid",
+						reason: failure.reason,
+					},
+					operation,
+				);
 				const artifact = expectedPlanArtifact(state);
 				const planPath = artifact && ctx.localProtocolOptions ? resolveRunMarkerPath(ctx.localProtocolOptions, artifact) : undefined;
 				let readable = false;
@@ -2287,12 +2508,17 @@ export default function leanflow(pi: ExtensionAPI): void {
 						// The fallback below gives the operator an editable plan repair path.
 					}
 				}
+				if (operation && !controlOperationContinuationIsCurrent(ctx, operation)) return;
 				if (readable) {
-					await refreshCanonicalPlanState(ctx, "mutation");
+					const refreshOperation = operation ? captureControlOperation(ctx, artifact) : undefined;
+					await refreshCanonicalPlanState(ctx, "mutation", refreshOperation);
 					return;
 				}
+				if (operation && !controlOperationContinuationIsCurrent(ctx, operation)) return;
 				state.handoffStatus = "NEEDS_UPDATE";
-				await writeRunMarker(ctx, "invalidated");
+				const markerOperation = operation ? captureControlOperation(ctx, artifact) : undefined;
+				await writeRunMarker(ctx, "invalidated", markerOperation);
+				if (operation && !controlOperationContinuationIsCurrent(ctx, operation)) return;
 				persist();
 				updateStatus(ctx);
 				ctx.ui.notify(`LeanFlow: ${failure.reason}; canonical plan is unreadable — repair and re-propose the plan.`, "warning");
@@ -2321,10 +2547,14 @@ export default function leanflow(pi: ExtensionAPI): void {
 				const lease = state.gateLease;
 				const finalized = state.finalizedGateSnapshot;
 				if (state.phase !== "gating" || !lease || !finalized) {
-					await applyGateRecoveryEvent(ctx, {
-						type: "lease_invalid",
-						reason: `${failure.reason}; Gate transport recovery lacks a durable lease`,
-					});
+					await applyGateRecoveryEvent(
+						ctx,
+						{
+							type: "lease_invalid",
+							reason: `${failure.reason}; Gate transport recovery lacks a durable lease`,
+						},
+						operation,
+					);
 					return;
 				}
 				const operationalRetrySnapshot = createOperationalRetrySnapshot(lease, finalized, interruption);
@@ -2333,6 +2563,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 					source === "session_interruption" || source === "restore"
 						? { type: "gate_interrupted", operationalRetrySnapshot }
 						: { type: "gate_error", operationalRetrySnapshot },
+					operation,
 				);
 				return;
 			}
@@ -2344,7 +2575,9 @@ export default function leanflow(pi: ExtensionAPI): void {
 		isError: boolean,
 		ctx: ExtensionContext,
 		interruptedBy: OperationalInterruption = "tool_error",
+		operation?: ControlOperationIdentity,
 	): Promise<void> {
+		if (operation && !controlOperationContinuationIsCurrent(ctx, operation)) return;
 		const lease = state.gateLease;
 		if (!lease || !state.finalizedGateSnapshot) {
 			await routeGateSnapshotFailure(
@@ -2355,6 +2588,8 @@ export default function leanflow(pi: ExtensionAPI): void {
 					reason: "Gate settlement lacks its durable lease or finalized manifest",
 				},
 				"settlement",
+				"tool_error",
+				operation,
 			);
 			return;
 		}
@@ -2364,6 +2599,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 				{ ok: false, kind: "transport_error", reason: "Gate tool did not return a valid result" },
 				"gate_tool_error",
 				interruptedBy,
+				operation,
 			);
 			return;
 		}
@@ -2380,9 +2616,11 @@ export default function leanflow(pi: ExtensionAPI): void {
 				},
 				"settlement",
 				"transport_error",
+				operation,
 			);
 			return;
 		}
+		if (operation && !controlOperationContinuationIsCurrent(ctx, operation)) return;
 		if (currentFingerprint.combinedDigest !== lease.repositoryFingerprint?.combinedDigest) {
 			await routeGateSnapshotFailure(
 				ctx,
@@ -2392,6 +2630,8 @@ export default function leanflow(pi: ExtensionAPI): void {
 					reason: "repository state changed immediately before Gate settlement",
 				},
 				"settlement",
+				"tool_error",
+				operation,
 			);
 			return;
 		}
@@ -2404,7 +2644,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 				!evidenceIds ||
 				evidenceIds.some((id) => !validationStates.some((validation) => validation.id === id))
 			) {
-				await finishGateResult(undefined, true, ctx, "invalid_gate_output");
+				await finishGateResult(undefined, true, ctx, "invalid_gate_output", operation);
 				ctx.ui.notify("LeanFlow: Gate BLOCKED result named an unknown approved validation ID.", "warning");
 				return;
 			}
@@ -2418,19 +2658,23 @@ export default function leanflow(pi: ExtensionAPI): void {
 				evidenceIds.includes(validation.id) ? { ...validation, status: blockedStatus } : validation,
 			);
 		}
-		await applyGateRecoveryEvent(ctx, {
-			type: "gate_settled",
-			outcome: result.verdict,
-			findingsJson: result.canonicalJson,
-			...(result.reasonCode ? { reasonCode: result.reasonCode } : {}),
-			...(evidenceIds ? { evidenceIds } : {}),
-			...(result.verdict === "BLOCKED"
-				? {
-						validationStates,
-						semanticEvidenceDigest: state.finalizedGateSnapshot.semanticEvidenceDigest,
-				  }
-				: {}),
-		});
+		await applyGateRecoveryEvent(
+			ctx,
+			{
+				type: "gate_settled",
+				outcome: result.verdict,
+				findingsJson: result.canonicalJson,
+				...(result.reasonCode ? { reasonCode: result.reasonCode } : {}),
+				...(evidenceIds ? { evidenceIds } : {}),
+				...(result.verdict === "BLOCKED"
+					? {
+							validationStates,
+							semanticEvidenceDigest: state.finalizedGateSnapshot.semanticEvidenceDigest,
+					  }
+					: {}),
+			},
+			operation,
+		);
 	}
 
 	function updateStatus(ctx: ExtensionContext): void {
@@ -2528,6 +2772,8 @@ export default function leanflow(pi: ExtensionAPI): void {
 			stateVersion: value.stateVersion,
 			gateAttempt: value.gateAttempt,
 			currentBuildRound: value.currentBuildRound,
+			controlSessionId: value.controlSessionId,
+			controlOperationEpoch: value.controlOperationEpoch,
 			gateCalls: value.gateCalls,
 			gateRetryMode: value.gateRetryMode,
 			gateLease: value.gateLease,
@@ -2547,8 +2793,8 @@ export default function leanflow(pi: ExtensionAPI): void {
 		});
 	}
 
-	const restoreSessionState = async (_event: unknown, ctx: ExtensionContext): Promise<void> => {
-		advanceBuildActivation();
+	const restoreSessionStateImpl = async (_event: unknown, ctx: ExtensionContext): Promise<void> => {
+		if (restoreSessionHook) await restoreSessionHook();
 		const branch = ctx.sessionManager.getBranch();
 		hasPersistedLeanFlowState = hasPersistedState(branch);
 		const rawBeforeRestore = (() => {
@@ -2571,13 +2817,11 @@ export default function leanflow(pi: ExtensionAPI): void {
 				Number.isInteger(rawStateVersion) &&
 				rawStateVersion >= 1 &&
 				rawStateVersion <= STATE_VERSION);
-		const wasGatingRaw = rawBeforeRestore?.phase === "gating" && supportedRawStateVersion;
+		const wasGatingRaw = rawBeforeRestore?.phase === "gating" && supportedRawStateVersion && rawStateVersion !== 7;
 		state = restoreState(branch);
-		pendingPlanRefreshes.clear();
-		pendingLspProbes.clear();
-		pendingApprovalWrites.clear();
-		pendingGateCalls.clear();
-		pendingGatePlanDigests.clear();
+		state.controlSessionId = buildSessionId(ctx);
+		state.controlOperationEpoch = activationEpoch;
+		pendingControlOperations.clear();
 		pendingEvidenceObservations.clear();
 
 		const restoredFromLegacy =
@@ -2738,16 +2982,23 @@ export default function leanflow(pi: ExtensionAPI): void {
 		resumePhaseTiming(state);
 		updateStatus(ctx);
 	};
+
+	const restoreSessionState = async (event: unknown, ctx: ExtensionContext): Promise<void> => {
+		const previous = restoreTail.catch(() => undefined);
+		const current = previous.then(async () => {
+			advanceBuildActivation();
+			await restoreSessionStateImpl(event, ctx);
+		});
+		restoreTail = current.catch(() => undefined);
+		await current;
+	};
 	async function refreshSettledPlanMutations(toolCallIds: Iterable<string>, ctx: ExtensionContext): Promise<void> {
-		let settled = false;
 		for (const toolCallId of toolCallIds) {
-			if (pendingPlanRefreshes.delete(toolCallId)) settled = true;
-		}
-		if (
-			settled &&
-			(state.phase === "planning" || state.phase === "awaiting_approval")
-		) {
-			await refreshCanonicalPlanState(ctx, "mutation");
+			const operation = pendingControlOperations.resolveTransport(toolCallId);
+			if (operation?.kind !== "proposal_mutation") continue;
+			if (!operation || !controlOperationIsCurrent(ctx, operation.identity, operation.payload.artifact)) continue;
+			await refreshCanonicalPlanState(ctx, "mutation", operation.identity);
+			return;
 		}
 	}
 
@@ -2773,8 +3024,8 @@ export default function leanflow(pi: ExtensionAPI): void {
 					)
 				: [];
 		await refreshSettledPlanMutations(settledToolCallIds, ctx);
-		if (!willContinue && pendingPlanRefreshes.size > 0) {
-			await refreshSettledPlanMutations([...pendingPlanRefreshes], ctx);
+		if (!willContinue && pendingControlOperations.count("proposal_mutation") > 0) {
+			await refreshSettledPlanMutations(pendingControlOperations.pendingTransport("proposal_mutation"), ctx);
 		}
 		pendingEvidenceObservations.clear();
 		if (state.phase === "finalizing" && !willContinue) {
@@ -2818,12 +3069,13 @@ export default function leanflow(pi: ExtensionAPI): void {
 
 			// Keep every artifact component ASCII-bounded while preserving task identity.
 			const slug = taskSlug(task);
-
 			if (
 				state.runMarkerArtifact &&
 				(state.runMarkerStatus === "awaiting_approval" || state.runMarkerStatus === "building")
 			) {
-				await writeRunMarker(ctx, "abandoned");
+				const markerOperation = captureControlOperation(ctx, state.planArtifact);
+				await writeRunMarker(ctx, "abandoned", markerOperation);
+				if (!controlOperationIsCurrent(ctx, markerOperation, state.planArtifact)) return;
 			}
 
 			pendingEvidenceObservations.clear();
@@ -2838,6 +3090,8 @@ export default function leanflow(pi: ExtensionAPI): void {
 				phaseStartedAt: now,
 				scoutCalls: 0,
 				runId: randomUUID(),
+				controlSessionId: buildSessionId(ctx),
+				controlOperationEpoch: activationEpoch,
 				gateCalls: 0,
 				gateAttempt: 0,
 				lspProbeStatus: "pending",
@@ -3549,10 +3803,18 @@ export default function leanflow(pi: ExtensionAPI): void {
 				if (shape.block) return { block: true, reason: shape.reason };
 				// writtenArtifacts is advisory UI state. The atomic manifest and
 				// its bound digests are the only Gate-readiness authority.
+				const preflightOperation = captureControlOperation(ctx, artifacts.plan);
+				if (gatePreflightHook) await gatePreflightHook();
+				if (!controlOperationIsCurrent(ctx, preflightOperation, artifacts.plan)) {
+					return { block: true, reason: "LeanFlow: Gate preflight authority changed before dispatch." };
+				}
 				const snapshot = await prepareGateSnapshot(ctx);
+				if (!controlOperationIsCurrent(ctx, preflightOperation, artifacts.plan)) {
+					return { block: true, reason: "LeanFlow: Gate preflight authority changed before dispatch." };
+				}
 				if (!snapshot.ok) {
 					recordStats(() => recordGateReadinessBlock(state));
-					await routeGateSnapshotFailure(ctx, snapshot, "preflight");
+					await routeGateSnapshotFailure(ctx, snapshot, "preflight", "tool_error", preflightOperation);
 					return {
 						block: true,
 						reason: `LeanFlow: Gate unavailable — complete build evidence first (${snapshot.reason}).`,
@@ -3569,8 +3831,11 @@ export default function leanflow(pi: ExtensionAPI): void {
 					reuseCycle: state.gateRetryMode === "operational" || state.gateRetryMode === "evidence",
 					now: Date.now(),
 				});
-				pendingGateCalls.add(event.toolCallId);
-				pendingGatePlanDigests.set(event.toolCallId, snapshot.planDigest);
+				const gateIdentity = captureControlOperation(ctx, snapshot.snapshotDigest);
+				pendingControlOperations.register(event.toolCallId, gateIdentity, {
+					kind: "gate_call",
+					payload: { snapshotDigest: snapshot.snapshotDigest },
+				});
 			}
 			state.scoutCalls += scoutCount;
 			if (roles.length > 0) {
@@ -3583,17 +3848,28 @@ export default function leanflow(pi: ExtensionAPI): void {
 			canonicalPlanMutation &&
 			(state.phase === "planning" || (state.phase === "awaiting_approval" && !approvalConfirmed))
 		) {
-			pendingPlanRefreshes.add(event.toolCallId);
+			const operation = captureControlOperation(ctx, canonicalPlanArtifact);
+			pendingControlOperations.register(event.toolCallId, operation, {
+				kind: "proposal_mutation",
+				payload: { artifact: canonicalPlanArtifact },
+			});
 		}
 
 		const diagnosticsTarget = lspDiagnosticsTarget(event);
+		const lspOperation =
+			state.phase === "building" && state.lspProbeStatus === "pending" && diagnosticsTarget !== undefined
+				? captureControlOperation(ctx, diagnosticsTarget)
+				: undefined;
 		if (
-			state.phase === "building" &&
-			state.lspProbeStatus === "pending" &&
+			lspOperation &&
 			diagnosticsTarget !== undefined &&
-			(await isUsableLspTarget(ctx, diagnosticsTarget))
+			(await isUsableLspTarget(ctx, diagnosticsTarget)) &&
+			controlOperationIsCurrent(ctx, lspOperation, diagnosticsTarget)
 		) {
-			pendingLspProbes.set(event.toolCallId, diagnosticsTarget);
+			pendingControlOperations.register(event.toolCallId, lspOperation, {
+				kind: "lsp_probe",
+				payload: { lspTarget: diagnosticsTarget },
+			});
 			state.lspLease = {
 				toolCallId: event.toolCallId,
 				kind: "lsp",
@@ -3604,7 +3880,6 @@ export default function leanflow(pi: ExtensionAPI): void {
 			};
 			persist();
 		}
-
 		if (isProposalWrite(event)) {
 			if (state.phase !== "awaiting_approval" || approvalConfirmed) {
 				return {
@@ -3621,32 +3896,45 @@ export default function leanflow(pi: ExtensionAPI): void {
 					reason: "LeanFlow: re-enter native plan mode for the queued local repair before requesting approval again.",
 				};
 			}
-			if (pendingPlanRefreshes.size > 0) {
+			if (pendingControlOperations.count("proposal_mutation") > 0) {
 				return {
 					block: true,
 					reason: "LeanFlow: wait for the canonical plan mutation to finish before proposing.",
 				};
 			}
 			const expected = state.planArtifact ?? canonicalPlanArtifact;
-			const lookup = expected ? await lookupFreshRecovery(ctx, expected) : { kind: "none" as const };
-			if (
-				!expected ||
-				event.input.content.trim() !== state.planSlug ||
-				!state.runId ||
-				lookup.kind !== "valid"
-			) {
+			if (!expected || event.input.content.trim() !== state.planSlug || !state.runId) {
 				return {
 					block: true,
 					reason: "LeanFlow: write the canonical plan and durable run marker before proposing its exact slug.",
 				};
 			}
-			if (!(await refreshCanonicalPlanState(ctx, "proposal"))) {
+			const proposalOperation = captureControlOperation(ctx, expected);
+			if (proposalLookupHook) await proposalLookupHook();
+			if (!controlOperationIsCurrent(ctx, proposalOperation, expected)) {
+				return { block: true, reason: "LeanFlow: proposal authority changed before dispatch." };
+			}
+			const lookup = await lookupFreshRecovery(ctx, expected);
+			if (!controlOperationIsCurrent(ctx, proposalOperation, expected)) {
+				return { block: true, reason: "LeanFlow: proposal authority changed before dispatch." };
+			}
+			if (lookup.kind !== "valid" || lookup.marker.runId !== proposalOperation.runId) {
+				return {
+					block: true,
+					reason: "LeanFlow: write the canonical plan and durable run marker before proposing its exact slug.",
+				};
+			}
+			if (!(await refreshCanonicalPlanState(ctx, "proposal", proposalOperation))) {
 				return {
 					block: true,
 					reason: "LeanFlow: the current canonical plan is invalid; repair it before requesting approval.",
 				};
 			}
-			pendingApprovalWrites.set(event.toolCallId, expected);
+			const approvalIdentity = captureControlOperation(ctx, expected);
+			pendingControlOperations.register(event.toolCallId, approvalIdentity, {
+				kind: "approval_write",
+				payload: { artifact: expected },
+			});
 		}
 
 		if (state.phase === "building" && effect === "repository_mutation") {
@@ -3750,31 +4038,44 @@ export default function leanflow(pi: ExtensionAPI): void {
 				}
 			}
 		}
-		if (event.toolName === "write" && pendingApprovalWrites.has(event.toolCallId)) {
-			const artifact = pendingApprovalWrites.get(event.toolCallId)!;
-			pendingApprovalWrites.delete(event.toolCallId);
-			if (event.isError) return;
+		const controlOperation = pendingControlOperations.resolveTransport(event.toolCallId);
+		const approvalOperation =
+			event.toolName === "write" && controlOperation?.kind === "approval_write" ? controlOperation : undefined;
+		if (approvalOperation) {
+			const artifact = approvalOperation.payload.artifact;
+			if (
+				event.isError ||
+				!artifact ||
+				!controlOperationIsCurrent(ctx, approvalOperation.identity, artifact) ||
+				state.planArtifact !== artifact
+			) {
+				return;
+			}
 			state.proposalBoundary = ctx.sessionManager.getBranch().length;
 			state.proposedPlanArtifact = artifact;
 			state.approvalRepairBoundary = undefined;
 			state.approvedPlanArtifact = undefined;
 			state.proposedPlanDigest = state.planDigest;
 			state.lspProbeTarget = undefined;
-			await writeRunMarker(ctx, "awaiting_approval");
+			if (!(await writeRunMarker(ctx, "awaiting_approval", approvalOperation.identity))) return;
 			persist();
 			updateStatus(ctx);
 			return;
 		}
 
-		const persistedLspTarget =
-			state.phase === "building" &&
-			state.lspProbeStatus === "pending" &&
-			state.lspLease?.toolCallId === event.toolCallId
-				? state.lspLease.lspTarget
-				: undefined;
-		const lspTarget = pendingLspProbes.get(event.toolCallId) ?? persistedLspTarget;
-		if (lspTarget !== undefined) {
-			pendingLspProbes.delete(event.toolCallId);
+		const lspOperation = controlOperation?.kind === "lsp_probe" ? controlOperation : undefined;
+		if (lspOperation) {
+			const lspTarget = lspOperation.payload.lspTarget;
+			if (
+				!lspTarget ||
+				!controlOperationIsCurrent(ctx, lspOperation.identity, lspTarget) ||
+				state.phase !== "building" ||
+				state.lspProbeStatus !== "pending" ||
+				state.lspLease?.toolCallId !== event.toolCallId ||
+				state.lspLease.lspTarget !== lspTarget
+			) {
+				return;
+			}
 			state.lspLease = undefined;
 			state.lspProbeStatus = "completed";
 			state.lspProbeTarget = lspTarget;
@@ -3783,31 +4084,29 @@ export default function leanflow(pi: ExtensionAPI): void {
 			return;
 		}
 
-		if (pendingPlanRefreshes.has(event.toolCallId)) {
-			pendingPlanRefreshes.delete(event.toolCallId);
-			if (event.isError) return;
-			await refreshCanonicalPlanState(ctx, "mutation");
+		const planOperation = controlOperation?.kind === "proposal_mutation" ? controlOperation : undefined;
+		if (planOperation) {
+			if (event.isError || !controlOperationIsCurrent(ctx, planOperation.identity, planOperation.payload.artifact)) {
+				return;
+			}
+			await refreshCanonicalPlanState(ctx, "mutation", planOperation.identity);
 			return;
 		}
 
-
-		if (
-			event.toolName === "task" &&
-			(pendingGateCalls.has(event.toolCallId) ||
-				(state.phase === "gating" && state.gateLease?.toolCallId === event.toolCallId))
-		) {
-			const dispatchedPlanDigest = pendingGatePlanDigests.get(event.toolCallId) ?? state.gateLease?.planDigest;
-			pendingGateCalls.delete(event.toolCallId);
-			pendingGatePlanDigests.delete(event.toolCallId);
-			if (state.phase === "gating" && state.gateLease) {
-				const snapshotCheck = await verifyGateSnapshot(ctx, state.gateLease);
-				if (!snapshotCheck.ok) {
-					ctx.ui.notify(`LeanFlow: ${snapshotCheck.reason}; Gate result was discarded.`, "warning");
-					await routeGateSnapshotFailure(ctx, snapshotCheck, "settlement");
-					return;
-				}
+		const gateOperation = event.toolName === "task" && controlOperation?.kind === "gate_call" ? controlOperation : undefined;
+		if (gateOperation) {
+			const lease = state.gateLease;
+			if (!lease || !gateControlOperationIsCurrent(ctx, gateOperation.identity, event.toolCallId)) return;
+			const dispatchedPlanDigest = gateOperation.identity.planDigest;
+			const snapshotCheck = await verifyGateSnapshot(ctx, lease);
+			if (!gateControlOperationIsCurrent(ctx, gateOperation.identity, event.toolCallId)) return;
+			if (!snapshotCheck.ok) {
+				ctx.ui.notify(`LeanFlow: ${snapshotCheck.reason}; Gate result was discarded.`, "warning");
+				await routeGateSnapshotFailure(ctx, snapshotCheck, "settlement", "tool_error", gateOperation.identity);
+				return;
 			}
 			if (!event.isError && (await planDriftedDuringGate(ctx, dispatchedPlanDigest))) {
+				if (!gateControlOperationIsCurrent(ctx, gateOperation.identity, event.toolCallId)) return;
 				ctx.ui.notify("LeanFlow: plan drifted during Gate; Gate result was discarded.", "warning");
 				await routeGateSnapshotFailure(
 					ctx,
@@ -3817,6 +4116,8 @@ export default function leanflow(pi: ExtensionAPI): void {
 						reason: "canonical plan digest changed during Gate",
 					},
 					"settlement",
+					"tool_error",
+					gateOperation.identity,
 				);
 				return;
 			}
@@ -3825,12 +4126,12 @@ export default function leanflow(pi: ExtensionAPI): void {
 				const parsed = parseGateResult(event.content);
 				if (!parsed.ok) {
 					ctx.ui.notify(`LeanFlow: Gate result semantic validation failed: ${parsed.reason}`, "warning");
-					await finishGateResult(undefined, true, ctx);
+					await finishGateResult(undefined, true, ctx, "invalid_gate_output", gateOperation.identity);
 					return;
 				}
 				result = parsed.result;
 			}
-			await finishGateResult(result, event.isError, ctx);
+			await finishGateResult(result, event.isError, ctx, "tool_error", gateOperation.identity);
 			return;
 		}
 	});
@@ -3876,9 +4177,13 @@ export default function leanflow(pi: ExtensionAPI): void {
 				state.runMarkerStatus === "building" ||
 				state.runMarkerStatus === "paused"
 			) {
-				await writeRunMarker(ctx, "abandoned");
+				const markerOperation = captureControlOperation(ctx, state.planArtifact);
+				await writeRunMarker(ctx, "abandoned", markerOperation);
+				if (!controlOperationIsCurrent(ctx, markerOperation, state.planArtifact)) return;
 			}
 			advanceBuildActivation();
+			state.controlSessionId = buildSessionId(ctx);
+			state.controlOperationEpoch = activationEpoch;
 			pendingEvidenceObservations.clear();
 			state.baselineCaptured = false;
 			state.buildMutationObserved = false;

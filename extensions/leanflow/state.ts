@@ -6,6 +6,7 @@ import {
 	type ValidationSemanticState,
 } from "./validation";
 import {
+	createOperationalRetrySnapshot,
 	isFinalizationCommitNonce,
 	finalizedGateSnapshotDigest,
 	parseFinalizedGateSnapshot,
@@ -178,6 +179,10 @@ export interface LeanFlowState {
 	gateAttempt: number;
 	/** Stable opaque identity persisted in the fresh-session run marker. */
 	runId?: string;
+	/** Session that owns the current control-plane activation. */
+	controlSessionId?: string;
+	/** Monotonic control-plane activation; late operations from prior epochs fail closed. */
+	controlOperationEpoch?: number;
 	/** Why BUILD resumed after a Gate attempt. */
 	gateRetryMode?: "repair" | "evidence" | "operational";
 	/** Stable slug naming all canonical workflow artifacts. */
@@ -257,7 +262,7 @@ export interface LeanFlowState {
 	repairLease?: RepairLease;
 	/** Explicit next action after provenance recovery; cleared on successful redispatch or repair. */
 	recoveryAction?: GateRecoveryAction;
-	/** Persisted workflow schema version; absence implies v1, and active output is always v7. */
+	/** Persisted workflow schema version; absence implies v1, and active output is always v8. */
 	stateVersion?: number;
 	/** Runtime token/context statistics for the current run. */
 	stats?: LeanFlowStats;
@@ -294,8 +299,8 @@ export function defaultState(): LeanFlowState {
 		gateDispatches: 0,
 		gateAttempt: 0,
 		humanRepairCycles: 0,
-		blockedRecovery: undefined,
 		consecutiveGateErrors: 0,
+		controlOperationEpoch: 1,
 		stateVersion: STATE_VERSION,
 		lspProbeStatus: "pending",
 		stats: defaultStats(),
@@ -332,7 +337,7 @@ export function restoreState(branch: Iterable<BranchEntry>): LeanFlowState {
  * finalizing state. Older state is normalized and persisted immediately by the
  * restore flow; it is never allowed to regain authority by migration alone.
  */
-export const STATE_VERSION = 7;
+export const STATE_VERSION = 8;
 
 function migrateLegacyGateState(
 	state: LeanFlowState,
@@ -631,6 +636,12 @@ function normalizeState(value: unknown): LeanFlowState {
 			repairLease = { fromRound, toRound: fromRound + 1, reason: "gate_fail", startedAt: Date.now() };
 		}
 	}
+	if (persistedVersion === 7 && phase === "gating" && gateLease && finalizedGateSnapshot) {
+		operationalRetrySnapshot = createOperationalRetrySnapshot(gateLease, finalizedGateSnapshot, "session_switch");
+		gateLease = undefined;
+		phase = "building";
+		gateRetryMode = "operational";
+	}
 	if (!finalizedGateSnapshot) finalizationCommitNonce = undefined;
 
 	if (gateRetryMode === "operational" && (!finalizedGateSnapshot || !operationalRetrySnapshot)) {
@@ -691,6 +702,13 @@ function normalizeState(value: unknown): LeanFlowState {
 				: 0,
 		gateAttempt: numberOr(state.gateAttempt, 0),
 		runId: typeof state.runId === "string" ? state.runId : undefined,
+		controlSessionId: typeof state.controlSessionId === "string" ? state.controlSessionId : undefined,
+		controlOperationEpoch:
+			typeof state.controlOperationEpoch === "number" &&
+			Number.isInteger(state.controlOperationEpoch) &&
+			state.controlOperationEpoch >= 1
+				? state.controlOperationEpoch
+				: 1,
 		planSlug: typeof state.planSlug === "string" ? state.planSlug : undefined,
 		planArtifact: typeof state.planArtifact === "string" ? state.planArtifact : undefined,
 		planDigest: planDigestValue,
