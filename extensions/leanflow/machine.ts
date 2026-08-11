@@ -25,6 +25,8 @@ export type GateEvent =
 			type: "gate_dispatch";
 			toolCallId: string;
 			runId: string;
+			controlSessionId?: string;
+			controlOperationEpoch?: number;
 			snapshotDigest: string;
 			planDigest: string;
 			buildRecordRound: number;
@@ -309,6 +311,8 @@ function reduceGateDispatch(
 		toolCallId: event.toolCallId,
 		kind: "gate",
 		runId: event.runId,
+		...(event.controlSessionId ? { controlSessionId: event.controlSessionId } : {}),
+		...(event.controlOperationEpoch !== undefined ? { controlOperationEpoch: event.controlOperationEpoch } : {}),
 		cycle,
 		startedAt: event.now,
 		snapshotDigest: event.snapshotDigest,

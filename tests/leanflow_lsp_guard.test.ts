@@ -16,6 +16,7 @@ import leanflow, {
 	setRepairSetupReadHookForTest,
 	setRestoreSessionHookForTest,
 } from "../extensions/leanflow/index";
+import { PendingOperationRegistry, createControlOperationIdentity } from "../extensions/leanflow/control-operation";
 import { finalizedGateSnapshotDigest, type FinalizedGateSnapshot } from "../extensions/leanflow/provenance";
 
 type TestContext = {
@@ -1394,6 +1395,149 @@ test("a stale human repair cannot overwrite a replacement BUILD record", async (
 	} finally {
 		setRepairSetupReadHookForTest(undefined);
 	}
+});
+
+test("plan cleanup cannot consume a pending Gate transport", async () => {
+	const harness = createHarness();
+	await enterDocumentationBuild(harness);
+	await completeBuildEvidence(harness);
+	await harness.handlers.get("tool_call")!(
+		{ toolName: "task", toolCallId: "gate-shared-with-cleanup", input: gateCallInput() },
+		harness.ctx,
+	);
+	await harness.handlers.get("turn_end")!(
+		{ toolResults: [{ toolCallId: "gate-shared-with-cleanup" }] },
+		harness.ctx,
+	);
+	await harness.handlers.get("tool_result")!(
+		{
+			toolName: "task",
+			toolCallId: "gate-shared-with-cleanup",
+			isError: false,
+			content: [{ type: "text", text: JSON.stringify({ verdict: "PASS", findings: [] }) }],
+		},
+		harness.ctx,
+	);
+	expect(harness.states.at(-1)).toMatchObject({ phase: "finalizing", terminalOutcome: "pass" });
+});
+
+test("registry rejects duplicate transports without orphaning the original operation", () => {
+	const registry = new PendingOperationRegistry<Record<string, never>>();
+	const authority = {
+		sessionId: "session-a",
+		runId: "11111111-1111-4111-8111-111111111111",
+		activationEpoch: 1,
+		phase: "planning" as const,
+		planDigest: undefined,
+	};
+	const first = createControlOperationIdentity(authority, "local://plan.md", "first");
+	const duplicate = createControlOperationIdentity(authority, "local://plan.md", "duplicate");
+	expect(registry.register("shared", first, { kind: "proposal_mutation", payload: {} })).toEqual({ ok: true });
+	expect(registry.register("shared", duplicate, { kind: "gate_call", payload: {} })).toEqual({
+		ok: false,
+		reason: "duplicate_transport",
+	});
+	expect(registry.peekTransport("shared")?.identity.operationId).toBe("first");
+	expect(registry.isConsistent()).toBe(true);
+	expect(registry.takeTransportIfKind("shared", "gate_call")).toBeUndefined();
+	expect(registry.peekTransport("shared")?.identity.operationId).toBe("first");
+	expect(registry.takeTransportIfKind("shared", "proposal_mutation")?.identity.operationId).toBe("first");
+	expect(registry.isConsistent()).toBe(true);
+});
+
+test("plan cleanup preserves Approval and LSP transports until their real results settle", async () => {
+	const approvalHarness = createHarness();
+	await writeInitialPlan(approvalHarness);
+	const approvalCall = approvalHarness.handlers.get("tool_call")!;
+	const approvalResult = approvalHarness.handlers.get("tool_result")!;
+	await approvalCall(
+		{ toolName: "write", toolCallId: "approval-shared-with-cleanup", input: { path: "xd://propose", content: EXAMPLE_SLUG } },
+		approvalHarness.ctx,
+	);
+	await approvalHarness.handlers.get("turn_end")!(
+		{ toolResults: [{ toolCallId: "approval-shared-with-cleanup" }] },
+		approvalHarness.ctx,
+	);
+	await approvalResult(
+		{ toolName: "write", toolCallId: "approval-shared-with-cleanup", isError: false },
+		approvalHarness.ctx,
+	);
+	expect(approvalHarness.states.at(-1)).toMatchObject({
+		phase: "awaiting_approval",
+		proposedPlanArtifact: EXAMPLE_PLAN_ARTIFACT,
+	});
+
+	const lspHarness = createHarness();
+	await writeInitialPlan(lspHarness);
+	const lspCall = lspHarness.handlers.get("tool_call")!;
+	const lspResult = lspHarness.handlers.get("tool_result")!;
+	await lspCall(
+		{ toolName: "write", toolCallId: "propose-before-lsp-cleanup", input: { path: "xd://propose", content: EXAMPLE_SLUG } },
+		lspHarness.ctx,
+	);
+	await lspResult({ toolName: "write", toolCallId: "propose-before-lsp-cleanup", isError: false }, lspHarness.ctx);
+	lspHarness.branch.push({ type: "mode_change", mode: "none" });
+	await lspHarness.handlers.get("context")!({ messages: approvalMessages }, lspHarness.ctx);
+	await lspCall(
+		{
+			toolName: "write",
+			toolCallId: "lsp-shared-with-cleanup",
+			input: {
+				path: "xd://lsp",
+				content: JSON.stringify({ action: "diagnostics", file: "src/example.ts", timeout: 60 }),
+			},
+		},
+		lspHarness.ctx,
+	);
+	await lspHarness.handlers.get("turn_end")!(
+		{ toolResults: [{ toolCallId: "lsp-shared-with-cleanup" }] },
+		lspHarness.ctx,
+	);
+	await lspResult(
+		{
+			toolName: "write",
+			toolCallId: "lsp-shared-with-cleanup",
+			isError: false,
+			content: [{ type: "text", text: "typescript-language-server: clean" }],
+		},
+		lspHarness.ctx,
+	);
+	expect(lspHarness.states.at(-1)).toMatchObject({
+		phase: "building",
+		lspProbeStatus: "completed",
+		lspProbeTarget: "src/example.ts",
+	});
+});
+
+test("terminal agent cleanup drains every current plan mutation and refreshes once", async () => {
+	const harness = createHarness();
+	await harness.commands.get("flow")!.handler(EXAMPLE_TASK, harness.ctx);
+	const state = harness.states.at(-1)!;
+	const artifact = `local://${state.planSlug}-plan.md`;
+	const planFile = resolveRunMarkerPath(harness.ctx.localProtocolOptions, artifact)!;
+	const content = [
+		"Update src/example.ts safely.",
+		"LSP applicability: required",
+		"## Critical files",
+		"- extensions/leanflow/index.ts",
+		"## Acceptance",
+		"- [ ] Preserve behavior.",
+		"## Verification",
+		"`bun test tests/leanflow_lsp_guard.test.ts`",
+		`LeanFlow run ID: ${state.runId}`,
+	].join("\n");
+	const call = harness.handlers.get("tool_call")!;
+	await call({ toolName: "write", toolCallId: "terminal-plan-one", input: { path: artifact, content } }, harness.ctx);
+	await call({ toolName: "write", toolCallId: "terminal-plan-two", input: { path: artifact, content } }, harness.ctx);
+	mkdirSync(dirname(planFile), { recursive: true });
+	writeFileSync(planFile, content);
+	await harness.handlers.get("agent_end")!({ willContinue: false, messages: [] }, harness.ctx);
+	expect(harness.states.at(-1)).toMatchObject({ phase: "awaiting_approval", planArtifact: artifact });
+	const proposal = await call(
+		{ toolName: "write", toolCallId: "proposal-after-terminal-drain", input: { path: "xd://propose", content: state.planSlug } },
+		harness.ctx,
+	);
+	expect(proposal).toBeUndefined();
 });
 test("a suspended Gate preflight cannot dispatch into a replacement run", async () => {
 	const entered = createDeferred<void>();

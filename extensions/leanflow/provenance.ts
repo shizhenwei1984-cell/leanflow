@@ -70,6 +70,8 @@ const LEASE_KEYS = [
 	"toolCallId",
 	"kind",
 	"runId",
+	"controlSessionId",
+	"controlOperationEpoch",
 	"cycle",
 	"startedAt",
 	"snapshotDigest",
@@ -180,6 +182,9 @@ function parseOperationLease(value: unknown): OperationLease | undefined {
 		value.kind !== "gate" ||
 		!nonEmpty(value.toolCallId) ||
 		!nonEmpty(value.runId) ||
+		(value.controlSessionId !== undefined && !nonEmpty(value.controlSessionId)) ||
+		(value.controlOperationEpoch !== undefined &&
+			(!Number.isInteger(value.controlOperationEpoch) || (value.controlOperationEpoch as number) < 1)) ||
 		!Number.isInteger(value.cycle) ||
 		(value.cycle as number) < 1 ||
 		typeof value.startedAt !== "number" ||
@@ -197,6 +202,10 @@ function parseOperationLease(value: unknown): OperationLease | undefined {
 		toolCallId: value.toolCallId,
 		kind: "gate",
 		runId: value.runId,
+		...(typeof value.controlSessionId === "string" ? { controlSessionId: value.controlSessionId } : {}),
+		...(typeof value.controlOperationEpoch === "number"
+			? { controlOperationEpoch: value.controlOperationEpoch }
+			: {}),
 		cycle: value.cycle as number,
 		startedAt: value.startedAt,
 		snapshotDigest: value.snapshotDigest,

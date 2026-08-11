@@ -69,7 +69,7 @@ import {
 	isControlOperationCurrent,
 	PendingOperationRegistry,
 } from "./control-operation";
-import type { ActiveControlAuthority, ControlOperationIdentity } from "./control-operation";
+import type { ActiveControlAuthority, ControlOperationIdentity, PendingControlOperation } from "./control-operation";
 import { checkAgentBudget, checkTaskGuard, extractAgentRoles, validateGateTaskCall } from "./guard";
 import type { GateArtifacts, LeanFlowAgentRole } from "./guard";
 import { assessHandoff, formatHandoffNotification } from "./handoff";
@@ -3098,14 +3098,35 @@ export default function leanflow(pi: ExtensionAPI): void {
 		restoreTail = current.catch(() => undefined);
 		await current;
 	};
+	async function refreshLatestPlanMutation(
+		operations: Iterable<PendingControlOperation<PendingControlPayload>>,
+		ctx: ExtensionContext,
+	): Promise<void> {
+		const latest = [...operations]
+			.filter(
+				(operation) =>
+					operation.kind === "proposal_mutation" &&
+					controlOperationIsCurrent(ctx, operation.identity, operation.payload.artifact),
+			)
+			.sort((left, right) => right.identity.createdAt - left.identity.createdAt)[0];
+		if (latest) await refreshCanonicalPlanState(ctx, "mutation", latest.identity);
+	}
+
 	async function refreshSettledPlanMutations(toolCallIds: Iterable<string>, ctx: ExtensionContext): Promise<void> {
+		const settled: PendingControlOperation<PendingControlPayload>[] = [];
 		for (const toolCallId of toolCallIds) {
-			const operation = pendingControlOperations.resolveTransport(toolCallId);
-			if (operation?.kind !== "proposal_mutation") continue;
-			if (!operation || !controlOperationIsCurrent(ctx, operation.identity, operation.payload.artifact)) continue;
-			await refreshCanonicalPlanState(ctx, "mutation", operation.identity);
-			return;
+			const operation = pendingControlOperations.takeTransportIfKind(toolCallId, "proposal_mutation");
+			if (operation) settled.push(operation);
 		}
+		await refreshLatestPlanMutation(settled, ctx);
+	}
+
+	function currentProposalMutations(ctx: ExtensionContext): readonly PendingControlOperation<PendingControlPayload>[] {
+		return pendingControlOperations.list(
+			(operation) =>
+				operation.kind === "proposal_mutation" &&
+				controlOperationIsCurrent(ctx, operation.identity, operation.payload.artifact),
+		);
 	}
 
 	pi.on("turn_end", async (event, ctx) => {
@@ -3130,8 +3151,13 @@ export default function leanflow(pi: ExtensionAPI): void {
 					)
 				: [];
 		await refreshSettledPlanMutations(settledToolCallIds, ctx);
-		if (!willContinue && pendingControlOperations.count("proposal_mutation") > 0) {
-			await refreshSettledPlanMutations(pendingControlOperations.pendingTransport("proposal_mutation"), ctx);
+		if (!willContinue) {
+			const terminal = pendingControlOperations.drain(
+				(operation) =>
+					operation.kind === "proposal_mutation" &&
+					controlOperationIsCurrent(ctx, operation.identity, operation.payload.artifact),
+			);
+			await refreshLatestPlanMutation(terminal, ctx);
 		}
 		pendingEvidenceObservations.clear();
 		if (state.phase === "finalizing" && !willContinue) {
@@ -3728,6 +3754,9 @@ export default function leanflow(pi: ExtensionAPI): void {
 	// -----------------------------------------------------------------------
 	pi.on("tool_call", async (event, ctx) => {
 		if (state.phase === "idle") return;
+		if (pendingControlOperations.peekTransport(event.toolCallId)) {
+			return { block: true, reason: "LeanFlow: duplicate toolCallId rejected by the control operation registry." };
+		}
 		if (state.phase === "finalizing") {
 			if (isFinalizingTodoCompletion(event)) return;
 			return {
@@ -3930,6 +3959,8 @@ export default function leanflow(pi: ExtensionAPI): void {
 					type: "gate_dispatch",
 					toolCallId: event.toolCallId,
 					runId: state.runId ?? "",
+					controlSessionId: state.controlSessionId,
+					controlOperationEpoch: state.controlOperationEpoch,
 					snapshotDigest: snapshot.snapshotDigest,
 					planDigest: snapshot.planDigest,
 					buildRecordRound: snapshot.buildRecordRound,
@@ -4002,7 +4033,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 					reason: "LeanFlow: re-enter native plan mode for the queued local repair before requesting approval again.",
 				};
 			}
-			if (pendingControlOperations.count("proposal_mutation") > 0) {
+			if (currentProposalMutations(ctx).length > 0) {
 				return {
 					block: true,
 					reason: "LeanFlow: wait for the canonical plan mutation to finish before proposing.",
@@ -4144,9 +4175,10 @@ export default function leanflow(pi: ExtensionAPI): void {
 				}
 			}
 		}
-		const controlOperation = pendingControlOperations.resolveTransport(event.toolCallId);
 		const approvalOperation =
-			event.toolName === "write" && controlOperation?.kind === "approval_write" ? controlOperation : undefined;
+			event.toolName === "write"
+				? pendingControlOperations.takeTransportIfKind(event.toolCallId, "approval_write")
+				: undefined;
 		if (approvalOperation) {
 			const artifact = approvalOperation.payload.artifact;
 			if (
@@ -4169,7 +4201,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 			return;
 		}
 
-		const lspOperation = controlOperation?.kind === "lsp_probe" ? controlOperation : undefined;
+		const lspOperation = pendingControlOperations.takeTransportIfKind(event.toolCallId, "lsp_probe");
 		if (lspOperation) {
 			const lspTarget = lspOperation.payload.lspTarget;
 			if (
@@ -4190,7 +4222,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 			return;
 		}
 
-		const planOperation = controlOperation?.kind === "proposal_mutation" ? controlOperation : undefined;
+		const planOperation = pendingControlOperations.takeTransportIfKind(event.toolCallId, "proposal_mutation");
 		if (planOperation) {
 			if (event.isError || !controlOperationIsCurrent(ctx, planOperation.identity, planOperation.payload.artifact)) {
 				return;
@@ -4199,9 +4231,37 @@ export default function leanflow(pi: ExtensionAPI): void {
 			return;
 		}
 
-		const gateOperation = event.toolName === "task" && controlOperation?.kind === "gate_call" ? controlOperation : undefined;
-		if (gateOperation) {
-			const lease = state.gateLease;
+		const correlatedGateOperation =
+			event.toolName === "task"
+				? pendingControlOperations.takeTransportIfKind(event.toolCallId, "gate_call")
+				: undefined;
+		const lease = state.gateLease;
+		const durableGateAuthority =
+			event.toolName === "task" &&
+			state.phase === "gating" &&
+			lease !== undefined &&
+			lease.toolCallId === event.toolCallId &&
+			lease.runId === state.runId &&
+			lease.controlSessionId === state.controlSessionId &&
+			lease.controlOperationEpoch === state.controlOperationEpoch;
+		const gateOperation =
+			durableGateAuthority && lease
+				? correlatedGateOperation ?? {
+						kind: "gate_call" as const,
+						identity: {
+							operationId: `lease:${lease.toolCallId}`,
+							sessionId: lease.controlSessionId!,
+							runId: lease.runId,
+							activationEpoch: lease.controlOperationEpoch!,
+							phase: "gating" as const,
+							planDigest: lease.planDigest,
+							artifactIdentity: lease.snapshotDigest,
+							createdAt: lease.startedAt,
+						},
+						payload: { snapshotDigest: lease.snapshotDigest },
+					}
+				: undefined;
+		if (gateOperation && lease) {
 			if (!lease || !gateControlOperationIsCurrent(ctx, gateOperation.identity, event.toolCallId)) return;
 			const dispatchedPlanDigest = gateOperation.identity.planDigest;
 			const snapshotCheck = await verifyGateSnapshot(ctx, lease);

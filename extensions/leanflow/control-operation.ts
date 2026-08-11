@@ -25,11 +25,6 @@ export interface ActiveControlAuthority {
 	planDigest: string | undefined;
 }
 
-export interface PendingControlOperation<T> {
-	kind: ControlOperationKind;
-	identity: ControlOperationIdentity;
-	payload: T;
-}
 
 export type ControlOperationKind =
 	| "canonical_plan_refresh"
@@ -125,32 +120,50 @@ export class PendingOperationRegistry<T> {
 		toolCallId: string,
 		identity: ControlOperationIdentity,
 		operation: Omit<PendingControlOperation<T>, "identity">,
-	): void {
+	): { ok: true } | { ok: false; reason: "duplicate_transport" } {
+		if (this.#transport.has(toolCallId) || this.#operations.has(identity.operationId)) {
+			return { ok: false, reason: "duplicate_transport" };
+		}
 		this.#operations.set(identity.operationId, Object.freeze({ ...operation, identity }));
 		this.#transport.set(toolCallId, identity.operationId);
+		return { ok: true };
 	}
 
-	resolveTransport(toolCallId: string): PendingControlOperation<T> | undefined {
+	peekTransport(toolCallId: string): PendingControlOperation<T> | undefined {
 		const operationId = this.#transport.get(toolCallId);
-		if (!operationId) return undefined;
-		this.#transport.delete(toolCallId);
+		return operationId === undefined ? undefined : this.#operations.get(operationId);
+	}
+
+	takeTransportIfKind(
+		toolCallId: string,
+		expectedKind: ControlOperationKind,
+	): PendingControlOperation<T> | undefined {
+		const operationId = this.#transport.get(toolCallId);
+		if (operationId === undefined) return undefined;
 		const operation = this.#operations.get(operationId);
+		if (!operation || operation.kind !== expectedKind) return undefined;
+		this.#transport.delete(toolCallId);
 		this.#operations.delete(operationId);
 		return operation;
 	}
 
-	invalidateEpoch(epoch: number): void {
-		for (const [operationId, operation] of this.#operations) {
-			if (operation.identity.activationEpoch <= epoch) this.#operations.delete(operationId);
-		}
+	list(predicate: (operation: PendingControlOperation<T>) => boolean): readonly PendingControlOperation<T>[] {
+		return [...this.#operations.values()].filter(predicate);
+	}
+
+	drain(predicate: (operation: PendingControlOperation<T>) => boolean): PendingControlOperation<T>[] {
+		const drained = this.list(predicate);
+		for (const operation of drained) this.#operations.delete(operation.identity.operationId);
 		this.#pruneTransport();
+		return [...drained];
+	}
+
+	invalidateEpoch(epoch: number): void {
+		this.drain((operation) => operation.identity.activationEpoch <= epoch);
 	}
 
 	invalidateRun(runId: string): void {
-		for (const [operationId, operation] of this.#operations) {
-			if (operation.identity.runId === runId) this.#operations.delete(operationId);
-		}
-		this.#pruneTransport();
+		this.drain((operation) => operation.identity.runId === runId);
 	}
 
 	pendingTransport(kind?: ControlOperationKind): readonly string[] {
@@ -162,6 +175,15 @@ export class PendingOperationRegistry<T> {
 
 	count(kind?: ControlOperationKind): number {
 		return kind === undefined ? this.#operations.size : this.pendingTransport(kind).length;
+	}
+
+	isConsistent(): boolean {
+		const operationIds = new Set<string>();
+		for (const operationId of this.#transport.values()) {
+			if (!this.#operations.has(operationId) || operationIds.has(operationId)) return false;
+			operationIds.add(operationId);
+		}
+		return operationIds.size === this.#operations.size;
 	}
 
 	clear(): void {

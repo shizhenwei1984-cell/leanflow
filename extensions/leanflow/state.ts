@@ -72,6 +72,8 @@ export interface OperationLease {
 	toolCallId: string;
 	kind: OperationLeaseKind;
 	runId: string;
+	controlSessionId?: string;
+	controlOperationEpoch?: number;
 	/** Gate round (gateAttempt) or LSP probe cycle the lease belongs to. */
 	cycle: number;
 	startedAt: number;
@@ -895,6 +897,8 @@ function normalizeOperationLease(value: unknown): OperationLease | undefined {
 		toolCallId?: unknown;
 		kind?: unknown;
 		runId?: unknown;
+		controlSessionId?: unknown;
+		controlOperationEpoch?: unknown;
 		cycle?: unknown;
 		startedAt?: unknown;
 		snapshotDigest?: unknown;
@@ -928,6 +932,10 @@ function normalizeOperationLease(value: unknown): OperationLease | undefined {
 			toolCallId: lease.toolCallId,
 			kind: lease.kind,
 			runId: lease.runId,
+			...(typeof lease.controlSessionId === "string" ? { controlSessionId: lease.controlSessionId } : {}),
+			...(typeof lease.controlOperationEpoch === "number" && Number.isInteger(lease.controlOperationEpoch)
+				? { controlOperationEpoch: lease.controlOperationEpoch }
+				: {}),
 			cycle,
 			startedAt,
 			snapshotDigest,
