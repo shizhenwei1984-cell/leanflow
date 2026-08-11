@@ -63,6 +63,7 @@ type PersistedState = {
 	runId?: string;
 	planDigest?: string;
 	runMarkerArtifact?: string;
+	runMarkerNonce?: string;
 	lspProbeStatus: "not_required" | "pending" | "completed";
 	lspProbeTarget?: string;
 	baselineCaptured?: boolean;
@@ -1190,6 +1191,59 @@ test("a marker publication suspended after close cannot overwrite a replacement 
 		released.resolve();
 		await settlement;
 		expect(readFileSync(pointerPath, "utf8")).toBe(replacementPointer);
+	} finally {
+		setAtomicPublicationAfterCloseHookForTest(undefined);
+	}
+});
+
+test("competing initial marker publications cannot replace the first active pointer", async () => {
+	const entered = createDeferred<void>();
+	const released = createDeferred<void>();
+	const harness = createHarness();
+	const call = harness.handlers.get("tool_call")!;
+	const result = harness.handlers.get("tool_result")!;
+	await harness.commands.get("flow")!.handler(EXAMPLE_TASK, harness.ctx);
+	const initial = harness.states.at(-1)!;
+	const planContent = completeHandoffPlan(
+		[
+			"Update src/example.ts and run focused tests.",
+			`LeanFlow run ID: ${initial.runId}`,
+			"LSP applicability: required",
+		].join("\n"),
+	);
+	const planPath = resolveRunMarkerPath(harness.ctx.localProtocolOptions, EXAMPLE_PLAN_ARTIFACT)!;
+	writeFileSync(planPath, planContent);
+	const pointerPath = resolveRunMarkerPath(harness.ctx.localProtocolOptions, hashedPointerArtifact(EXAMPLE_SLUG))!;
+	let suspended = false;
+	setAtomicPublicationAfterCloseHookForTest(async (filePath) => {
+		if (!suspended && filePath === pointerPath) {
+			suspended = true;
+			entered.resolve();
+			await released.promise;
+		}
+	});
+	try {
+		await call(
+			{ toolName: "write", toolCallId: "first-initial-marker", input: { path: EXAMPLE_PLAN_ARTIFACT, content: planContent } },
+			harness.ctx,
+		);
+		const first = result({ toolName: "write", toolCallId: "first-initial-marker", isError: false }, harness.ctx);
+		await entered.promise;
+		await call(
+			{ toolName: "write", toolCallId: "second-initial-marker", input: { path: EXAMPLE_PLAN_ARTIFACT, content: planContent } },
+			harness.ctx,
+		);
+		await result({ toolName: "write", toolCallId: "second-initial-marker", isError: false }, harness.ctx);
+		const winner = readFileSync(pointerPath, "utf8");
+		const markerPath = resolveRunMarkerPath(
+			harness.ctx.localProtocolOptions,
+			`local://.leanflow/runs/${initial.runId}.json`,
+		)!;
+		const winnerMarker = readFileSync(markerPath, "utf8");
+		released.resolve();
+		await first;
+		expect(readFileSync(pointerPath, "utf8")).toBe(winner);
+		expect(readFileSync(markerPath, "utf8")).toBe(winnerMarker);
 	} finally {
 		setAtomicPublicationAfterCloseHookForTest(undefined);
 	}
@@ -4708,8 +4762,52 @@ test("pointer persistence failures report the stage, path, and filesystem code",
 	expect(latest.persistenceFailureMessage).toContain(activeDirectory);
 	expect(harness.notifications.at(-1)).toContain("during pointer write");
 	expect(harness.notifications.at(-1)).toContain(`${latest.persistenceFailureCode}, path: ${expectedPointerPath}`);
-	const marker = JSON.parse(readFileSync(runMarkerPath(harness), "utf8"));
-	expect(marker.status).toBe("awaiting_approval");
+	const expectedMarkerPath = resolveRunMarkerPath(
+		harness.ctx.localProtocolOptions,
+		`local://.leanflow/runs/${initial.runId}.json`,
+	)!;
+	expect(existsSync(expectedMarkerPath)).toBe(false);
+
+	rmSync(activeDirectory);
+	await call(
+		{
+			toolName: "write",
+			toolCallId: "pointer-retry-plan",
+			input: { path: EXAMPLE_PLAN_ARTIFACT, content: planContent },
+		},
+		harness.ctx,
+	);
+	await harness.handlers.get("tool_result")!(
+		{ toolName: "write", toolCallId: "pointer-retry-plan", isError: false },
+		harness.ctx,
+	);
+	const retried = harness.states.at(-1)!;
+	const retryNonce = retried.runMarkerNonce;
+	expect(retried.phase).toBe("awaiting_approval");
+	expect(retried.persistenceDegraded).toBe(false);
+	expect(typeof retryNonce).toBe("string");
+	const pointer = JSON.parse(readFileSync(expectedPointerPath, "utf8"));
+	expect(pointer.markerNonce).toBe(retryNonce);
+});
+
+test("a fresh extension replaces a persisted terminal active pointer", async () => {
+	const harness = createHarness();
+	const old = writeFreshArtifacts(harness, {
+		planContent: "Archived plan.\nLeanFlow run ID: 4f414c4c-8f8f-4dca-8df3-9e0fabada555\nLSP applicability: required",
+		markerOverrides: { status: "abandoned", markerNonce: "abandoned-pointer-nonce" },
+		pointer: "hashed",
+		slug: EXAMPLE_SLUG,
+	});
+	const pointer = JSON.parse(readFileSync(old.pointerPath, "utf8"));
+	pointer.markerNonce = "abandoned-pointer-nonce";
+	writeFileSync(old.pointerPath, JSON.stringify(pointer));
+
+	await writeInitialPlan(harness);
+	const replacement = harness.states.at(-1)!;
+	const activePointer = JSON.parse(readFileSync(old.pointerPath, "utf8"));
+	expect(replacement.runId).not.toBe(old.runId);
+	expect(activePointer.runId).toBe(replacement.runId);
+	expect(activePointer.markerNonce).toBe(replacement.runMarkerNonce);
 });
 
 test("marker durability is required before proposal and BUILD setup failures keep approval pending", async () => {

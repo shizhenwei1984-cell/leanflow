@@ -253,6 +253,8 @@ export interface LeanFlowState {
 	terminalOutcome?: "pass" | "fail_after_retry" | "gate_operational_failure";
 	/** Latest durable lifecycle status written to the run marker. */
 	runMarkerStatus?: RunMarkerStatus;
+	/** Nonce of the active-pointer candidate that was durably published with this marker. */
+	runMarkerNonce?: string;
 	/** Marker/pointer persistence failed; current in-memory control remains authoritative. */
 	persistenceDegraded?: boolean;
 	/** Last failed persistence step, retained for actionable diagnostics. */
@@ -766,6 +768,7 @@ function normalizeState(value: unknown): LeanFlowState {
 		approvalInvalidated: state.approvalInvalidated === true,
 		approvalRepairBoundary: optionalNumber(state.approvalRepairBoundary),
 		runMarkerArtifact: typeof state.runMarkerArtifact === "string" ? state.runMarkerArtifact : undefined,
+		runMarkerNonce: typeof state.runMarkerNonce === "string" && state.runMarkerNonce.length > 0 ? state.runMarkerNonce : undefined,
 		runMarkerStatus: isRunMarkerStatus(state.runMarkerStatus) ? state.runMarkerStatus : undefined,
 		terminalOutcome,
 		persistenceDegraded: state.persistenceDegraded === true,

@@ -114,6 +114,7 @@ interface RunMarker {
 	planArtifact: string;
 	planDigest: string;
 	status: LeanFlowState["runMarkerStatus"];
+	markerNonce: string;
 	updatedAt: number;
 	phaseStartedAt: number;
 	scoutCalls: number;
@@ -131,6 +132,8 @@ interface ActiveRunPointer {
 	markerArtifact: string;
 	planArtifact: string;
 	status: NonNullable<LeanFlowState["runMarkerStatus"]>;
+	/** Absent only on pre-v10 pointers; never trusted as current authority. */
+	markerNonce?: string;
 	updatedAt: number;
 }
 
@@ -836,6 +839,8 @@ export default function leanflow(pi: ExtensionAPI): void {
 	const pendingEvidenceObservations = new Map<string, PendingEvidenceObservation>();
 	const buildRecordLock = new KeyedOperationLock();
 	const repairRecordLock = new KeyedOperationLock();
+	const activePointerLock = new KeyedOperationLock();
+	const relinquishedPointerNonces = new Set<string>();
 	const validationAbortControllers = new Map<string, AbortController>();
 	let activationEpoch = 1;
 
@@ -936,13 +941,6 @@ export default function leanflow(pi: ExtensionAPI): void {
 		}
 	}
 
-	function clearPersistenceFailure(): void {
-		state.persistenceDegraded = false;
-		delete state.persistenceFailureStage;
-		delete state.persistenceFailurePath;
-		delete state.persistenceFailureCode;
-		delete state.persistenceFailureMessage;
-	}
 
 	type BuildRecordSetupResult =
 		| {
@@ -1977,11 +1975,34 @@ export default function leanflow(pi: ExtensionAPI): void {
 		}
 		return { absolute, size: stat.size, stat };
 	}
-	async function writeRunMarker(
+
+	interface MarkerPublicationSnapshot {
+		runId: string;
+		planSlug: string;
+		planDigest: string;
+		controlSessionId: string;
+		controlOperationEpoch: number;
+		markerArtifact: string;
+		pointerArtifact: string;
+		markerNonce: string;
+		expectedPointerNonce?: string;
+		previousStatus?: NonNullable<LeanFlowState["runMarkerStatus"]>;
+	}
+
+	type PreparedMarkerPublication = Readonly<{
+		snapshot: MarkerPublicationSnapshot;
+		markerPath: string;
+		pointerPath: string;
+		marker: RunMarker;
+		pointer: ActiveRunPointer;
+		isCurrent: () => boolean;
+	}>;
+
+	function captureCurrentMarkerPublication(
 		ctx: ExtensionContext,
 		status: NonNullable<LeanFlowState["runMarkerStatus"]>,
 		operation?: ControlOperationIdentity,
-	): Promise<boolean> {
+	): PreparedMarkerPublication | undefined {
 		if (!state.runId || !state.planSlug || !state.planArtifact || !state.planDigest || !state.startedAt || !state.stats) {
 			setPersistenceFailure(
 				ctx,
@@ -1990,50 +2011,50 @@ export default function leanflow(pi: ExtensionAPI): void {
 				new Error("run marker state is incomplete"),
 				"INVALID_STATE",
 			);
-			return false;
+			return undefined;
 		}
-		const options = ctx.localProtocolOptions;
-		if (!options) {
+		if (!ctx.localProtocolOptions || !state.controlSessionId || state.controlOperationEpoch === undefined) {
 			setPersistenceFailure(
 				ctx,
 				"precondition",
 				"local://.leanflow",
-				new Error("local protocol options are unavailable"),
+				new Error("local protocol or control authority is unavailable"),
 				"NO_LOCAL_PROTOCOL",
 			);
-			return false;
+			return undefined;
 		}
-		const artifact = runMarkerArtifact(state.planSlug, state.runId);
+		const markerArtifact = runMarkerArtifact(state.planSlug, state.runId);
 		const pointerArtifact = activePointerArtifact(state.planSlug);
-		const markerOperation = operation ?? captureControlOperation(ctx, `${artifact}\u0000${pointerArtifact}`);
+		const markerPath = resolveRunMarkerPath(ctx.localProtocolOptions, markerArtifact);
+		const pointerPath = resolveRunMarkerPath(ctx.localProtocolOptions, pointerArtifact);
+		if (!markerPath || !pointerPath) {
+			setPersistenceFailure(ctx, "marker", markerArtifact, new Error("marker publication path cannot be resolved"), "INVALID_PATH");
+			return undefined;
+		}
+		const markerOperation = operation ?? captureControlOperation(ctx, `${markerArtifact}\u0000${pointerArtifact}`);
 		const isCurrent = () => controlOperationIsCurrent(ctx, markerOperation);
-		if (!isCurrent()) return false;
-		state.runMarkerArtifact = artifact;
-		state.runMarkerStatus = status;
-		const markerPath = resolveRunMarkerPath(options, artifact);
-		if (!markerPath) {
-			setPersistenceFailure(ctx, "marker", artifact, new Error("run marker path cannot be resolved"), "INVALID_PATH");
-			return false;
-		}
-		const pointerPath = resolveRunMarkerPath(options, pointerArtifact);
-		if (!pointerPath) {
-			setPersistenceFailure(
-				ctx,
-				"pointer",
-				pointerArtifact,
-				new Error("active pointer path cannot be resolved"),
-				"INVALID_PATH",
-			);
-			return false;
-		}
 		const now = Date.now();
-		const marker: RunMarker = {
-			version: 2,
+		const markerNonce = randomUUID();
+		const snapshot: MarkerPublicationSnapshot = Object.freeze({
 			runId: state.runId,
 			planSlug: state.planSlug,
-			planArtifact: state.planArtifact,
 			planDigest: state.planDigest,
+			controlSessionId: state.controlSessionId,
+			controlOperationEpoch: state.controlOperationEpoch,
+			markerArtifact,
+			pointerArtifact,
+			markerNonce,
+			...(state.runMarkerNonce ? { expectedPointerNonce: state.runMarkerNonce } : {}),
+			...(state.runMarkerStatus ? { previousStatus: state.runMarkerStatus } : {}),
+		});
+		const marker: RunMarker = {
+			version: 2,
+			runId: snapshot.runId,
+			planSlug: snapshot.planSlug,
+			planArtifact: state.planArtifact,
+			planDigest: snapshot.planDigest,
 			status,
+			markerNonce,
 			updatedAt: now,
 			phaseStartedAt: state.phaseStartedAt ?? now,
 			scoutCalls: state.scoutCalls,
@@ -2046,40 +2067,176 @@ export default function leanflow(pi: ExtensionAPI): void {
 		};
 		const pointer: ActiveRunPointer = {
 			version: 1,
-			runId: state.runId,
-			markerArtifact: artifact,
+			runId: snapshot.runId,
+			markerArtifact,
 			planArtifact: state.planArtifact,
 			status,
+			markerNonce,
 			updatedAt: now,
 		};
-		let failureStage: NonNullable<LeanFlowState["persistenceFailureStage"]> =
-			status === "awaiting_approval" ? "marker" : "pointer";
-		let failurePath = status === "awaiting_approval" ? markerPath : pointerPath;
+		return Object.freeze({ snapshot, markerPath, pointerPath, marker, pointer, isCurrent });
+	}
+
+	function readActivePointer(pointerPath: string): ActiveRunPointer | undefined {
 		try {
-			const markerFirst = status === "awaiting_approval";
-			const firstPath = markerFirst ? markerPath : pointerPath;
-			const firstValue = markerFirst ? marker : pointer;
-			if (!(await writeJsonAtomically(firstPath, firstValue, isCurrent))) return false;
-			failureStage = markerFirst ? "pointer" : "marker";
-			failurePath = markerFirst ? pointerPath : markerPath;
-			const secondPath = markerFirst ? pointerPath : markerPath;
-			const secondValue = markerFirst ? pointer : marker;
-			if (!(await writeJsonAtomically(secondPath, secondValue, isCurrent))) return false;
-			if (!isCurrent()) return false;
-			state.runMarkerArtifact = artifact;
-			state.runMarkerStatus = status;
-			clearPersistenceFailure();
+			const value = JSON.parse(fsSync.readFileSync(pointerPath, "utf8"));
+			if (!isPlainRecord(value)) return undefined;
+			const pointer = value as Partial<ActiveRunPointer>;
+			return (
+				pointer.version === 1 &&
+				typeof pointer.runId === "string" &&
+				typeof pointer.markerArtifact === "string" &&
+				typeof pointer.planArtifact === "string" &&
+				typeof pointer.status === "string"
+			)
+				? (pointer as ActiveRunPointer)
+				: undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
+	function pointerReferencesTerminalMarker(pointer: ActiveRunPointer, pointerPath: string): boolean {
+		if (!RUN_ID_PATTERN.test(pointer.runId) || pointer.markerArtifact !== runMarkerArtifact("", pointer.runId)) return false;
+		try {
+			const markerPath = path.join(path.dirname(path.dirname(pointerPath)), "runs", `${pointer.runId}.json`);
+			const marker = JSON.parse(fsSync.readFileSync(markerPath, "utf8"));
+			return (
+				isPlainRecord(marker) &&
+				marker.version === 2 &&
+				marker.runId === pointer.runId &&
+				marker.markerNonce === pointer.markerNonce &&
+				(marker.status === "abandoned" || marker.status === "completed" || marker.status === "invalidated")
+			);
+		} catch {
+			return false;
+		}
+	}
+
+	function pointerMatchesSnapshot(
+		pointer: ActiveRunPointer | undefined,
+		snapshot: MarkerPublicationSnapshot,
+		pointerPath: string,
+	): boolean {
+		if (snapshot.previousStatus === undefined) {
+			return (
+				pointer === undefined ||
+				(pointer.markerNonce !== undefined &&
+					(relinquishedPointerNonces.has(pointer.markerNonce) || pointerReferencesTerminalMarker(pointer, pointerPath)))
+			);
+		}
+		if (!pointer) return snapshot.expectedPointerNonce === undefined;
+		return (
+			pointer.runId === snapshot.runId &&
+			pointer.markerArtifact === snapshot.markerArtifact &&
+			(snapshot.expectedPointerNonce === undefined || pointer.markerNonce === snapshot.expectedPointerNonce)
+		);
+	}
+	async function stageJson(
+		filePath: string,
+		value: unknown,
+		isCurrent: () => boolean,
+		afterClose?: () => Promise<void>,
+	): Promise<string | undefined> {
+		const temporary = `${filePath}.stage-${process.pid}-${randomUUID()}`;
+		try {
+			if (!(await writeJsonAtomically(temporary, value, isCurrent))) return undefined;
+			if (afterClose) await afterClose();
+			return isCurrent() ? temporary : undefined;
+		} finally {
+			if (!isCurrent()) await fs.rm(temporary, { force: true });
+		}
+	}
+
+	async function publishMarkerAndActivePointer(publication: PreparedMarkerPublication): Promise<boolean> {
+		let stagedMarker: string | undefined;
+		try {
+			stagedMarker = await stageJson(publication.markerPath, publication.marker, publication.isCurrent);
+		} catch (error) {
+			throw Object.assign(error instanceof Error ? error : new Error(String(error)), { publicationStage: "marker" });
+		}
+		if (!stagedMarker) return false;
+		let stagedPointer: string | undefined;
+		try {
+			stagedPointer = await stageJson(
+				publication.pointerPath,
+				publication.pointer,
+				publication.isCurrent,
+				atomicPublicationAfterCloseHook ? () => atomicPublicationAfterCloseHook!(publication.pointerPath) : undefined,
+			);
+		} catch (error) {
+			await fs.rm(stagedMarker, { force: true });
+			throw Object.assign(error instanceof Error ? error : new Error(String(error)), { publicationStage: "pointer" });
+		}
+		if (!stagedPointer) {
+			await fs.rm(stagedMarker, { force: true });
+			return false;
+		}
+		const release = await activePointerLock.acquire(`active-pointer:${publication.snapshot.pointerArtifact}`);
+		try {
+			if (
+				!publication.isCurrent() ||
+				!pointerMatchesSnapshot(readActivePointer(publication.pointerPath), publication.snapshot, publication.pointerPath)
+			) {
+				return false;
+			}
+			fsSync.renameSync(stagedMarker, publication.markerPath);
+			syncParentDirectoryBestEffortSync(publication.markerPath);
+			fsSync.renameSync(stagedPointer, publication.pointerPath);
+			syncParentDirectoryBestEffortSync(publication.pointerPath);
+			return true;
+		} finally {
+			await fs.rm(stagedMarker, { force: true });
+			await fs.rm(stagedPointer, { force: true });
+			release();
+		}
+	}
+
+
+	async function writeRunMarker(
+		ctx: ExtensionContext,
+		status: NonNullable<LeanFlowState["runMarkerStatus"]>,
+		operation?: ControlOperationIdentity,
+	): Promise<boolean> {
+		const publication = captureCurrentMarkerPublication(ctx, status, operation);
+		if (!publication) return false;
+		try {
+			if (!(await publishMarkerAndActivePointer(publication))) return false;
+			if (!publication.isCurrent()) return false;
+			const candidate: LeanFlowState = {
+				...state,
+				runMarkerArtifact: publication.snapshot.markerArtifact,
+				runMarkerStatus: status,
+				runMarkerNonce: publication.snapshot.markerNonce,
+				persistenceDegraded: false,
+				persistenceFailureStage: undefined,
+				persistenceFailurePath: undefined,
+				persistenceFailureCode: undefined,
+				persistenceFailureMessage: undefined,
+			};
+			persistCandidateState(candidate);
+			state = candidate;
 			return true;
 		} catch (error) {
-			if (isCurrent()) setPersistenceFailure(ctx, failureStage, failurePath, error);
+			const failedPointer =
+				typeof error === "object" &&
+				error !== null &&
+				"publicationStage" in error &&
+				error.publicationStage === "pointer";
+			if (publication.isCurrent()) {
+				setPersistenceFailure(
+					ctx,
+					failedPointer ? "pointer" : "marker",
+					failedPointer ? publication.pointerPath : publication.markerPath,
+					error,
+				);
+			}
 			return false;
 		}
 	}
 
 	type HistoricalRunMarker = Readonly<{
-		runId: string;
-		markerArtifact: string;
-		pointerArtifact: string;
+		snapshot: MarkerPublicationSnapshot;
 		markerPath: string;
 		pointerPath: string;
 		marker: RunMarker;
@@ -2088,13 +2245,16 @@ export default function leanflow(pi: ExtensionAPI): void {
 
 	function captureHistoricalRunMarker(ctx: ExtensionContext): HistoricalRunMarker | undefined {
 		if (
+			state.phase === "idle" ||
 			!ctx.localProtocolOptions ||
 			!state.runId ||
 			!state.planSlug ||
 			!state.planArtifact ||
 			!state.planDigest ||
 			!state.startedAt ||
-			!state.stats
+			!state.stats ||
+			!state.controlSessionId ||
+			state.controlOperationEpoch === undefined
 		) {
 			return undefined;
 		}
@@ -2104,19 +2264,31 @@ export default function leanflow(pi: ExtensionAPI): void {
 		const pointerPath = resolveRunMarkerPath(ctx.localProtocolOptions, pointerArtifact);
 		if (!markerPath || !pointerPath) return undefined;
 		const now = Date.now();
-		return Object.freeze({
+		const markerNonce = randomUUID();
+		const snapshot: MarkerPublicationSnapshot = Object.freeze({
 			runId: state.runId,
+			planSlug: state.planSlug,
+			planDigest: state.planDigest,
+			controlSessionId: state.controlSessionId,
+			controlOperationEpoch: state.controlOperationEpoch,
 			markerArtifact,
 			pointerArtifact,
+			markerNonce,
+			...(state.runMarkerNonce ? { expectedPointerNonce: state.runMarkerNonce } : {}),
+			...(state.runMarkerStatus ? { previousStatus: state.runMarkerStatus } : {}),
+		});
+		return Object.freeze({
+			snapshot,
 			markerPath,
 			pointerPath,
 			marker: {
 				version: 2 as const,
-				runId: state.runId,
-				planSlug: state.planSlug,
+				runId: snapshot.runId,
+				planSlug: snapshot.planSlug,
 				planArtifact: state.planArtifact,
-				planDigest: state.planDigest,
+				planDigest: snapshot.planDigest,
 				status: "abandoned" as const,
+				markerNonce,
 				updatedAt: now,
 				phaseStartedAt: state.phaseStartedAt ?? now,
 				scoutCalls: state.scoutCalls,
@@ -2129,34 +2301,43 @@ export default function leanflow(pi: ExtensionAPI): void {
 			},
 			pointer: {
 				version: 1 as const,
-				runId: state.runId,
+				runId: snapshot.runId,
 				markerArtifact,
 				planArtifact: state.planArtifact,
 				status: "abandoned" as const,
+				markerNonce,
 				updatedAt: now,
 			},
 		});
 	}
 
-	function pointerStillMatches(snapshot: HistoricalRunMarker): boolean {
-		try {
-			const current = JSON.parse(fsSync.readFileSync(snapshot.pointerPath, "utf8"));
-			return (
-				isPlainRecord(current) &&
-				current.runId === snapshot.runId &&
-				current.markerArtifact === snapshot.markerArtifact
-			);
-		} catch {
-			return false;
+	async function publishHistoricalCancellation(snapshot: HistoricalRunMarker): Promise<void> {
+		if (
+			await publishMarkerAndActivePointer({
+				snapshot: snapshot.snapshot,
+				markerPath: snapshot.markerPath,
+				pointerPath: snapshot.pointerPath,
+				marker: snapshot.marker,
+				pointer: snapshot.pointer,
+				isCurrent: () => true,
+			})
+		) {
+			relinquishPointerNonce(snapshot.snapshot.markerNonce);
 		}
 	}
 
-	async function publishHistoricalCancellation(snapshot: HistoricalRunMarker): Promise<void> {
-		await writeJsonAtomically(snapshot.markerPath, snapshot.marker);
-		await writeJsonAtomically(snapshot.pointerPath, snapshot.pointer, () => pointerStillMatches(snapshot));
+	function relinquishPointerNonce(nonce: string | undefined): void {
+		if (!nonce) return;
+		relinquishedPointerNonces.add(nonce);
+		if (relinquishedPointerNonces.size > 128) relinquishedPointerNonces.delete(relinquishedPointerNonces.values().next().value!);
+	}
+
+	function relinquishCurrentPointer(): void {
+		relinquishPointerNonce(state.runMarkerNonce);
 	}
 
 	function invalidateCurrentWorkflowAuthority(ctx: ExtensionContext): void {
+		relinquishCurrentPointer();
 		advanceBuildActivation();
 		pendingEvidenceObservations.clear();
 		state.controlSessionId = buildSessionId(ctx);
@@ -2173,6 +2354,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 		state.humanRepairCycles = undefined;
 		state.lastGateFindings = undefined;
 		state.runMarkerStatus = "abandoned";
+		state.runMarkerNonce = undefined;
 		transitionPhase(state, "idle");
 		persist();
 		updateStatus(ctx);
@@ -3322,6 +3504,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 					setPersistenceFailure(ctx, "marker", historicalMarker.markerPath, error);
 				}
 			} else {
+				relinquishCurrentPointer();
 				advanceBuildActivation();
 				pendingEvidenceObservations.clear();
 			}
