@@ -198,3 +198,22 @@ export class PendingOperationRegistry<T> {
 	}
 }
 
+/** FIFO exclusion by an immutable operation key. Each release unlinks only its own tail. */
+export class KeyedOperationLock {
+	readonly #tails = new Map<string, Promise<void>>();
+
+	async acquire(key: string): Promise<() => void> {
+		const previous = this.#tails.get(key) ?? Promise.resolve();
+		let release!: () => void;
+		const tail = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		this.#tails.set(key, tail);
+		await previous;
+		return () => {
+			release();
+			if (this.#tails.get(key) === tail) this.#tails.delete(key);
+		};
+	}
+}
+

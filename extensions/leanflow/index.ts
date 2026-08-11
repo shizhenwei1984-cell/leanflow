@@ -67,6 +67,7 @@ import {
 	createControlOperationIdentity,
 	isControlOperationContinuationCurrent,
 	isControlOperationCurrent,
+	KeyedOperationLock,
 	PendingOperationRegistry,
 } from "./control-operation";
 import type { ActiveControlAuthority, ControlOperationIdentity, PendingControlOperation } from "./control-operation";
@@ -833,7 +834,8 @@ export default function leanflow(pi: ExtensionAPI): void {
 		| { identity: BuildOperationIdentity; toolName: "bash"; command: string }
 		| { identity: BuildOperationIdentity; toolName: "lsp"; lspRequest: ParsedLspRequest };
 	const pendingEvidenceObservations = new Map<string, PendingEvidenceObservation>();
-	const buildRecordLockTails = new Map<string, Promise<void>>();
+	const buildRecordLock = new KeyedOperationLock();
+	const repairRecordLock = new KeyedOperationLock();
 	const validationAbortControllers = new Map<string, AbortController>();
 	let activationEpoch = 1;
 
@@ -842,18 +844,15 @@ export default function leanflow(pi: ExtensionAPI): void {
 	}
 
 	async function acquireBuildRecordLock(identity: BuildOperationIdentity): Promise<() => void> {
-		const key = queueKey(identity);
-		const previous = buildRecordLockTails.get(key) ?? Promise.resolve();
-		let release!: () => void;
-		const tail = new Promise<void>((resolve) => {
-			release = resolve;
-		});
-		buildRecordLockTails.set(key, tail);
-		await previous;
-		return () => {
-			release();
-			if (buildRecordLockTails.get(key) === tail) buildRecordLockTails.delete(key);
-		};
+		return buildRecordLock.acquire(queueKey(identity));
+	}
+
+	function repairQueueKey(operation: RepairOperationIdentity): string {
+		return `${operation.controlSessionId}\u0000${operation.runId}\u0000${operation.fromRound}\u0000${operation.toRound}\u0000${operation.transactionId}`;
+	}
+
+	async function acquireRepairRecordLock(operation: RepairOperationIdentity): Promise<() => void> {
+		return repairRecordLock.acquire(repairQueueKey(operation));
 	}
 
 	function invalidateControlOperations(_reason: string): void {
@@ -1700,7 +1699,6 @@ export default function leanflow(pi: ExtensionAPI): void {
 	): Promise<BuildRecordSetupResult> {
 		const stale = (): BuildRecordSetupResult => ({ ok: false, reason: "stale repair operation" });
 		const isCurrent = () => isRepairOperationCurrent(operation);
-		if (!isCurrent()) return stale();
 		const expected = {
 			runId: operation.runId,
 			planSlug: operation.planSlug,
@@ -1708,7 +1706,11 @@ export default function leanflow(pi: ExtensionAPI): void {
 			approvedValidationDigest: operation.approvedValidationDigest,
 		};
 		let recoveryEligible = false;
+		const release = await acquireRepairRecordLock(operation);
 		try {
+			// A queued duplicate must lose authority before it inspects or
+			// rewrites the record that the first lease replay just advanced.
+			if (!isCurrent()) return stale();
 			const value = await readBuildRecordValueAt(operation.recordPath);
 			if (repairSetupReadHook) await repairSetupReadHook();
 			if (!isCurrent()) return stale();
@@ -1788,6 +1790,8 @@ export default function leanflow(pi: ExtensionAPI): void {
 				ctx.ui.notify(`LeanFlow: failed to start the repair evidence round: ${reason}`, "warning");
 			}
 			return { ok: false, reason };
+		} finally {
+			release();
 		}
 	}
 
@@ -2070,6 +2074,108 @@ export default function leanflow(pi: ExtensionAPI): void {
 			if (isCurrent()) setPersistenceFailure(ctx, failureStage, failurePath, error);
 			return false;
 		}
+	}
+
+	type HistoricalRunMarker = Readonly<{
+		runId: string;
+		markerArtifact: string;
+		pointerArtifact: string;
+		markerPath: string;
+		pointerPath: string;
+		marker: RunMarker;
+		pointer: ActiveRunPointer;
+	}>;
+
+	function captureHistoricalRunMarker(ctx: ExtensionContext): HistoricalRunMarker | undefined {
+		if (
+			!ctx.localProtocolOptions ||
+			!state.runId ||
+			!state.planSlug ||
+			!state.planArtifact ||
+			!state.planDigest ||
+			!state.startedAt ||
+			!state.stats
+		) {
+			return undefined;
+		}
+		const markerArtifact = runMarkerArtifact(state.planSlug, state.runId);
+		const pointerArtifact = activePointerArtifact(state.planSlug);
+		const markerPath = resolveRunMarkerPath(ctx.localProtocolOptions, markerArtifact);
+		const pointerPath = resolveRunMarkerPath(ctx.localProtocolOptions, pointerArtifact);
+		if (!markerPath || !pointerPath) return undefined;
+		const now = Date.now();
+		return Object.freeze({
+			runId: state.runId,
+			markerArtifact,
+			pointerArtifact,
+			markerPath,
+			pointerPath,
+			marker: {
+				version: 2 as const,
+				runId: state.runId,
+				planSlug: state.planSlug,
+				planArtifact: state.planArtifact,
+				planDigest: state.planDigest,
+				status: "abandoned" as const,
+				updatedAt: now,
+				phaseStartedAt: state.phaseStartedAt ?? now,
+				scoutCalls: state.scoutCalls,
+				startedAt: state.startedAt,
+				handoffStatus: state.handoffStatus,
+				handoffWarnings: state.handoffWarnings,
+				handoffBlockers: state.handoffBlockers,
+				stats: state.stats,
+				lspProbeStatus: state.lspProbeStatus,
+			},
+			pointer: {
+				version: 1 as const,
+				runId: state.runId,
+				markerArtifact,
+				planArtifact: state.planArtifact,
+				status: "abandoned" as const,
+				updatedAt: now,
+			},
+		});
+	}
+
+	function pointerStillMatches(snapshot: HistoricalRunMarker): boolean {
+		try {
+			const current = JSON.parse(fsSync.readFileSync(snapshot.pointerPath, "utf8"));
+			return (
+				isPlainRecord(current) &&
+				current.runId === snapshot.runId &&
+				current.markerArtifact === snapshot.markerArtifact
+			);
+		} catch {
+			return false;
+		}
+	}
+
+	async function publishHistoricalCancellation(snapshot: HistoricalRunMarker): Promise<void> {
+		await writeJsonAtomically(snapshot.markerPath, snapshot.marker);
+		await writeJsonAtomically(snapshot.pointerPath, snapshot.pointer, () => pointerStillMatches(snapshot));
+	}
+
+	function invalidateCurrentWorkflowAuthority(ctx: ExtensionContext): void {
+		advanceBuildActivation();
+		pendingEvidenceObservations.clear();
+		state.controlSessionId = buildSessionId(ctx);
+		state.controlOperationEpoch = activationEpoch;
+		state.baselineCaptured = false;
+		state.buildMutationObserved = false;
+		state.gateLease = undefined;
+		state.lspLease = undefined;
+		state.repairLease = undefined;
+		state.finalizedGateSnapshot = undefined;
+		state.finalizationCommitNonce = undefined;
+		state.operationalRetrySnapshot = undefined;
+		state.gateDispatches = undefined;
+		state.humanRepairCycles = undefined;
+		state.lastGateFindings = undefined;
+		state.runMarkerStatus = "abandoned";
+		transitionPhase(state, "idle");
+		persist();
+		updateStatus(ctx);
 	}
 
 
@@ -3201,20 +3307,27 @@ export default function leanflow(pi: ExtensionAPI): void {
 
 			// Keep every artifact component ASCII-bounded while preserving task identity.
 			const slug = taskSlug(task);
-			if (
+			const historicalMarker =
 				state.runMarkerArtifact &&
-				(state.runMarkerStatus === "awaiting_approval" || state.runMarkerStatus === "building")
-			) {
-				const markerOperation = captureControlOperation(ctx, state.planArtifact);
-				await writeRunMarker(ctx, "abandoned", markerOperation);
-				if (!controlOperationIsCurrent(ctx, markerOperation, state.planArtifact)) return;
+				(state.runMarkerStatus === "awaiting_approval" ||
+					state.runMarkerStatus === "building" ||
+					state.runMarkerStatus === "paused")
+					? captureHistoricalRunMarker(ctx)
+					: undefined;
+			if (historicalMarker) {
+				invalidateCurrentWorkflowAuthority(ctx);
+				try {
+					await publishHistoricalCancellation(historicalMarker);
+				} catch (error) {
+					setPersistenceFailure(ctx, "marker", historicalMarker.markerPath, error);
+				}
+			} else {
+				advanceBuildActivation();
+				pendingEvidenceObservations.clear();
 			}
-
-			pendingEvidenceObservations.clear();
 
 			// Initialize state machine and the first observable phase.
 			const now = Date.now();
-			advanceBuildActivation();
 			state = {
 				...defaultState(),
 				phase: "planning",
@@ -4338,29 +4451,22 @@ export default function leanflow(pi: ExtensionAPI): void {
 				ctx.ui.notify("LeanFlow: no active run to cancel.", "warning");
 				return;
 			}
-			if (
+			const historicalMarker =
 				state.runMarkerStatus === "awaiting_approval" ||
 				state.runMarkerStatus === "building" ||
 				state.runMarkerStatus === "paused"
-			) {
-				const markerOperation = captureControlOperation(ctx, state.planArtifact);
-				await writeRunMarker(ctx, "abandoned", markerOperation);
-				if (!controlOperationIsCurrent(ctx, markerOperation, state.planArtifact)) return;
+					? captureHistoricalRunMarker(ctx)
+					: undefined;
+			// Linearization point: every old callback loses authority and the
+			// cancelled state is durable before marker I/O can suspend.
+			invalidateCurrentWorkflowAuthority(ctx);
+			if (historicalMarker) {
+				try {
+					await publishHistoricalCancellation(historicalMarker);
+				} catch (error) {
+					setPersistenceFailure(ctx, "marker", historicalMarker.markerPath, error);
+				}
 			}
-			advanceBuildActivation();
-			state.controlSessionId = buildSessionId(ctx);
-			state.controlOperationEpoch = activationEpoch;
-			pendingEvidenceObservations.clear();
-			state.baselineCaptured = false;
-			state.buildMutationObserved = false;
-			state.gateLease = undefined;
-			state.lspLease = undefined;
-			state.gateDispatches = undefined;
-			state.humanRepairCycles = undefined;
-			state.lastGateFindings = undefined;
-			transitionPhase(state, "idle");
-			persist();
-			updateStatus(ctx);
 			ctx.ui.notify("LeanFlow: run cancelled and recovery marker abandoned.", "info");
 		},
 	});

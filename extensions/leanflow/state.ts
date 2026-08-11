@@ -295,7 +295,7 @@ export interface LeanFlowState {
 	repairLease?: RepairLease;
 	/** Explicit next action after provenance recovery; cleared on successful redispatch or repair. */
 	recoveryAction?: GateRecoveryAction;
-	/** Persisted workflow schema version; absence implies v1, and active output is always v8. */
+	/** Persisted workflow schema version; absence implies v1, and active output is always v9. */
 	stateVersion?: number;
 	/** Runtime token/context statistics for the current run. */
 	stats?: LeanFlowStats;

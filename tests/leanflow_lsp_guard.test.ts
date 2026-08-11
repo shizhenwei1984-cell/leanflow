@@ -16,7 +16,7 @@ import leanflow, {
 	setRepairSetupReadHookForTest,
 	setRestoreSessionHookForTest,
 } from "../extensions/leanflow/index";
-import { PendingOperationRegistry, createControlOperationIdentity } from "../extensions/leanflow/control-operation";
+import { KeyedOperationLock, PendingOperationRegistry, createControlOperationIdentity } from "../extensions/leanflow/control-operation";
 import { finalizedGateSnapshotDigest, type FinalizedGateSnapshot } from "../extensions/leanflow/provenance";
 
 type TestContext = {
@@ -1397,6 +1397,56 @@ test("a stale human repair cannot overwrite a replacement BUILD record", async (
 	}
 });
 
+test("duplicate repair replay preserves the active repair result", async () => {
+	const firstEntered = createDeferred<void>();
+	const firstReleased = createDeferred<void>();
+	let setupCalls = 0;
+	const harness = createHarness();
+	try {
+		await enterDocumentationBuild(harness);
+		await completeBuildEvidence(harness);
+		await dispatchGateResult(harness, "duplicate-repair-first-fail", "FAIL");
+		await completeBuildEvidence(harness);
+		await dispatchGateResult(harness, "duplicate-repair-second-fail", "FAIL");
+		expect(harness.states.at(-1)).toMatchObject({ phase: "awaiting_human" });
+
+		setRepairSetupReadHookForTest(async () => {
+			setupCalls += 1;
+			if (setupCalls === 1) {
+				firstEntered.resolve();
+				await firstReleased.promise;
+			}
+		});
+		const firstReplay = harness.commands.get("flowcontinue")!.handler("", harness.ctx);
+		await firstEntered.promise;
+		const duplicateReplay = harness.handlers.get("session_switch")!({}, harness.ctx);
+		firstReleased.resolve();
+
+		await Promise.all([firstReplay, duplicateReplay]);
+		expect(setupCalls).toBe(2);
+		expect(harness.states.at(-1)).toMatchObject({ phase: "building", currentBuildRound: 3 });
+	} finally {
+		setRepairSetupReadHookForTest(undefined);
+	}
+});
+
+test("repair queue serializes a duplicate lease without blocking another run", async () => {
+	const lock = new KeyedOperationLock();
+	const firstRelease = await lock.acquire("session-a\u0000run-a\u00001\u00002\u0000transaction-a");
+	let duplicateAcquired = false;
+	const duplicate = lock.acquire("session-a\u0000run-a\u00001\u00002\u0000transaction-a").then((release) => {
+		duplicateAcquired = true;
+		return release;
+	});
+	const unrelatedRelease = await lock.acquire("session-a\u0000run-b\u00001\u00002\u0000transaction-b");
+	expect(duplicateAcquired).toBe(false);
+	unrelatedRelease();
+	firstRelease();
+	const duplicateRelease = await duplicate;
+	expect(duplicateAcquired).toBe(true);
+	duplicateRelease();
+});
+
 test("plan cleanup cannot consume a pending Gate transport", async () => {
 	const harness = createHarness();
 	await enterDocumentationBuild(harness);
@@ -1538,6 +1588,112 @@ test("terminal agent cleanup drains every current plan mutation and refreshes on
 		harness.ctx,
 	);
 	expect(proposal).toBeUndefined();
+});
+
+test("flowcancel linearization wins over a late Gate PASS while marker I/O is suspended", async () => {
+	const entered = createDeferred<void>();
+	const released = createDeferred<void>();
+	let paused = false;
+	const harness = createHarness();
+	try {
+		await enterDocumentationBuild(harness);
+		await completeBuildEvidence(harness);
+		await harness.handlers.get("tool_call")!(
+			{ toolName: "task", toolCallId: "gate-during-cancel", input: gateCallInput() },
+			harness.ctx,
+		);
+		setAtomicPublicationAfterCloseHookForTest(async () => {
+			if (paused) return;
+			paused = true;
+			entered.resolve();
+			await released.promise;
+		});
+		const cancellation = harness.commands.get("flowcancel")!.handler("", harness.ctx);
+		await entered.promise;
+		await harness.handlers.get("tool_result")!(
+			{
+				toolName: "task",
+				toolCallId: "gate-during-cancel",
+				isError: false,
+				content: [{ type: "text", text: JSON.stringify({ verdict: "PASS", findings: [] }) }],
+			},
+			harness.ctx,
+		);
+		expect(harness.states.at(-1)!.phase).toBe("idle");
+		expect(harness.states.at(-1)!.terminalOutcome).toBeUndefined();
+		released.resolve();
+		await cancellation;
+		expect(harness.states.at(-1)!.phase).toBe("idle");
+		expect(harness.states.at(-1)!.terminalOutcome).toBeUndefined();
+	} finally {
+		setAtomicPublicationAfterCloseHookForTest(undefined);
+	}
+});
+
+test("a suspended cancellation marker cannot overwrite a replacement active pointer", async () => {
+	const entered = createDeferred<void>();
+	const released = createDeferred<void>();
+	let paused = false;
+	const harness = createHarness();
+	try {
+		await writeInitialPlan(harness);
+		setAtomicPublicationAfterCloseHookForTest(async () => {
+			if (paused) return;
+			paused = true;
+			entered.resolve();
+			await released.promise;
+		});
+		const cancellation = harness.commands.get("flowcancel")!.handler("", harness.ctx);
+		await entered.promise;
+		await writeInitialPlan(harness);
+		const replacement = harness.states.at(-1)!;
+		const pointerPath = resolveRunMarkerPath(
+			harness.ctx.localProtocolOptions,
+			hashedPointerArtifact(EXAMPLE_SLUG),
+		)!;
+		const replacementPointer = readFileSync(pointerPath, "utf8");
+		released.resolve();
+		await cancellation;
+		expect(readFileSync(pointerPath, "utf8")).toBe(replacementPointer);
+		expect(JSON.parse(replacementPointer).runId).toBe(replacement.runId);
+	} finally {
+		setAtomicPublicationAfterCloseHookForTest(undefined);
+	}
+});
+
+test("flowcancel discards a late LSP settlement", async () => {
+	const harness = createHarness();
+	await writeInitialPlan(harness);
+	const call = harness.handlers.get("tool_call")!;
+	const result = harness.handlers.get("tool_result")!;
+	await call(
+		{ toolName: "write", toolCallId: "propose-before-cancel-lsp", input: { path: "xd://propose", content: EXAMPLE_SLUG } },
+		harness.ctx,
+	);
+	await result({ toolName: "write", toolCallId: "propose-before-cancel-lsp", isError: false }, harness.ctx);
+	harness.branch.push({ type: "mode_change", mode: "none" });
+	await harness.handlers.get("context")!({ messages: approvalMessages }, harness.ctx);
+	await call(
+		{
+			toolName: "write",
+			toolCallId: "lsp-during-cancel",
+			input: { path: "xd://lsp", content: JSON.stringify({ action: "diagnostics", file: "src/example.ts", timeout: 60 }) },
+		},
+		harness.ctx,
+	);
+	await harness.commands.get("flowcancel")!.handler("", harness.ctx);
+	const stateCount = harness.states.length;
+	await result(
+		{
+			toolName: "write",
+			toolCallId: "lsp-during-cancel",
+			isError: false,
+			content: [{ type: "text", text: "typescript-language-server: clean" }],
+		},
+		harness.ctx,
+	);
+	expect(harness.states).toHaveLength(stateCount);
+	expect(harness.states.at(-1)).toMatchObject({ phase: "idle", lspLease: undefined });
 });
 test("a suspended Gate preflight cannot dispatch into a replacement run", async () => {
 	const entered = createDeferred<void>();
