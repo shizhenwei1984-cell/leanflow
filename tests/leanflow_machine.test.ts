@@ -6,7 +6,7 @@ import {
 	createOperationalRetrySnapshot,
 	finalizedGateSnapshotDigest,
 } from "../extensions/leanflow/provenance";
-import { defaultState, type LeanFlowPhase, type LeanFlowState } from "../extensions/leanflow/state";
+import { createRepairLease, defaultState, type LeanFlowPhase, type LeanFlowState } from "../extensions/leanflow/state";
 import { createApprovedValidationContract, parseApprovedValidation } from "../extensions/leanflow/validation";
 
 const GATE_RUN_ID = "f8e46687-2719-4fa1-8b6f-f5bb9a4e1f42";
@@ -35,6 +35,24 @@ function buildingState() {
 	state.approvedValidationDigest = validationContract.digest;
 	state.currentBuildRound = 1;
 	return state;
+}
+
+function repairReady(
+	state: LeanFlowState,
+	input: Omit<Extract<GateEvent, { type: "repair_round_ready" }>, "transactionId" | "runId" | "fromRound">,
+): Extract<GateEvent, { type: "repair_round_ready" }> {
+	const lease = state.repairLease;
+	if (!lease || !state.runId) throw new Error("repair lease missing from test fixture");
+	return { ...input, transactionId: lease.transactionId, runId: state.runId, fromRound: lease.fromRound };
+}
+
+function repairFailed(
+	state: LeanFlowState,
+	reason: string,
+): Extract<GateEvent, { type: "repair_round_failed" }> {
+	const lease = state.repairLease;
+	if (!lease || !state.runId) throw new Error("repair lease missing from test fixture");
+	return { type: "repair_round_failed", transactionId: lease.transactionId, runId: state.runId, reason };
 }
 
 function sha64(char: string): string {
@@ -235,7 +253,6 @@ test("first FAIL starts a repair round with artifacts cleared before initializat
 		phase: "repair_preparing",
 		gateCalls: 1,
 		gateRetryMode: "repair",
-		gateLease: undefined,
 		lastGateFindings: '{"id":"first"}',
 		writtenArtifacts: [],
 	});
@@ -244,7 +261,17 @@ test("first FAIL starts a repair round with artifacts cleared before initializat
 	expect(state.consecutiveGateErrors).toBe(0);
 	expect(effects.map((effect) => effect.kind)).toEqual(["clear_artifacts", "notify", "begin_repair_round"]);
 	expect(checkInvariants(state)).toEqual([]);
-	const ready = reduceGate(state, { type: "repair_round_ready", round: 2, baselineCaptured: true, freshRecord: false, lspEvidencePresent: true });
+	const firstLease = state.repairLease!;
+	const ready = reduceGate(state, {
+		type: "repair_round_ready",
+		transactionId: firstLease.transactionId,
+		runId: state.runId!,
+		fromRound: firstLease.fromRound,
+		round: 2,
+		baselineCaptured: true,
+		freshRecord: false,
+		lspEvidencePresent: true,
+	});
 	expect(state.phase).toBe("building");
 	expect(state.baselineCaptured).toBe(true);
 	expect(ready.effects.map((e) => e.kind)).toEqual(["write_marker", "notify"]);
@@ -257,7 +284,10 @@ test("first FAIL starts a repair round with artifacts cleared before initializat
 	human.phase = "awaiting_human";
 	human.gateAttempt = 1;
 	reduceGate(human, { type: "human_continue", now: 10 });
-	const humanReady = reduceGate(human, { type: "repair_round_ready", round: 2, baselineCaptured: false, freshRecord: false, lspEvidencePresent: true });
+	const humanReady = reduceGate(
+		human,
+		repairReady(human, { type: "repair_round_ready", round: 2, baselineCaptured: false, freshRecord: false, lspEvidencePresent: true }),
+	);
 	expect(humanReady.effects[1]).toEqual({
 		kind: "notify",
 		level: "info",
@@ -265,7 +295,7 @@ test("first FAIL starts a repair round with artifacts cleared before initializat
 	});
 	const failed = dispatch();
 	reduceGate(failed, { type: "gate_settled", outcome: "FAIL" });
-	const failEffects = reduceGate(failed, { type: "repair_round_failed", reason: "disk full" });
+	const failEffects = reduceGate(failed, repairFailed(failed, "disk full"));
 	expect(failed.phase).toBe("awaiting_human");
 	expect(failEffects.effects.map((e) => e.kind)).toEqual(["write_marker", "notify"]);
 });
@@ -275,19 +305,21 @@ test("fresh repair records require a new durable LSP probe when the plan require
 	state.phase = "repair_preparing";
 	state.gateAttempt = 1;
 	state.currentBuildRound = 1;
-	state.gateRetryMode = "repair";
-	state.repairLease = { fromRound: 1, toRound: 2, reason: "human_continue", startedAt: 10 };
+	state.repairLease = createRepairLease(state, 1, "human_continue");
 	state.lspProbeStatus = "completed";
 	state.lspProbeTarget = "src/example.ts";
 	state.buildMutationObserved = true;
 
-	reduceGate(state, {
-		type: "repair_round_ready",
-		round: 2,
-		baselineCaptured: false,
-		freshRecord: true,
-		lspEvidencePresent: false,
-	});
+	reduceGate(
+		state,
+		repairReady(state, {
+			type: "repair_round_ready",
+			round: 2,
+			baselineCaptured: false,
+			freshRecord: true,
+			lspEvidencePresent: false,
+		}),
+	);
 	expect(state).toMatchObject({
 		phase: "building",
 		currentBuildRound: 2,
@@ -304,7 +336,10 @@ test("second FAIL pauses for a human without setting a terminal outcome", () => 
 	const state = dispatch();
 	state.baselineCaptured = true;
 	reduceGate(state, { type: "gate_settled", outcome: "FAIL" });
-	reduceGate(state, { type: "repair_round_ready", round: 2, baselineCaptured: true, freshRecord: false, lspEvidencePresent: true });
+	reduceGate(
+		state,
+		repairReady(state, { type: "repair_round_ready", round: 2, baselineCaptured: true, freshRecord: false, lspEvidencePresent: true }),
+	);
 	dispatch(state, "gate-2");
 
 	const { effects } = reduceGate(state, { type: "gate_settled", outcome: "FAIL", findingsJson: "x".repeat(4_001) });
@@ -616,7 +651,10 @@ function mulberry32(seed: number): () => number {
 function pausedAfterTwoFailures(): LeanFlowState {
 	const state = dispatch();
 	reduceGate(state, { type: "gate_settled", outcome: "FAIL", findingsJson: '{"id":"first"}' });
-	reduceGate(state, { type: "repair_round_ready", round: 2, baselineCaptured: true, freshRecord: false, lspEvidencePresent: true });
+	reduceGate(
+		state,
+		repairReady(state, { type: "repair_round_ready", round: 2, baselineCaptured: true, freshRecord: false, lspEvidencePresent: true }),
+	);
 	dispatch(state, "gate-2");
 	reduceGate(state, { type: "gate_settled", outcome: "FAIL", findingsJson: '{"id":"second"}' });
 	expect(state.phase).toBe("awaiting_human");
@@ -651,7 +689,15 @@ function randomGateEvent(state: LeanFlowState, random: () => number, seed: numbe
 			if (random() < 0.4) return { type: "restore_reconcile", now: index };
 			return { type: "gate_settled", outcome: randomOutcome(random) };
 		case "repair_preparing":
-			return random() < 0.5 ? { type: "repair_round_ready", round: state.gateAttempt + 1, baselineCaptured: true, freshRecord: false, lspEvidencePresent: true } : { type: "repair_round_failed", reason: "disk full" };
+			return random() < 0.5
+				? repairReady(state, {
+						type: "repair_round_ready",
+						round: state.repairLease!.toRound,
+						baselineCaptured: true,
+						freshRecord: false,
+						lspEvidencePresent: true,
+					})
+				: repairFailed(state, "disk full");
 		case "awaiting_human":
 			return random() < 0.5
 				? { type: "human_continue", now: index }
@@ -717,8 +763,17 @@ function terminalInvalidEvents(seed: number, index: number): GateEvent[] {
 		detachedOperationalEvent("gate_error"),
 		detachedOperationalEvent("gate_interrupted"),
 		{ type: "restore_reconcile", now: index },
-		{ type: "repair_round_ready", round: 99, baselineCaptured: true, freshRecord: false, lspEvidencePresent: true },
-		{ type: "repair_round_failed", reason: "x" },
+		{
+			type: "repair_round_ready",
+			transactionId: `ignored-${seed}-${index}`,
+			runId: GATE_RUN_ID,
+			fromRound: 1,
+			round: 99,
+			baselineCaptured: true,
+			freshRecord: false,
+			lspEvidencePresent: true,
+		},
+		{ type: "repair_round_failed", transactionId: `ignored-${seed}-${index}`, runId: GATE_RUN_ID, reason: "x" },
 		{ type: "human_continue", now: index },
 		{ type: "human_finish_failed", now: index },
 	];

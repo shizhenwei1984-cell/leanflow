@@ -1,6 +1,7 @@
 import { finalizedGateSnapshotDigest, type OperationalRetrySnapshot } from "./provenance";
 import {
 	STATE_VERSION,
+	createRepairLease,
 	type BlockedReasonCode,
 	type GateOutcome,
 	type GateRecoveryAction,
@@ -45,12 +46,15 @@ export type GateEvent =
 	| { type: "restore_reconcile"; now: number }
 	| {
 			type: "repair_round_ready";
+			transactionId: string;
+			runId: string;
+			fromRound: number;
 			round: number;
 			baselineCaptured: boolean;
 			freshRecord: boolean;
 			lspEvidencePresent: boolean;
 	  }
-	| { type: "repair_round_failed"; reason: string }
+	| { type: "repair_round_failed"; transactionId: string; runId: string; reason: string }
 	| { type: "snapshot_invalid"; reason: string }
 	| { type: "record_invalid"; reason: string; checkpointRecoverable: boolean }
 	| { type: "plan_drift"; reason: string }
@@ -356,12 +360,7 @@ function reduceGateSettlement(
 				recordGateFailure(state, true);
 				resetConsecutiveGateErrors(state);
 				const fromRound = state.currentBuildRound ?? state.gateAttempt;
-				state.repairLease = {
-					fromRound,
-					toRound: fromRound + 1,
-					reason: "gate_fail",
-					startedAt: Date.now(),
-				};
+				state.repairLease = createRepairLease(state, fromRound, "gate_fail");
 				state.phase = "repair_preparing";
 				state.writtenArtifacts = [];
 				return {
@@ -524,19 +523,17 @@ function reduceRepairRoundReady(
 	state: LeanFlowState,
 	event: Extract<GateEvent, { type: "repair_round_ready" }>,
 ): { effects: Effect[] } {
-	if (state.phase !== "repair_preparing") return { effects: [] };
-
-	if (state.repairLease && event.round !== state.repairLease.toRound) {
-		state.repairLease = undefined;
-		state.phase = "awaiting_human";
-		return {
-			effects: [
-				{ kind: "write_marker", status: "paused" },
-				{ kind: "notify", level: "warning", message: `Repair round mismatch: ${event.round} vs lease` },
-			],
-		};
+	if (
+		state.phase !== "repair_preparing" ||
+		!state.repairLease ||
+		event.transactionId !== state.repairLease.transactionId ||
+		event.runId !== state.runId ||
+		event.fromRound !== state.repairLease.fromRound ||
+		event.round !== state.repairLease.toRound
+	) {
+		return { effects: [] };
 	}
-	const reason = state.repairLease?.reason;
+	const reason = state.repairLease.reason;
 	state.gateAttempt = event.round - 1;
 	if (state.gateAttempt < 0) state.gateAttempt = 0;
 	state.currentBuildRound = event.round;
@@ -576,8 +573,14 @@ function reduceRepairRoundFailed(
 	state: LeanFlowState,
 	event: Extract<GateEvent, { type: "repair_round_failed" }>,
 ): { effects: Effect[] } {
-	if (state.phase !== "repair_preparing") return { effects: [] };
-
+	if (
+		state.phase !== "repair_preparing" ||
+		!state.repairLease ||
+		event.transactionId !== state.repairLease.transactionId ||
+		event.runId !== state.runId
+	) {
+		return { effects: [] };
+	}
 	state.repairLease = undefined;
 	state.phase = "awaiting_human";
 	return {
@@ -613,7 +616,7 @@ function reduceHumanContinue(state: LeanFlowState): { effects: Effect[] } {
 	resetBlockedRecovery(state);
 	state.recoveryAction = undefined;
 	const fromRound = state.currentBuildRound ?? state.gateAttempt;
-	state.repairLease = { fromRound, toRound: fromRound + 1, reason: "human_continue", startedAt: Date.now() };
+	state.repairLease = createRepairLease(state, fromRound, "human_continue");
 	state.phase = "repair_preparing";
 	return {
 		effects: [

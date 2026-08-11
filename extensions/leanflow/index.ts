@@ -58,7 +58,7 @@ import {
 	parseFinalizedGateSnapshot,
 } from "./provenance";
 import type { FinalizedGateSnapshot, OperationalInterruption } from "./provenance";
-import { CUSTOM_TYPE, STATE_VERSION, defaultState, defaultStats, hasPersistedState, restoreState } from "./state";
+import { CUSTOM_TYPE, STATE_VERSION, createRepairLease, defaultState, defaultStats, hasPersistedState, restoreState } from "./state";
 import type { BlockedReasonCode, GateOutcome, LeanFlowState, RepositoryFingerprint } from "./state";
 import { checkInvariants, reduceGate, resetBlockedRecovery } from "./machine";
 import type { Effect, SnapshotFailureKind } from "./machine";
@@ -783,6 +783,13 @@ export function setGatePreflightHookForTest(hook: (() => Promise<void>) | undefi
 	gatePreflightHook = hook;
 }
 
+let repairSetupReadHook: (() => Promise<void>) | undefined;
+
+/** Test-only seam: pauses repair setup after its immutable record read. */
+export function setRepairSetupReadHookForTest(hook: (() => Promise<void>) | undefined): void {
+	repairSetupReadHook = hook;
+}
+
 let proposalLookupHook: (() => Promise<void>) | undefined;
 
 /** Test-only seam: pauses proposal preflight after authority capture. */
@@ -947,6 +954,63 @@ export default function leanflow(pi: ExtensionAPI): void {
 				lspEvidencePresent: boolean;
 		  }
 		| { ok: false; reason: string };
+
+	type RepairOperationIdentity = Readonly<{
+		operationId: string;
+		controlSessionId: string;
+		controlOperationEpoch: number;
+		activationEpoch: number;
+		transactionId: string;
+		runId: string;
+		planSlug: string;
+		planDigest: string;
+		approvedValidationDigest: string;
+		fromRound: number;
+		toRound: number;
+		recordPath: string;
+		reason: NonNullable<LeanFlowState["repairLease"]>["reason"];
+	}>;
+
+	function captureRepairOperation(ctx: ExtensionContext): RepairOperationIdentity {
+		const lease = state.repairLease;
+		if (!lease || !state.controlSessionId || state.controlOperationEpoch === undefined) {
+			throw new Error("LeanFlow repair operation lacks a durable lease or control authority");
+		}
+		if (!ctx.localProtocolOptions) throw new Error("LeanFlow repair record path cannot be resolved without local protocol options");
+		const recordPath = resolveRunMarkerPath(ctx.localProtocolOptions, lease.recordArtifact);
+		if (!recordPath) throw new Error("LeanFlow repair record path cannot be resolved");
+		return Object.freeze({
+			operationId: randomUUID(),
+			controlSessionId: state.controlSessionId,
+			controlOperationEpoch: state.controlOperationEpoch,
+			activationEpoch,
+			transactionId: lease.transactionId,
+			runId: lease.runId,
+			planSlug: lease.planSlug,
+			planDigest: lease.planDigest,
+			approvedValidationDigest: lease.approvedValidationDigest,
+			fromRound: lease.fromRound,
+			toRound: lease.toRound,
+			recordPath,
+			reason: lease.reason,
+		});
+	}
+
+	function isRepairOperationCurrent(operation: RepairOperationIdentity): boolean {
+		const lease = state.repairLease;
+		return (
+			operation.controlSessionId === state.controlSessionId &&
+			operation.controlOperationEpoch === state.controlOperationEpoch &&
+			operation.activationEpoch === activationEpoch &&
+			operation.runId === state.runId &&
+			operation.planDigest === state.planDigest &&
+			operation.approvedValidationDigest === state.approvedValidationDigest &&
+			state.phase === "repair_preparing" &&
+			lease?.transactionId === operation.transactionId &&
+			lease.fromRound === operation.fromRound &&
+			lease.toRound === operation.toRound
+		);
+	}
 
 	function evidenceFailureMessage(error: unknown): string {
 		return error instanceof Error ? error.message : String(error);
@@ -1630,55 +1694,86 @@ export default function leanflow(pi: ExtensionAPI): void {
 		}
 	}
 
-	async function beginRepairBuildRound(ctx: ExtensionContext): Promise<BuildRecordSetupResult> {
-		const lease = state.repairLease;
-		const fromRound = lease ? lease.fromRound : (state.currentBuildRound ?? state.gateAttempt);
-		const toRound = lease ? lease.toRound : fromRound + 1;
+	async function beginRepairBuildRound(
+		ctx: ExtensionContext,
+		operation: RepairOperationIdentity,
+	): Promise<BuildRecordSetupResult> {
+		const stale = (): BuildRecordSetupResult => ({ ok: false, reason: "stale repair operation" });
+		const isCurrent = () => isRepairOperationCurrent(operation);
+		if (!isCurrent()) return stale();
+		const expected = {
+			runId: operation.runId,
+			planSlug: operation.planSlug,
+			planDigest: operation.planDigest,
+			approvedValidationDigest: operation.approvedValidationDigest,
+		};
 		let recoveryEligible = false;
 		try {
+			const value = await readBuildRecordValueAt(operation.recordPath);
+			if (repairSetupReadHook) await repairSetupReadHook();
+			if (!isCurrent()) return stale();
 			let actual: BuildEvidenceRecordV3;
 			try {
-				actual = await readBuildRecordForReconciliation(ctx);
+				actual = parseBuildEvidenceRecordWithoutRound(value, expected);
 			} catch (error) {
-				recoveryEligible = true;
-				throw new Error(`internal build record is missing or unreadable: ${evidenceFailureMessage(error)}`);
+				const legacyRound = isPlainRecord(value) && Number.isInteger(value.round) ? (value.round as number) : undefined;
+				if (!isCurrent()) return stale();
+				if (
+					isPlainRecord(value) &&
+					(value.version === 1 || value.version === 2) &&
+					legacyRound !== undefined &&
+					legacyRound >= 1
+				) {
+					const legacyIdentity: BuildRecordIdentity = {
+						...expected,
+						round: legacyRound,
+					};
+					actual = migrateBuildEvidenceRecord(value, legacyIdentity);
+					if (!isCurrent()) return stale();
+					if (!(await writeJsonAtomically(operation.recordPath, actual, isCurrent)) || !isCurrent()) return stale();
+				} else {
+					recoveryEligible = true;
+					throw error;
+				}
 			}
-			if (actual.round === toRound) {
+			if (!isCurrent()) return stale();
+			if (actual.round === operation.toRound) {
 				return {
 					ok: true,
-					round: toRound,
+					round: operation.toRound,
 					baselinePresent: !!actual.baseline,
 					freshRecord: actual.observations.length === 0,
 					lspEvidencePresent: actual.observations.some((observation) => observation.toolName === "lsp"),
 				};
 			}
-			if (actual.round !== fromRound) {
+			if (actual.round !== operation.fromRound) {
 				recoveryEligible = true;
-				throw new Error(`BUILD record round ${actual.round} does not match expected ${fromRound} → ${toRound}`);
+				throw new Error(`BUILD record round ${actual.round} does not match expected ${operation.fromRound} → ${operation.toRound}`);
 			}
-			const nextRecord: BuildEvidenceRecordV3 = {
-				...actual,
-				round: toRound,
-				observations: [],
-			};
-			await writeJsonAtomically(activeBuildRecordPath(ctx), nextRecord);
+			const nextRecord: BuildEvidenceRecordV3 = { ...actual, round: operation.toRound, observations: [] };
+			if (!isCurrent()) return stale();
+			if (!(await writeJsonAtomically(operation.recordPath, nextRecord, isCurrent)) || !isCurrent()) return stale();
 			return {
 				ok: true,
-				round: toRound,
+				round: operation.toRound,
 				baselinePresent: !!nextRecord.baseline,
 				freshRecord: true,
 				lspEvidencePresent: false,
 			};
 		} catch (error) {
+			if (!isCurrent()) return stale();
 			let failure = error;
-			if (recoveryEligible && lease?.reason === "human_continue") {
+			if (recoveryEligible && operation.reason === "human_continue") {
 				try {
-					const fresh = createBuildEvidenceRecord(activeBuildIdentity(toRound));
-					await writeJsonAtomically(activeBuildRecordPath(ctx), fresh);
-					state.buildMutationObserved = false;
+					const fresh = createBuildEvidenceRecord({
+						...expected,
+						round: operation.toRound,
+					});
+					if (!isCurrent()) return stale();
+					if (!(await writeJsonAtomically(operation.recordPath, fresh, isCurrent)) || !isCurrent()) return stale();
 					return {
 						ok: true,
-						round: toRound,
+						round: operation.toRound,
 						baselinePresent: false,
 						freshRecord: true,
 						lspEvidencePresent: false,
@@ -1687,12 +1782,10 @@ export default function leanflow(pi: ExtensionAPI): void {
 					failure = recoveryError;
 				}
 			}
+			if (!isCurrent()) return stale();
 			const reason = evidenceFailureMessage(failure);
 			if (ctx.hasUI) {
-				ctx.ui.notify(
-					`LeanFlow: failed to start the repair evidence round: ${reason}`,
-					"warning",
-				);
+				ctx.ui.notify(`LeanFlow: failed to start the repair evidence round: ${reason}`, "warning");
 			}
 			return { ok: false, reason };
 		}
@@ -2361,6 +2454,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 		ctx: ExtensionContext,
 		effects: Effect[],
 		operation?: ControlOperationIdentity,
+		suppressRepairNotification = false,
 	): Promise<{ ok: true } | { ok: false; reason?: string }> {
 		for (const effect of effects) {
 			if (operation && !controlOperationContinuationIsCurrent(ctx, operation)) {
@@ -2371,42 +2465,45 @@ export default function leanflow(pi: ExtensionAPI): void {
 					state.writtenArtifacts = [];
 					break;
 				case "begin_repair_round": {
+					const repairOperation = captureRepairOperation(ctx);
+					const continuation = captureControlOperation(ctx);
+					if (!isRepairOperationCurrent(repairOperation)) {
+						return { ok: false, reason: "stale repair operation" };
+					}
 					persist();
-					const buildRecord = await beginRepairBuildRound(ctx);
-					if (operation && !controlOperationContinuationIsCurrent(ctx, operation)) {
-						return { ok: false, reason: "control operation authority changed" };
+					const buildRecord = await beginRepairBuildRound(ctx, repairOperation);
+					if (!isRepairOperationCurrent(repairOperation)) {
+						return { ok: false, reason: "stale repair operation" };
 					}
-					if (!buildRecord.ok) {
-						const { effects: repairEffects } = reduceGate(state, {
-							type: "repair_round_failed",
-							reason: buildRecord.reason,
-						});
-						const repaired = await executeGateEffects(ctx, repairEffects, operation);
-						if (!repaired.ok || (operation && !controlOperationContinuationIsCurrent(ctx, operation))) {
-							return { ok: false, reason: "control operation authority changed" };
-						}
-						persist();
-						updateStatus(ctx);
-						const violations = checkInvariants(state);
-						if (violations.length > 0) {
-							ctx.ui.notify(`LeanFlow invariant violation: ${violations.join("; ")}`, "warning");
-						}
-						return { ok: false, reason: buildRecord.reason };
+					const transition = buildRecord.ok
+						? reduceGate(state, {
+								type: "repair_round_ready",
+								transactionId: repairOperation.transactionId,
+								runId: repairOperation.runId,
+								fromRound: repairOperation.fromRound,
+								round: buildRecord.round,
+								baselineCaptured: buildRecord.baselinePresent,
+								freshRecord: buildRecord.freshRecord,
+								lspEvidencePresent: buildRecord.lspEvidencePresent,
+							})
+						: reduceGate(state, {
+								type: "repair_round_failed",
+								transactionId: repairOperation.transactionId,
+								runId: repairOperation.runId,
+								reason: buildRecord.reason,
+							});
+					persist();
+					const repairEffects = suppressRepairNotification
+						? transition.effects.filter((candidate) => candidate.kind !== "notify")
+						: transition.effects;
+					const completed = await executeGateEffects(ctx, repairEffects, continuation);
+					if (!completed.ok) return completed;
+					updateStatus(ctx);
+					const violations = checkInvariants(state);
+					if (violations.length > 0) {
+						ctx.ui.notify(`LeanFlow invariant violation: ${violations.join("; ")}`, "warning");
 					}
-					if (state.phase === "repair_preparing") {
-						const { effects: readyEffects } = reduceGate(state, {
-							type: "repair_round_ready",
-							round: buildRecord.round,
-							baselineCaptured: buildRecord.baselinePresent,
-							freshRecord: buildRecord.freshRecord,
-							lspEvidencePresent: buildRecord.lspEvidencePresent,
-						});
-						const ready = await executeGateEffects(ctx, readyEffects, operation);
-						if (!ready.ok || (operation && !controlOperationContinuationIsCurrent(ctx, operation))) {
-							return { ok: false, reason: "control operation authority changed" };
-						}
-						persist();
-					}
+					if (!buildRecord.ok) return { ok: false, reason: buildRecord.reason };
 					break;
 				}
 				case "write_marker": {
@@ -2806,6 +2903,7 @@ export default function leanflow(pi: ExtensionAPI): void {
 				return {
 					phase: raw.phase,
 					stateVersion: raw.stateVersion,
+					data: raw,
 				};
 			}
 			return undefined;
@@ -2823,6 +2921,50 @@ export default function leanflow(pi: ExtensionAPI): void {
 		state.controlOperationEpoch = activationEpoch;
 		pendingControlOperations.clear();
 		pendingEvidenceObservations.clear();
+
+		if (
+			rawBeforeRestore?.phase === "repair_preparing" &&
+			typeof rawStateVersion === "number" &&
+			rawStateVersion >= 3 &&
+			rawStateVersion < STATE_VERSION &&
+			state.runId &&
+			state.planSlug &&
+			state.planDigest &&
+			state.approvedValidationDigest
+		) {
+			const rawLease = isPlainRecord(rawBeforeRestore.data.repairLease) ? rawBeforeRestore.data.repairLease : undefined;
+			const rawRound = rawBeforeRestore.data.currentBuildRound ?? rawBeforeRestore.data.gateAttempt;
+			const fromRound =
+				typeof rawLease?.fromRound === "number" && Number.isInteger(rawLease.fromRound)
+					? rawLease.fromRound
+					: typeof rawRound === "number" && Number.isInteger(rawRound)
+						? rawRound
+						: undefined;
+			if (fromRound !== undefined && fromRound >= 0) {
+				try {
+					const recordPath = buildRecordPathFor(ctx, state.runId);
+					const record = parseBuildEvidenceRecordWithoutRound(await readBuildRecordValueAt(recordPath), {
+						runId: state.runId,
+						planSlug: state.planSlug,
+						planDigest: state.planDigest,
+						approvedValidationDigest: state.approvedValidationDigest,
+					});
+					if (record.round !== fromRound && record.round !== fromRound + 1) {
+						throw new Error(`legacy repair record round ${record.round} does not prove ${fromRound} → ${fromRound + 1}`);
+					}
+					state.repairLease = createRepairLease(state, fromRound, "record_recovery");
+					state.phase = "repair_preparing";
+					state.gateRetryMode = "repair";
+					state.recoveryAction = undefined;
+				} catch {
+					state.repairLease = undefined;
+					state.phase = "awaiting_human";
+					state.gateRetryMode = undefined;
+					state.recoveryAction = "flowcontinue_rebuild_checkpoint";
+					await writeRunMarker(ctx, "paused");
+				}
+			}
+		}
 
 		const restoredFromLegacy =
 			rawBeforeRestore !== undefined && rawBeforeRestore.stateVersion !== state.stateVersion;
@@ -2901,54 +3043,18 @@ export default function leanflow(pi: ExtensionAPI): void {
 			// record only; the generic round reconciliation below would misread
 			// the pending round and corrupt gateAttempt.
 			if (!state.repairLease) {
-				let degraded = false;
-				try {
-					const record = await readBuildRecordForReconciliation(ctx);
-					const fromRound = state.currentBuildRound ?? state.gateAttempt;
-					const toRound = fromRound + 1;
-					if (record.round === fromRound || record.round === toRound) {
-						state.repairLease = { fromRound, toRound, reason: "gate_fail", startedAt: Date.now() };
-					} else {
-						degraded = true;
-					}
-				} catch {
-					degraded = true;
-				}
-				if (degraded) {
-					state.repairLease = undefined;
-					state.phase = "awaiting_human";
-					await writeRunMarker(ctx, "paused");
-					ctx.ui.notify(
-						"LeanFlow: repair preparation could not be recovered; use /flowcontinue or /flowcancel.",
-						"warning",
-					);
-				}
-			}
-			if (state.phase === "repair_preparing" && state.repairLease) {
-				try {
-					const buildRecord = await beginRepairBuildRound(ctx);
-					if (buildRecord.ok) {
-						const { effects: readyEffects } = reduceGate(state, {
-							type: "repair_round_ready",
-							round: buildRecord.round,
-							baselineCaptured: buildRecord.baselinePresent,
-							freshRecord: buildRecord.freshRecord,
-							lspEvidencePresent: buildRecord.lspEvidencePresent,
-						});
-						await executeGateEffects(
-							ctx,
-							readyEffects.filter((effect) => effect.kind !== "notify"),
-						);
-					} else {
-						const { effects: repairEffects } = reduceGate(state, {
-							type: "repair_round_failed",
-							reason: buildRecord.reason,
-						});
-						await executeGateEffects(ctx, repairEffects);
-					}
-				} catch {
-					// Reconciliation failure is handled at next preflight.
-				}
+				state.phase = "awaiting_human";
+				state.recoveryAction = "flowcontinue_rebuild_checkpoint";
+				await writeRunMarker(ctx, "paused");
+				ctx.ui.notify(
+					"LeanFlow: repair preparation has no durable transaction lease; use /flowcontinue or /flowcancel.",
+					"warning",
+				);
+			} else {
+				// A restored lease keeps its durable transaction ID. The runtime
+				// identity is freshly bound to this restore activation by the
+				// effect executor, so replay is serial and idempotent.
+				await executeGateEffects(ctx, [{ kind: "begin_repair_round" }], undefined, true);
 			}
 		} else if (state.phase === "building") {
 			try {

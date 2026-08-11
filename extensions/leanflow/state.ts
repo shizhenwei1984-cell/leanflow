@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
 	createApprovedValidationContract,
 	parseApprovedValidation,
@@ -131,10 +132,40 @@ export interface LeanFlowStats {
 }
 
 export interface RepairLease {
+	version: 1;
+	transactionId: string;
+	runId: string;
+	planSlug: string;
+	planDigest: string;
+	approvedValidationDigest: string;
 	fromRound: number;
 	toRound: number;
-	reason: "gate_fail" | "repair_setup_failed" | "human_continue";
+	recordArtifact: string;
+	reason: "gate_fail" | "human_continue" | "record_recovery";
 	startedAt: number;
+}
+
+export function createRepairLease(
+	state: Pick<LeanFlowState, "runId" | "planSlug" | "planDigest" | "approvedValidationDigest">,
+	fromRound: number,
+	reason: RepairLease["reason"],
+): RepairLease {
+	if (!state.runId || !state.planSlug || !state.planDigest || !state.approvedValidationDigest) {
+		throw new Error("active LeanFlow run identity is incomplete for repair setup");
+	}
+	return {
+		version: 1,
+		transactionId: randomUUID(),
+		runId: state.runId,
+		planSlug: state.planSlug,
+		planDigest: state.planDigest,
+		approvedValidationDigest: state.approvedValidationDigest,
+		fromRound,
+		toRound: fromRound + 1,
+		recordArtifact: `local://.leanflow/runs/${state.runId}-build-record.json`,
+		reason,
+		startedAt: Date.now(),
+	};
 }
 export type BlockedReasonCode =
 	| "missing_validation"
@@ -337,7 +368,7 @@ export function restoreState(branch: Iterable<BranchEntry>): LeanFlowState {
  * finalizing state. Older state is normalized and persisted immediately by the
  * restore flow; it is never allowed to regain authority by migration alone.
  */
-export const STATE_VERSION = 8;
+export const STATE_VERSION = 9;
 
 function migrateLegacyGateState(
 	state: LeanFlowState,
@@ -368,19 +399,23 @@ function migrateLegacyGateState(
 
 function normalizeRepairLease(value: unknown): RepairLease | undefined {
 	if (typeof value !== "object" || value === null) return undefined;
-	const lease = value as { fromRound?: unknown; toRound?: unknown; reason?: unknown; startedAt?: unknown };
-	const fromRound = optionalNumber(lease.fromRound);
-	const toRound = optionalNumber(lease.toRound);
-	const startedAt = optionalNumber(lease.startedAt);
+	const lease = value as Partial<RepairLease>;
 	if (
-		fromRound === undefined || toRound === undefined || startedAt === undefined ||
-		!Number.isInteger(fromRound) || !Number.isInteger(toRound) ||
-		fromRound < 0 || toRound < 1 || toRound !== fromRound + 1 ||
-		(lease.reason !== "gate_fail" && lease.reason !== "repair_setup_failed" && lease.reason !== "human_continue")
+		lease.version !== 1 ||
+		typeof lease.transactionId !== "string" || lease.transactionId.length === 0 ||
+		typeof lease.runId !== "string" || lease.runId.length === 0 ||
+		typeof lease.planSlug !== "string" || lease.planSlug.length === 0 ||
+		typeof lease.planDigest !== "string" || lease.planDigest.length === 0 ||
+		typeof lease.approvedValidationDigest !== "string" || lease.approvedValidationDigest.length === 0 ||
+		typeof lease.recordArtifact !== "string" || lease.recordArtifact.length === 0 ||
+		typeof lease.fromRound !== "number" || !Number.isInteger(lease.fromRound) || lease.fromRound < 0 ||
+		typeof lease.toRound !== "number" || !Number.isInteger(lease.toRound) || lease.toRound !== lease.fromRound + 1 ||
+		typeof lease.startedAt !== "number" || !Number.isFinite(lease.startedAt) ||
+		(lease.reason !== "gate_fail" && lease.reason !== "human_continue" && lease.reason !== "record_recovery")
 	) {
 		return undefined;
 	}
-	return { fromRound, toRound, reason: lease.reason, startedAt };
+	return lease as RepairLease;
 }
 
 function normalizeApprovedValidations(value: unknown): ApprovedValidation[] {
@@ -621,19 +656,17 @@ function normalizeState(value: unknown): LeanFlowState {
 		operationalRetrySnapshot = undefined;
 	}
 
-	// State v7 retains only a v2 snapshot whose nonce and full run identity
-	// already match. Older artifact marks and partial retry metadata are never
-	// promoted into authority by normalization.
+	// State v8 retains only nonce-bound finalization authority. A pre-v9 repair
+	// lease is deliberately not reconstructed here: restore must prove it from
+	// the durable BUILD record before it can regain repair authority.
 	if (legacySchema) {
 		blockedRecovery = undefined;
 		writtenArtifacts = [];
 		if (!finalizedGateSnapshot) gateLease = undefined;
-		// v3 predated the persisted repair lease. This is a syntactically valid
-		// compatibility lease only: restore must still reconcile it against the
-		// BUILD record before it can advance a round.
-		if (persistedVersion === 3 && phase === "repair_preparing" && gateRetryMode === "repair" && !repairLease) {
-			const fromRound = declaredBuildRound ?? Math.max(0, numberOr(state.gateAttempt, 0));
-			repairLease = { fromRound, toRound: fromRound + 1, reason: "gate_fail", startedAt: Date.now() };
+		if (phase === "repair_preparing" && !repairLease) {
+			phase = "awaiting_human";
+			gateRetryMode = undefined;
+			recoveryAction = "flowcontinue_rebuild_checkpoint";
 		}
 	}
 	if (persistedVersion === 7 && phase === "gating" && gateLease && finalizedGateSnapshot) {

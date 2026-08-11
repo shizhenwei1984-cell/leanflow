@@ -13,6 +13,7 @@ import leanflow, {
 	setFreshRecoveryLookupHookForTest,
 	setGatePreflightHookForTest,
 	setProposalLookupHookForTest,
+	setRepairSetupReadHookForTest,
 	setRestoreSessionHookForTest,
 } from "../extensions/leanflow/index";
 import { finalizedGateSnapshotDigest, type FinalizedGateSnapshot } from "../extensions/leanflow/provenance";
@@ -237,6 +238,40 @@ function gateCallInput(options: { batch?: boolean; slug?: string } = {}): Record
 		schemaMode: "strict",
 	};
 	return options.batch === false ? item : { context: "LeanFlow Gate", tasks: [item] };
+}
+
+const GATE_FAIL_TEXT = JSON.stringify({
+	verdict: "FAIL",
+	findings: [
+		{
+			category: "correctness",
+			severity: "blocking",
+			file: "src/example.ts",
+			location: "1",
+			issue: "Required behavior is missing.",
+			required_fix: "Implement the required behavior.",
+		},
+	],
+});
+
+async function dispatchGateResult(
+	harness: Harness,
+	toolCallId: string,
+	verdict: "PASS" | "FAIL",
+): Promise<void> {
+	await harness.handlers.get("tool_call")!(
+		{ toolName: "task", toolCallId, input: gateCallInput() },
+		harness.ctx,
+	);
+	await harness.handlers.get("tool_result")!(
+		{
+			toolName: "task",
+			toolCallId,
+			isError: false,
+			content: [{ type: "text", text: verdict === "PASS" ? JSON.stringify({ verdict: "PASS", findings: [] }) : GATE_FAIL_TEXT }],
+		},
+		harness.ctx,
+	);
 }
 function blockedGateText(
 	harness: Harness,
@@ -1240,6 +1275,7 @@ test("a Gate settlement suspended after registry consumption cannot mutate a rep
 				fingerprintEntered.resolve();
 				return fingerprintReleased.promise;
 			}
+
 			return undefined;
 		},
 	});
@@ -1273,6 +1309,91 @@ test("a Gate settlement suspended after registry consumption cannot mutate a rep
 	expect(
 		readFileSync(resolveRunMarkerPath(harness.ctx.localProtocolOptions, hashedPointerArtifact(EXAMPLE_SLUG))!, "utf8"),
 	).toBe(activePointer);
+});
+test("a stale automatic repair cannot overwrite a replacement BUILD record", async () => {
+	const entered = createDeferred<void>();
+	const released = createDeferred<void>();
+	let paused = false;
+	const harness = createHarness();
+	try {
+		await enterDocumentationBuild(harness);
+		await completeBuildEvidence(harness);
+		setRepairSetupReadHookForTest(async () => {
+			if (paused) return;
+			paused = true;
+			entered.resolve();
+			await released.promise;
+		});
+		const gateCall = harness.handlers.get("tool_call")!;
+		const gateResult = harness.handlers.get("tool_result")!;
+		await gateCall({ toolName: "task", toolCallId: "stale-auto-repair", input: gateCallInput() }, harness.ctx);
+		const settlement = gateResult(
+			{
+				toolName: "task",
+				toolCallId: "stale-auto-repair",
+				isError: false,
+				content: [{ type: "text", text: GATE_FAIL_TEXT }],
+			},
+			harness.ctx,
+		);
+		await entered.promise;
+		await harness.commands.get("flowcancel")!.handler("", harness.ctx);
+		await enterDocumentationBuild(harness);
+		const replacement = harness.states.at(-1)!;
+		const replacementRecordPath = buildRecordPath(harness);
+		const replacementRecord = readFileSync(replacementRecordPath, "utf8");
+		released.resolve();
+		await settlement;
+		expect(harness.states.at(-1)).toMatchObject({
+			phase: "building",
+			runId: replacement.runId,
+			currentBuildRound: 1,
+		});
+		expect(readFileSync(replacementRecordPath, "utf8")).toBe(replacementRecord);
+		await completeBuildEvidence(harness);
+		await dispatchGateResult(harness, "replacement-after-auto-repair", "PASS");
+		expect(harness.states.at(-1)).toMatchObject({ phase: "finalizing", terminalOutcome: "pass" });
+	} finally {
+		setRepairSetupReadHookForTest(undefined);
+	}
+});
+
+test("a stale human repair cannot overwrite a replacement BUILD record", async () => {
+	const entered = createDeferred<void>();
+	const released = createDeferred<void>();
+	const harness = createHarness();
+	try {
+		await enterDocumentationBuild(harness);
+		await completeBuildEvidence(harness);
+		await dispatchGateResult(harness, "human-repair-first-fail", "FAIL");
+		await completeBuildEvidence(harness);
+		await dispatchGateResult(harness, "human-repair-second-fail", "FAIL");
+		expect(harness.states.at(-1)).toMatchObject({ phase: "awaiting_human" });
+		setRepairSetupReadHookForTest(async () => {
+			entered.resolve();
+			await released.promise;
+		});
+		const continuation = harness.commands.get("flowcontinue")!.handler("", harness.ctx);
+		await entered.promise;
+		await harness.commands.get("flowcancel")!.handler("", harness.ctx);
+		await enterDocumentationBuild(harness);
+		const replacement = harness.states.at(-1)!;
+		const replacementRecordPath = buildRecordPath(harness);
+		const replacementRecord = readFileSync(replacementRecordPath, "utf8");
+		released.resolve();
+		await continuation;
+		expect(harness.states.at(-1)).toMatchObject({
+			phase: "building",
+			runId: replacement.runId,
+			currentBuildRound: 1,
+		});
+		expect(readFileSync(replacementRecordPath, "utf8")).toBe(replacementRecord);
+		await completeBuildEvidence(harness);
+		await dispatchGateResult(harness, "replacement-after-human-repair", "PASS");
+		expect(harness.states.at(-1)).toMatchObject({ phase: "finalizing", terminalOutcome: "pass" });
+	} finally {
+		setRepairSetupReadHookForTest(undefined);
+	}
 });
 test("a suspended Gate preflight cannot dispatch into a replacement run", async () => {
 	const entered = createDeferred<void>();
@@ -2182,7 +2303,7 @@ test("state v7 in-flight Gate restores through operational interruption without 
 
 	await harness.handlers.get("session_switch")!({}, harness.ctx);
 	expect(harness.states.at(-1)).toMatchObject({
-		stateVersion: 8,
+		stateVersion: 9,
 		phase: "building",
 		gateRetryMode: "operational",
 		gateLease: undefined,
@@ -4973,10 +5094,10 @@ test("legacy Gate-ready state invalidates missing manifest authority on restore"
 test("new runs persist the current state schema version", async () => {
 	const harness = createHarness();
 	await harness.commands.get("flow")!.handler("schema version", harness.ctx);
-	expect(harness.states.at(-1)).toMatchObject({ phase: "planning", stateVersion: 8 });
+	expect(harness.states.at(-1)).toMatchObject({ phase: "planning", stateVersion: 9 });
 	const persisted = harness.branch.at(-1) as { customType: string; data: Record<string, unknown> };
 	expect(persisted.customType).toBe("leanflow-state");
-	expect(persisted.data.stateVersion).toBe(8);
+	expect(persisted.data.stateVersion).toBe(9);
 });
 
 test("state v6 successful finalization migrates v2 evidence and resumes without another Gate verdict", async () => {
@@ -5019,7 +5140,7 @@ test("state v6 successful finalization migrates v2 evidence and resumes without 
 		observations: legacyRecord.observations,
 	});
 	expect(harness.states.at(-1)).toMatchObject({
-		stateVersion: 8,
+		stateVersion: 9,
 		phase: "building",
 		gateRetryMode: "evidence",
 		recoveryAction: "refinalize_legacy_pass",
